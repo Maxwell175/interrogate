@@ -16,8 +16,21 @@
 #include "indexRemapper.h"
 #include "interrogate_datafile.h"
 
+#include <cstring>
+
 using std::map;
 using std::string;
+
+namespace {
+
+void
+free_module_def_strings(InterrogateModuleDef &def) {
+  delete[] def.library_name;
+  delete[] def.library_hash_name;
+  delete[] def.module_name;
+}
+
+}
 
 InterrogateDatabase *InterrogateDatabase::_global_ptr = nullptr;
 int InterrogateDatabase::_file_major_version = 0;
@@ -962,6 +975,63 @@ read(std::istream &in, InterrogateModuleDef *def) {
 
   merge_from(temp);
   return true;
+}
+
+/**
+ * Reads the indicated database file immediately and merges it into the current
+ * database without requiring a precompiled module definition.
+ */
+bool InterrogateDatabase::
+read_file(const string &database_filename) {
+  const DSearchPath &searchpath = interrogatedb_path;
+
+  Filename pathname = database_filename;
+  if (!pathname.empty() && pathname[0] != '/') {
+    pathname = searchpath.find_file(pathname);
+  }
+
+  if (pathname.empty()) {
+    std::cerr << "Unable to find " << database_filename << " on " << searchpath << "\n";
+    set_error_flag(true);
+    return false;
+  }
+
+  std::ifstream input;
+  pathname.set_text();
+  if (!pathname.open_read(input)) {
+    std::cerr << "Unable to read " << pathname << ".\n";
+    set_error_flag(true);
+    return false;
+  }
+
+  int file_identifier;
+  input >> file_identifier >> _file_major_version >> _file_minor_version;
+
+  if (_file_major_version != _current_major_version ||
+      _file_minor_version > _current_minor_version) {
+    std::cerr
+      << "Cannot read interrogate data in " << pathname
+      << "; database is version " << _file_major_version << "."
+      << _file_minor_version << " while we are expecting "
+      << _current_major_version << "." << _current_minor_version
+      << ".\n";
+    set_error_flag(true);
+    return false;
+  }
+
+  InterrogateModuleDef def;
+  std::memset(&def, 0, sizeof(def));
+  def.file_identifier = file_identifier;
+  def.database_filename = pathname.c_str();
+
+  bool ok = read(input, &def);
+  if (!ok) {
+    std::cerr << "Error reading " << pathname << ".\n";
+    set_error_flag(true);
+  }
+
+  free_module_def_strings(def);
+  return ok;
 }
 
 /**

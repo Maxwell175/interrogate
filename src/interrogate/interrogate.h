@@ -37,6 +37,7 @@ extern bool build_c_wrappers;
 extern bool build_python_wrappers;
 extern bool build_python_obj_wrappers;
 extern bool build_python_native;
+extern bool build_csharp;
 extern bool track_interpreter;
 extern bool save_unique_names;
 extern bool no_database;
@@ -46,5 +47,9 @@ extern bool mangle_names;
 extern CPPVisibility min_vis;
 extern std::string library_name;
 extern std::string module_name;
+extern Filename csharp_output_dir;
+extern std::string csharp_dll_name;
+
+extern bool csharp_database_only_pass;
 
 #endif

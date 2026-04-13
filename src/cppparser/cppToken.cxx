@@ -352,6 +352,9 @@ output(std::ostream &out) const {
   case KW_EXTENSION:
     out << "KW_EXTENSION";
     break;
+  case KW_CSHARP_EXTENSION:
+    out << "KW_CSHARP_EXTENSION";
+    break;
 
   case KW_EXTERN:
     out << "KW_EXTERN";
@@ -1015,6 +1018,9 @@ output_code(std::ostream &out) const {
 
   case KW_EXTENSION:
     out << "__extension";
+    break;
+  case KW_CSHARP_EXTENSION:
+    out << "__csharp_extension";
     break;
 
   case KW_EXTERN:

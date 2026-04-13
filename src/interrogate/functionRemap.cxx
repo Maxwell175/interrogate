@@ -49,6 +49,7 @@ FunctionRemap(const InterrogateType &itype, const InterrogateFunction &ifunc,
   _has_this = false;
   _blocking = false;
   _extension = false;
+  _csharp_extension = false;
   _const_method = false;
   _first_true_parameter = 0;
   _num_default_parameters = num_default_parameters;
@@ -60,6 +61,7 @@ FunctionRemap(const InterrogateType &itype, const InterrogateFunction &ifunc,
   _return_value_needs_management = false;
   _return_value_destructor = 0;
   _manage_reference_count = false;
+  _return_nullable = false;
 
   _cppfunc = cppfunc;
   _ftype = _cppfunc->_type->as_function_type();
@@ -324,6 +326,22 @@ make_wrapper_entry(FunctionIndex function_index) {
     iwrapper._flags |= InterrogateFunctionWrapper::F_extension;
   }
 
+  if (_csharp_extension) {
+    iwrapper._flags |= InterrogateFunctionWrapper::F_csharp_extension;
+  }
+
+  if ((_flags & F_explicit_self) != 0) {
+    iwrapper._flags |= InterrogateFunctionWrapper::F_explicit_self;
+  }
+
+  if (_ForcedVoidReturn) {
+    iwrapper._flags |= InterrogateFunctionWrapper::F_forced_void_return;
+  }
+
+  if (_return_nullable) {
+    iwrapper._flags |= InterrogateFunctionWrapper::F_return_nullable;
+  }
+
   if (_cppfunc->_attributes.has_attribute("deprecated")) {
     iwrapper._flags |= InterrogateFunctionWrapper::F_deprecated;
   }
@@ -345,6 +363,9 @@ make_wrapper_entry(FunctionIndex function_index) {
     }
     if ((*pi)._remap->has_default_value()) {
       param._parameter_flags |= InterrogateFunctionWrapper::PF_is_optional;
+    }
+    if ((*pi)._nullable) {
+      param._parameter_flags |= InterrogateFunctionWrapper::PF_nullable;
     }
     iwrapper._parameters.push_back(param);
   }
@@ -383,6 +404,10 @@ make_wrapper_entry(FunctionIndex function_index) {
       // << " is unavailable.\n" << "  Cannot manage return value for:\n  " <<
       // description << "\n";
     }
+  }
+
+  if (_manage_reference_count) {
+    iwrapper._flags |= InterrogateFunctionWrapper::F_manage_reference_count;
   }
 
   InterrogateDatabase::get_ptr()->add_wrapper(_wrapper_index, iwrapper);
@@ -608,7 +633,10 @@ setup_properties(const InterrogateFunction &ifunc, InterfaceMaker *interface_mak
     _blocking = true;
   }
   if ((_cppfunc->_storage_class & CPPInstance::SC_extension) != 0) {
-    // Same with functions or methods marked with "extension".
+    _extension = true;
+  }
+  if ((_cppfunc->_storage_class & CPPInstance::SC_csharp_extension) != 0) {
+    _csharp_extension = true;
     _extension = true;
   }
 
@@ -631,6 +659,7 @@ setup_properties(const InterrogateFunction &ifunc, InterfaceMaker *interface_mak
       Parameter param;
       param._name = "this";
       param._has_name = true;
+      param._nullable = false;
       if (_const_method) {
         CPPType *const_type = CPPType::new_type(new CPPConstType(_cpptype));
         param._remap = interface_maker->remap_parameter(_cpptype, const_type);
@@ -667,6 +696,7 @@ setup_properties(const InterrogateFunction &ifunc, InterfaceMaker *interface_mak
     Parameter param;
     param._has_name = true;
     param._name = params[i]->get_simple_name();
+    param._nullable = params[i]->_attributes.has_attribute("in::nullable");
 
     if (param._name.empty()) {
       // If the parameter has no name, record it as being nameless, but also
@@ -761,6 +791,8 @@ setup_properties(const InterrogateFunction &ifunc, InterfaceMaker *interface_mak
     _return_type = interface_maker->remap_parameter(_cpptype, void_type);
     assert(_return_type != nullptr);
   }
+
+  _return_nullable = _cppfunc->_attributes.has_attribute("in::nullable");
 
   // Do we need to manage the return value?
   _return_value_needs_management =

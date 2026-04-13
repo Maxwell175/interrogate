@@ -5,6 +5,7 @@ set(INTERROGATE_HEADERS
   functionWriters.h
   interfaceMaker.h
   interfaceMakerC.h
+  interfaceMakerCSharp.h
   interfaceMakerPython.h interfaceMakerPythonObj.h
   interfaceMakerPythonSimple.h
   interfaceMakerPythonNative.h
@@ -32,6 +33,7 @@ set(INTERROGATE_SOURCES
   functionWriters.cxx
   interfaceMaker.cxx
   interfaceMakerC.cxx
+  interfaceMakerCSharp.cxx
   interfaceMakerPython.cxx interfaceMakerPythonObj.cxx
   interfaceMakerPythonSimple.cxx
   interfaceMakerPythonNative.cxx
@@ -131,6 +133,12 @@ add_executable(interrogate ${INTERROGATE_SOURCES}
   ${CMAKE_CURRENT_BINARY_DIR}/interrogate_preamble_python_native.h.cxx)
 target_link_libraries(interrogate cppParser interrogatedb)
 
+set(INTERROGATE_CSHARP_SOURCES ${INTERROGATE_SOURCES})
+list(REMOVE_ITEM INTERROGATE_CSHARP_SOURCES interrogate.cxx)
+add_executable(interrogate_csharp interrogate_csharp.cxx ${INTERROGATE_CSHARP_SOURCES}
+  ${CMAKE_CURRENT_BINARY_DIR}/interrogate_preamble_python_native.h.cxx)
+target_link_libraries(interrogate_csharp cppParser interrogatedb)
+
 # parse_file utility
 add_executable(parse_file parse_file.cxx)
 target_link_libraries(parse_file cppParser)
@@ -141,6 +149,7 @@ target_link_libraries(interrogate_module cppParser interrogatedb)
 
 if(NOT CMAKE_CROSSCOMPILING)
   add_executable(host_interrogate ALIAS interrogate)
+  add_executable(host_interrogate_csharp ALIAS interrogate_csharp)
   add_executable(host_interrogate_module ALIAS interrogate_module)
 
 else()
@@ -166,7 +175,8 @@ endif()
 
 if(SKBUILD)
   install(TARGETS interrogate COMPONENT tools DESTINATION interrogate)
+  install(TARGETS interrogate_csharp COMPONENT tools DESTINATION interrogate_csharp)
   install(TARGETS interrogate_module COMPONENT tools DESTINATION interrogate_module)
 else()
-  install(TARGETS interrogate interrogate_module COMPONENT tools DESTINATION ${CMAKE_INSTALL_BINDIR})
+  install(TARGETS interrogate interrogate_csharp interrogate_module COMPONENT tools DESTINATION ${CMAKE_INSTALL_BINDIR})
 endif()

@@ -285,6 +285,7 @@ pop_struct() {
 %token KW_END_PUBLISH "__end_publish"
 %token KW_ENUM "enum"
 %token KW_EXTENSION "__extension"
+%token KW_CSHARP_EXTENSION "__csharp_extension"
 %token KW_EXTERN "extern"
 %token KW_EXPLICIT "explicit"
 %token KW_EXPLICIT_LPAREN "explicit("
@@ -1072,6 +1073,10 @@ storage_class:
         | KW_EXTENSION storage_class
 {
   $$ = $2 | (int)CPPInstance::SC_extension;
+}
+        | KW_CSHARP_EXTENSION storage_class
+{
+  $$ = $2 | (int)CPPInstance::SC_csharp_extension;
 }
         | KW_THREAD_LOCAL storage_class
 {

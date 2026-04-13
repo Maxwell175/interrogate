@@ -20,6 +20,7 @@
 #include "interfaceMakerPythonObj.h"
 #include "interfaceMakerPythonSimple.h"
 #include "interfaceMakerPythonNative.h"
+#include "interfaceMakerCSharp.h"
 #include "functionRemap.h"
 
 #include "interrogateType.h"
@@ -354,6 +355,11 @@ write_code(ostream &out_code,ostream * out_include, InterrogateModuleDef *def) {
     makers.push_back(maker);
   }
 
+  if (build_csharp) {
+    InterfaceMakerCSharp *maker = new InterfaceMakerCSharp(def);
+    makers.push_back(maker);
+  }
+
   EXPORT_IMPORT_PREFIX = std::string("EXPCL_") + def->module_name;
   for (size_t i = 0; i < EXPORT_IMPORT_PREFIX.size(); i++) {
     EXPORT_IMPORT_PREFIX[i] = toupper(EXPORT_IMPORT_PREFIX[i]);
@@ -387,6 +393,9 @@ write_code(ostream &out_code,ostream * out_include, InterrogateModuleDef *def) {
   }
 
   declaration_bodies << "#include <sstream>\n";
+  if (build_csharp) {
+    declaration_bodies << "#include \"extension.h\"\n";
+  }
   declaration_bodies << "\n";
 
   IncludeFiles::const_iterator ifi;
@@ -2555,6 +2564,10 @@ define_struct_type(InterrogateType &itype, CPPStructType *cpptype,
 
   if (cpptype->is_final()) {
     itype._flags |= InterrogateType::F_final;
+  }
+
+  if (cpptype->is_abstract()) {
+    itype._flags |= InterrogateType::F_abstract;
   }
 
   if (cpptype->_file.is_c_file()) {

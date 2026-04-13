@@ -91,6 +91,38 @@ is_extension() const {
  * @since 1.11.0
  */
 INLINE bool InterrogateFunctionWrapper::
+is_csharp_extension() const {
+  return (_flags & F_csharp_extension) != 0;
+}
+
+/**
+ * @since 1.11.0
+ */
+INLINE bool InterrogateFunctionWrapper::
+is_explicit_self() const {
+  return (_flags & F_explicit_self) != 0;
+}
+
+/**
+ * @since 1.11.0
+ */
+INLINE bool InterrogateFunctionWrapper::
+is_forced_void_return() const {
+  return (_flags & F_forced_void_return) != 0;
+}
+
+/**
+ * @since 1.11.0
+ */
+INLINE bool InterrogateFunctionWrapper::
+is_return_nullable() const {
+  return (_flags & F_return_nullable) != 0;
+}
+
+/**
+ * @since 1.11.0
+ */
+INLINE bool InterrogateFunctionWrapper::
 is_deprecated() const {
   return (_flags & F_deprecated) != 0;
 }
@@ -117,6 +149,15 @@ get_return_type() const {
 INLINE bool InterrogateFunctionWrapper::
 caller_manages_return_value() const {
   return (_flags & F_caller_manages) != 0;
+}
+
+/**
+ * Returns true if the wrapper returns a refcounted value whose ownership is
+ * transferred via the C API.
+ */
+INLINE bool InterrogateFunctionWrapper::
+manages_reference_count() const {
+  return (_flags & F_manage_reference_count) != 0;
 }
 
 /**
@@ -187,6 +228,17 @@ INLINE bool InterrogateFunctionWrapper::
 parameter_is_optional(int n) const {
   if (n >= 0 && n < (int)_parameters.size()) {
     return (_parameters[n]._parameter_flags & PF_is_optional) != 0;
+  }
+  return false;
+}
+
+/**
+ *
+ */
+INLINE bool InterrogateFunctionWrapper::
+parameter_is_nullable(int n) const {
+  if (n >= 0 && n < (int)_parameters.size()) {
+    return (_parameters[n]._parameter_flags & PF_nullable) != 0;
   }
   return false;
 }

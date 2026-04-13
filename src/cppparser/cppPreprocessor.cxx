@@ -80,6 +80,7 @@ static const std::unordered_map<std::string, int> keywords = {
   {"__end_publish", KW_END_PUBLISH},
   {"enum", KW_ENUM},
   {"extern", KW_EXTERN},
+  {"__csharp_extension", KW_CSHARP_EXTENSION},
   {"__extension", KW_EXTENSION},
   {"explicit", KW_EXPLICIT},
   {"__published", KW_PUBLISHED},

@@ -65,6 +65,12 @@ __pycache__/
 *.pyc
 *.pyo
 
+# C# / .NET
+csharp/**/bin/
+csharp/**/obj/
+*.nupkg
+*.snupkg
+
 # Test tool cache directories
 .tox/
 .cache/

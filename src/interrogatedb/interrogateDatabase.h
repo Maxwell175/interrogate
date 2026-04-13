@@ -110,6 +110,7 @@ public:
 
   void write(std::ostream &out, InterrogateModuleDef *def) const;
   bool read(std::istream &in, InterrogateModuleDef *def);
+  bool read_file(const std::string &database_filename);
 
 private:
   INLINE void check_latest();

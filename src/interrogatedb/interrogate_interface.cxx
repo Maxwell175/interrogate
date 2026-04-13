@@ -456,6 +456,30 @@ interrogate_wrapper_is_extension(FunctionWrapperIndex wrapper) {
 }
 
 bool
+interrogate_wrapper_is_csharp_extension(FunctionWrapperIndex wrapper) {
+  // cerr << "interrogate_wrapper_is_csharp_extension(" << wrapper << ")\n";
+  return InterrogateDatabase::get_ptr()->get_wrapper(wrapper).is_csharp_extension();
+}
+
+bool
+interrogate_wrapper_is_explicit_self(FunctionWrapperIndex wrapper) {
+  // cerr << "interrogate_wrapper_is_explicit_self(" << wrapper << ")\n";
+  return InterrogateDatabase::get_ptr()->get_wrapper(wrapper).is_explicit_self();
+}
+
+bool
+interrogate_wrapper_is_forced_void_return(FunctionWrapperIndex wrapper) {
+  // cerr << "interrogate_wrapper_is_forced_void_return(" << wrapper << ")\n";
+  return InterrogateDatabase::get_ptr()->get_wrapper(wrapper).is_forced_void_return();
+}
+
+bool
+interrogate_wrapper_is_return_nullable(FunctionWrapperIndex wrapper) {
+  // cerr << "interrogate_wrapper_is_return_nullable(" << wrapper << ")\n";
+  return InterrogateDatabase::get_ptr()->get_wrapper(wrapper).is_return_nullable();
+}
+
+bool
 interrogate_wrapper_is_deprecated(FunctionWrapperIndex wrapper) {
   // cerr << "interrogate_wrapper_is_deprecated(" << wrapper << ")\n";
   return InterrogateDatabase::get_ptr()->get_wrapper(wrapper).is_deprecated();
@@ -490,6 +514,12 @@ interrogate_wrapper_caller_manages_return_value(FunctionWrapperIndex wrapper) {
   // cerr << "interrogate_wrapper_caller_manages_return_value(" << wrapper <<
   // ")\n";
   return InterrogateDatabase::get_ptr()->get_wrapper(wrapper).caller_manages_return_value();
+}
+
+bool
+interrogate_wrapper_manages_reference_count(FunctionWrapperIndex wrapper) {
+  // cerr << "interrogate_wrapper_manages_reference_count(" << wrapper << ")\n";
+  return InterrogateDatabase::get_ptr()->get_wrapper(wrapper).manages_reference_count();
 }
 
 FunctionIndex
@@ -536,6 +566,12 @@ bool
 interrogate_wrapper_parameter_is_optional(FunctionWrapperIndex wrapper, int n) {
   // cerr << "interrogate_wrapper_is_optional(" << wrapper << ", " << n << ")\n";
   return InterrogateDatabase::get_ptr()->get_wrapper(wrapper).parameter_is_optional(n);
+}
+
+bool
+interrogate_wrapper_parameter_is_nullable(FunctionWrapperIndex wrapper, int n) {
+  // cerr << "interrogate_wrapper_is_nullable(" << wrapper << ", " << n << ")\n";
+  return InterrogateDatabase::get_ptr()->get_wrapper(wrapper).parameter_is_nullable(n);
 }
 
 bool
@@ -885,6 +921,12 @@ bool
 interrogate_type_is_union(TypeIndex type) {
   // cerr << "interrogate_type_is_union(" << type << ")\n";
   return InterrogateDatabase::get_ptr()->get_type(type).is_union();
+}
+
+bool
+interrogate_type_is_abstract(TypeIndex type) {
+  // cerr << "interrogate_type_is_abstract(" << type << ")\n";
+  return InterrogateDatabase::get_ptr()->get_type(type).is_abstract();
 }
 
 bool

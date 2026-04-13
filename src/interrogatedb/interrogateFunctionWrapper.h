@@ -37,11 +37,16 @@ public:
   INLINE bool is_copy_constructor() const;
   INLINE bool is_coerce_constructor() const;
   INLINE bool is_extension() const;
+  INLINE bool is_csharp_extension() const;
+  INLINE bool is_explicit_self() const;
+  INLINE bool is_forced_void_return() const;
+  INLINE bool is_return_nullable() const;
   INLINE bool is_deprecated() const;
 
   INLINE bool has_return_value() const;
   INLINE TypeIndex get_return_type() const;
   INLINE bool caller_manages_return_value() const;
+  INLINE bool manages_reference_count() const;
   INLINE FunctionIndex get_return_value_destructor() const;
 
   INLINE int number_of_parameters() const;
@@ -50,6 +55,7 @@ public:
   INLINE const std::string &parameter_get_name(int n) const;
   INLINE bool parameter_is_this(int n) const;
   INLINE bool parameter_is_optional(int n) const;
+  INLINE bool parameter_is_nullable(int n) const;
 
   INLINE const std::string &get_unique_name() const;
 
@@ -71,12 +77,18 @@ private:
     F_coerce_constructor = 0x0010,
     F_extension        = 0x0020,
     F_deprecated       = 0x0040,
+    F_manage_reference_count = 0x0080,
+    F_explicit_self    = 0x0100,
+    F_forced_void_return = 0x0200,
+    F_csharp_extension = 0x0400,
+    F_return_nullable  = 0x0800,
   };
 
   enum ParameterFlags {
     PF_has_name       = 0x0001,
     PF_is_this        = 0x0002,
     PF_is_optional    = 0x0004,
+    PF_nullable       = 0x0008,
   };
 
   int _flags;

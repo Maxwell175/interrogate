@@ -72,8 +72,23 @@ write(std::ostream &out, int indent_level, const char *tag) const {
     if (_flags & F_extension) {
       out << " extension";
     }
+    if (_flags & F_csharp_extension) {
+      out << " csharp_extension";
+    }
     if (_flags & F_deprecated) {
       out << " deprecated";
+    }
+    if (_flags & F_manage_reference_count) {
+      out << " manage_reference_count";
+    }
+    if (_flags & F_explicit_self) {
+      out << " explicit_self";
+    }
+    if (_flags & F_forced_void_return) {
+      out << " forced_void_return";
+    }
+    if (_flags & F_return_nullable) {
+      out << " return_nullable";
     }
     out << "\n";
   }
@@ -119,6 +134,9 @@ write(std::ostream &out, int indent_level, const char *tag) const {
     }
     if (param._parameter_flags & PF_is_optional) {
       out << " (optional)";
+    }
+    if (param._parameter_flags & PF_nullable) {
+      out << " (nullable)";
     }
     out << ": " << idb->get_type(param._type).get_scoped_name() << "\n";
   }

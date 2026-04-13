@@ -308,6 +308,14 @@ is_final() const {
 }
 
 /**
+ * Returns true if the type is abstract.
+ */
+INLINE bool InterrogateType::
+is_abstract() const {
+  return (_flags & F_abstract) != 0;
+}
+
+/**
  *
  */
 INLINE bool InterrogateType::

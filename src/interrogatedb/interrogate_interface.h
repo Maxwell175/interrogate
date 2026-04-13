@@ -288,6 +288,10 @@ EXPCL_INTERROGATEDB bool interrogate_wrapper_is_coerce_constructor(FunctionWrapp
 // This returns true if this is an extension function, rather than a real
 // function defined in the C++ code.
 EXPCL_INTERROGATEDB bool interrogate_wrapper_is_extension(FunctionWrapperIndex wrapper);
+EXPCL_INTERROGATEDB bool interrogate_wrapper_is_csharp_extension(FunctionWrapperIndex wrapper);
+EXPCL_INTERROGATEDB bool interrogate_wrapper_is_explicit_self(FunctionWrapperIndex wrapper);
+EXPCL_INTERROGATEDB bool interrogate_wrapper_is_forced_void_return(FunctionWrapperIndex wrapper);
+EXPCL_INTERROGATEDB bool interrogate_wrapper_is_return_nullable(FunctionWrapperIndex wrapper);
 
 // This returns true if function is marked as deprecated.
 EXPCL_INTERROGATEDB bool interrogate_wrapper_is_deprecated(FunctionWrapperIndex wrapper);
@@ -322,6 +326,7 @@ EXPCL_INTERROGATEDB TypeIndex interrogate_wrapper_return_type(FunctionWrapperInd
  * value.
  */
 EXPCL_INTERROGATEDB bool interrogate_wrapper_caller_manages_return_value(FunctionWrapperIndex wrapper);
+EXPCL_INTERROGATEDB bool interrogate_wrapper_manages_reference_count(FunctionWrapperIndex wrapper);
 EXPCL_INTERROGATEDB FunctionIndex interrogate_wrapper_return_value_destructor(FunctionWrapperIndex wrapper);
 
 // These define the parameters of the function.
@@ -331,6 +336,7 @@ EXPCL_INTERROGATEDB bool interrogate_wrapper_parameter_has_name(FunctionWrapperI
 EXPCL_INTERROGATEDB const char *interrogate_wrapper_parameter_name(FunctionWrapperIndex wrapper, int n);
 EXPCL_INTERROGATEDB bool interrogate_wrapper_parameter_is_this(FunctionWrapperIndex wrapper, int n);
 EXPCL_INTERROGATEDB bool interrogate_wrapper_parameter_is_optional(FunctionWrapperIndex wrapper, int n);
+EXPCL_INTERROGATEDB bool interrogate_wrapper_parameter_is_nullable(FunctionWrapperIndex wrapper, int n);
 
 // This returns a pointer to a function that may be called to invoke the
 // function, if the -fptrs option to return function pointers was specified to
@@ -477,6 +483,7 @@ EXPCL_INTERROGATEDB int interrogate_type_enum_value(TypeIndex type, int n);
 EXPCL_INTERROGATEDB bool interrogate_type_is_struct(TypeIndex type);
 EXPCL_INTERROGATEDB bool interrogate_type_is_class(TypeIndex type);
 EXPCL_INTERROGATEDB bool interrogate_type_is_union(TypeIndex type);
+EXPCL_INTERROGATEDB bool interrogate_type_is_abstract(TypeIndex type);
 
 // If is_fully_defined() returns false, this classstruct was a forward
 // reference, and we really don't know anything about it.  (In this case, it

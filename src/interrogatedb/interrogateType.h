@@ -77,6 +77,7 @@ public:
   INLINE bool is_class() const;
   INLINE bool is_union() const;
   INLINE bool is_final() const;
+  INLINE bool is_abstract() const;
 
   INLINE bool is_fully_defined() const;
   INLINE bool is_unpublished() const;
@@ -145,6 +146,7 @@ private:
     F_scoped_enum          = 0x800000,
     F_final                =0x1000000,
     F_deprecated           =0x2000000,
+    F_abstract             =0x4000000,
   };
 
 public:

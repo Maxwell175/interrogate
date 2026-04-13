@@ -579,10 +579,40 @@ record_function(const InterrogateType &itype, FunctionIndex func_index) {
 
 // printf(" Function Name = %s\n", ifunc.get_name().c_str());
 
+  // Binary .in databases carry no _instances; synthesize from _cpptype when
+  // available (preserved by InterrogateType::merge_with for live parse runs).
+  InterrogateFunction::Instances synthetic_instances;
+  if (ifunc._instances == nullptr && itype._cpptype != nullptr) {
+    CPPType *resolved = TypeManager::resolve_type(itype._cpptype);
+    CPPStructType *struct_type = resolved ? resolved->as_struct_type() : nullptr;
+    if (struct_type != nullptr && struct_type->_scope != nullptr &&
+        ifunc.has_name()) {
+      CPPDeclaration *decl = struct_type->_scope->find_symbol(ifunc.get_name(), false);
+      if (decl != nullptr) {
+        CPPFunctionGroup *fgroup = decl->as_function_group();
+        if (fgroup != nullptr) {
+          size_t synthetic_index = 0;
+          for (CPPFunctionGroup::Instances::const_iterator gi = fgroup->_instances.begin();
+               gi != fgroup->_instances.end(); ++gi) {
+            synthetic_instances[(*gi)->get_fully_scoped_name() + "#" + std::to_string(synthetic_index++)] = *gi;
+          }
+        } else {
+          CPPInstance *inst = decl->as_instance();
+          if (inst != nullptr) {
+            synthetic_instances[inst->get_fully_scoped_name()] = inst;
+          }
+        }
+      }
+    }
+  }
+
+  const InterrogateFunction::Instances *instances =
+    (ifunc._instances != nullptr) ? ifunc._instances : &synthetic_instances;
+
   // Now get all the valid FunctionRemaps for the function.
-  if (ifunc._instances != nullptr) {
+  if (!instances->empty()) {
     InterrogateFunction::Instances::const_iterator ii;
-    for (ii = ifunc._instances->begin(); ii != ifunc._instances->end(); ++ii) {
+    for (ii = instances->begin(); ii != instances->end(); ++ii) {
       CPPInstance *cppfunc = (*ii).second;
       CPPFunctionType *ftype = cppfunc->_type->as_function_type();
       int max_default_parameters = 0;
@@ -763,12 +793,6 @@ manage_return_value(ostream &out, int indent_level,
       type->output_instance(out, "refcount", &parser);
       out << " = " << return_expr << ";\n";
 
-      indent(out, indent_level)
-        << "if (" << return_expr << " != nullptr) {\n";
-      indent(out, indent_level + 2)
-        << "(" << return_expr << ")->ref();\n";
-      indent(out, indent_level)
-        << "}\n";
       output_ref(out, indent_level, remap, "refcount");
       return remap->_return_type->temporary_to_return("refcount");
     }
@@ -805,7 +829,15 @@ output_ref(ostream &out, int indent_level, FunctionRemap *remap,
            const string &varname) const {
 
   if (TypeManager::is_pointer_to_base(remap->_return_type->get_temporary_type())) {
-    // Actually, we have it stored in a PointerTo.  No need to do anything.
+    // Stored in a PointerTo, but the extern "C" wrapper returns a raw
+    // pointer.  The PointerTo destructor unrefs when the local goes out of
+    // scope, so we need an explicit ref to keep the object alive for the caller.
+    indent(out, indent_level)
+      << "if (" << varname << " != nullptr) {\n";
+    indent(out, indent_level + 2)
+      << varname << "->ref();\n";
+    indent(out, indent_level)
+      << "}\n";
     return;
   }
 

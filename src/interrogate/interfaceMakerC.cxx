@@ -151,7 +151,11 @@ write_prototype_for(ostream &out, InterfaceMaker::Function *func) {
   for (ri = func->_remaps.begin(); ri != func->_remaps.end(); ++ri) {
     FunctionRemap *remap = (*ri);
 
-    if (remap->_extension || (remap->_flags & FunctionRemap::F_explicit_self)) {
+    if (remap->_flags & FunctionRemap::F_explicit_self) {
+      continue;
+    }
+
+    if (remap->_extension && !remap->_csharp_extension) {
       continue;
     }
 
@@ -184,7 +188,10 @@ write_function_for(ostream &out, InterfaceMaker::Function *func) {
 void InterfaceMakerC::
 write_function_instance(ostream &out, InterfaceMaker::Function *func,
                         FunctionRemap *remap) {
-  if (remap->_extension || (remap->_flags & FunctionRemap::F_explicit_self)) {
+  if (remap->_flags & FunctionRemap::F_explicit_self) {
+    return;
+  }
+  if (remap->_extension && !remap->_csharp_extension) {
     return;
   }
 
@@ -208,8 +215,10 @@ write_function_instance(ostream &out, InterfaceMaker::Function *func,
     write_spam_message(out, remap);
   }
 
+  std::string container =
+    (remap->_extension && remap->_csharp_extension && !remap->_has_this) ? "" : "param0";
   std::string return_expr =
-    remap->call_function(out, 2, true, "param0");
+    remap->call_function(out, 2, true, container);
   return_expr = manage_return_value(out, 2, remap, return_expr);
   if (!return_expr.empty()) {
     out << "  return " << return_expr << ";\n";

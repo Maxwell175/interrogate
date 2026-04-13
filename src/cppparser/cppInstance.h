@@ -61,6 +61,7 @@ public:
     // And this is for methods tagged with __extension, which declares
     // extension methods defined separately from the source code.
     SC_extension    = 0x2000,
+    SC_csharp_extension = 0x400000,
 
     // These are for =default and =delete functions.
     SC_defaulted    = 0x4000,

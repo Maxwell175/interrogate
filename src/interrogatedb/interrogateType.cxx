@@ -130,10 +130,16 @@ merge_with(const InterrogateType &other) {
     _flags |= (other._flags & F_global);
 
   } else {
-    // They win.
+    // They win.  Binary .in files never carry _cpptype; keep ours if present.
+    CPPType  *saved_cpptype  = _cpptype;
+    CPPScope *saved_cppscope = _cppscope;
     int old_flags = (_flags & F_global);
     (*this) = other;
     _flags |= old_flags;
+    if (_cpptype == nullptr && saved_cpptype != nullptr) {
+      _cpptype  = saved_cpptype;
+      _cppscope = saved_cppscope;
+    }
   }
 }
 
@@ -225,6 +231,9 @@ write(std::ostream &out, int indent_level) const {
     }
     if (_flags & F_final) {
       out << " final";
+    }
+    if (_flags & F_abstract) {
+      out << " abstract";
     }
     if (_flags & F_deprecated) {
       out << " deprecated";

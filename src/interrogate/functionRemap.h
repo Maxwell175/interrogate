@@ -71,6 +71,7 @@ public:
     bool _has_name;
     std::string _name;
     ParameterRemap *_remap;
+    bool _nullable;
   };
 
   enum Type {
@@ -115,6 +116,7 @@ public:
   bool _has_this;
   bool _blocking;
   bool _extension;
+  bool _csharp_extension;
   bool _const_method;
   size_t _first_true_parameter;
   int _num_default_parameters;
@@ -132,6 +134,7 @@ public:
   bool _return_value_needs_management;
   FunctionIndex _return_value_destructor;
   bool _manage_reference_count;
+  bool _return_nullable;
 
   CPPType *_cpptype;
   CPPScope *_cppscope;
