@@ -19,6 +19,7 @@
 #include "filename.h"
 
 #include <string>
+#include <vector>
 
 extern CPPParser parser;
 
@@ -47,6 +48,7 @@ extern bool mangle_names;
 extern CPPVisibility min_vis;
 extern std::string library_name;
 extern std::string module_name;
+extern std::vector<Filename> database_search_dirs;
 extern Filename csharp_output_dir;
 extern std::string csharp_dll_name;
 

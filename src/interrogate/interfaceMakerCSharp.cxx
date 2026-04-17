@@ -35,12 +35,15 @@
 #include <cctype>
 #include <functional>
 #include <fstream>
+#include <set>
 #include <sstream>
 
 using std::ostream;
 using std::string;
 
-
+std::set<int> csharp_owned_type_indices;
+std::map<int, std::string> csharp_type_module_map;
+std::map<std::string, std::string> csharp_library_to_module;
 
 namespace {
 
@@ -352,6 +355,16 @@ void
 emit_peer_namespace_usings(ostream &out, const string &cs_namespace, const string &dir) {
   std::set<string> peers;
   collect_peer_namespaces(dir, peers);
+
+  // Also add namespaces from the --module-map (csharp_library_to_module),
+  // which provides a complete set of known modules.
+  for (const auto &entry : csharp_library_to_module) {
+    string ns = prettify_namespace(entry.second);
+    if (!ns.empty()) {
+      peers.insert(ns);
+    }
+  }
+
   for (const string &ns : peers) {
     if (ns != cs_namespace) {
       out << "using " << ns << ";\n";
@@ -359,11 +372,55 @@ emit_peer_namespace_usings(ostream &out, const string &cs_namespace, const strin
   }
 }
 
+static bool
+find_file_in_tree(const Filename &dir, const string &basename,
+                  Filename &result, std::set<string> &visited) {
+  Filename search_dir(dir);
+  search_dir.make_absolute();
+  search_dir.standardize();
+
+  string dir_key = search_dir.to_os_generic();
+  if (!visited.insert(dir_key).second || !search_dir.is_directory()) {
+    return false;
+  }
+
+  vector_string contents;
+  if (!search_dir.scan_directory(contents)) {
+    return false;
+  }
+
+  for (const string &entry : contents) {
+    if (entry == basename) {
+      result = Filename(search_dir, entry);
+      return true;
+    }
+  }
+
+  for (const string &entry : contents) {
+    if (entry == "." || entry == "..") continue;
+    Filename child(search_dir, entry);
+    if (child.is_directory() && find_file_in_tree(child, basename, result, visited)) {
+      return true;
+    }
+  }
+  return false;
+}
+
 Filename
 find_database_file(const string &basename) {
+  // Check the directory of the first loaded .in file
   Filename local(output_data_filename.get_dirname(), basename);
   if (local.exists()) {
     return local;
+  }
+
+  // Search configured search directories recursively
+  for (const Filename &dir : database_search_dirs) {
+    Filename result;
+    std::set<string> visited;
+    if (find_file_in_tree(dir, basename, result, visited)) {
+      return result;
+    }
   }
 
   return Filename();
@@ -487,6 +544,28 @@ build_signature_key(const string &name, const std::vector<string> &param_types,
 
 string
 get_csharp_type_name(const InterrogateType &itype) {
+  // For types nested inside another class, prefix the C# name with the outer
+  // class name + underscore.
+  if (itype.get_outer_class() != 0) {
+    InterrogateDatabase *idb = InterrogateDatabase::get_ptr();
+    const InterrogateType &outer = idb->get_type(itype.get_outer_class());
+    string outer_name;
+    if (outer.has_name()) {
+      outer_name = make_csharp_identifier(outer.get_name());
+    } else if (outer.has_scoped_name()) {
+      outer_name = make_csharp_identifier(InterrogateBuilder::descope(outer.get_scoped_name()));
+    }
+    string simple;
+    if (itype.has_name()) {
+      simple = make_csharp_identifier(itype.get_name());
+    } else if (itype.has_scoped_name()) {
+      simple = make_csharp_identifier(InterrogateBuilder::descope(itype.get_scoped_name()));
+    }
+    if (!outer_name.empty() && !simple.empty()) {
+      return outer_name + "_" + simple;
+    }
+  }
+
   if (itype.has_name()) {
     return make_csharp_identifier(itype.get_name());
   }
@@ -727,6 +806,11 @@ should_skip_csharp_type(const InterrogateType &itype) {
     return true;
   }
 
+  // Skip C++ internal types that are not exported.;
+  if (!itype.is_global() && !itype.is_fully_defined()) {
+    return true;
+  }
+
   string simple_name = get_csharp_type_name(itype);
   if (simple_name == "basic_string_char") {
     return true;
@@ -943,12 +1027,46 @@ get_native_ownership_name(FunctionRemap *remap, bool for_constructor) {
   return "NativeOwnership.Borrowed";
 }
 
+/**
+ * Walks the InterrogateType inheritance chain to determine whether the given
+ * type derives from ReferenceCount (or is ReferenceCount itself).
+ */
+static bool
+is_type_refcounted(TypeIndex type_index,
+                   std::set<TypeIndex> &visited) {
+  if (type_index == 0) return false;
+  if (!visited.insert(type_index).second) return false;  // cycle guard
+
+  InterrogateDatabase *idb = InterrogateDatabase::get_ptr();
+  const InterrogateType &itype = idb->get_type(type_index);
+
+  const string &true_name = itype.get_true_name();
+  if (true_name == "ReferenceCount" || true_name == "TypedReferenceCount") {
+    return true;
+  }
+
+  int num_derivations = itype.number_of_derivations();
+  for (int i = 0; i < num_derivations; ++i) {
+    if (is_type_refcounted(itype.get_derivation(i), visited)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+static bool
+is_type_refcounted(TypeIndex type_index) {
+  std::set<TypeIndex> visited;
+  return is_type_refcounted(type_index, visited);
+}
+
 string
 get_native_ownership_name(const InterrogateFunctionWrapper &wrapper,
                           bool for_constructor) {
   if (wrapper.manages_reference_count()) {
     return "NativeOwnership.RefCounted";
   }
+
   if (for_constructor || wrapper.caller_manages_return_value()) {
     return "NativeOwnership.Owned";
   }
@@ -1220,11 +1338,6 @@ best_legal_method_remap(InterfaceMaker::Function *func) {
   return best;
 }
 
-bool
-object_has_virtual_methods(InterfaceMaker::Object *) {
-  return false;
-}
-
 void
 ensure_make_seqs(InterfaceMaker &maker, InterfaceMaker::Object *object) {
   if (object == nullptr) {
@@ -1265,11 +1378,6 @@ ensure_make_seqs(InterfaceMaker &maker, InterfaceMaker::Object *object) {
 }
 
 string
-get_director_class_name(const InterrogateType &itype) {
-  return "CSharpDirector_" + get_csharp_type_name(itype);
-}
-
-string
 get_supplemental_destructor_entry_point(const InterrogateType &itype) {
   string name;
   if (itype.has_scoped_name()) {
@@ -1297,6 +1405,36 @@ get_supplemental_destructor_name(const InterrogateType &itype) {
     name = get_csharp_type_name(itype);
   }
   return make_csharp_identifier("Destroy_" + name);
+}
+
+string
+get_supplemental_unref_destructor_entry_point(const InterrogateType &itype) {
+  string name;
+  if (itype.has_scoped_name()) {
+    name = itype.get_scoped_name();
+    for (char &c : name) {
+      if (c == ':' || c == '<' || c == '>' || c == ',' || c == ' ') {
+        c = '_';
+      }
+    }
+  } else {
+    name = get_csharp_type_name(itype);
+  }
+  return "_inCSUnrefDestr_" + name;
+}
+
+string
+get_supplemental_unref_destructor_name(const InterrogateType &itype) {
+  string name;
+  if (itype.has_scoped_name()) {
+    name = itype.get_scoped_name();
+    for (char &c : name) {
+      if (c == ':') c = '_';
+    }
+  } else {
+    name = get_csharp_type_name(itype);
+  }
+  return make_csharp_identifier("UnrefDestroy_" + name);
 }
 
 }  // namespace
@@ -1336,12 +1474,6 @@ write_prototypes(ostream &, ostream *) {
  */
 void InterfaceMakerCSharp::
 write_functions(ostream &out) {
-  struct DirectorMethod {
-    Function *func;
-    FunctionRemap *remap;
-  };
-
-  std::vector<Object *> director_objects;
   std::vector<Object *> destructor_objects;
   std::vector<Object *> collection_objects;
 
@@ -1363,17 +1495,13 @@ write_functions(ostream &out) {
       }
     }
 
-    if (object_has_virtual_methods(object)) {
-      director_objects.push_back(object);
-    }
-
     CollectionFacadeKind facade_kind = get_collection_facade_kind(object->_itype);
     if (facade_kind != CF_none && facade_kind != CF_array_base) {
       collection_objects.push_back(object);
     }
   }
 
-  if (destructor_objects.empty() && director_objects.empty() && collection_objects.empty()) {
+  if (destructor_objects.empty() && collection_objects.empty()) {
     return;
   }
 
@@ -1383,23 +1511,20 @@ write_functions(ostream &out) {
       << "#define EXPORT_FUNC extern \"C\"\n"
       << "#endif\n\n";
 
-  bool need_abort = false;
-  for (Object *object : director_objects) {
-    for (Function *func : object->_methods) {
-      FunctionRemap *remap = best_legal_method_remap(func);
-      if (func != nullptr && remap != nullptr && func->_ifunc.is_virtual() &&
-          remap->_cppfunc != nullptr &&
-          (remap->_cppfunc->_storage_class & CPPInstance::SC_pure_virtual) != 0) {
-        need_abort = true;
-        break;
-      }
+  // Collect all objects that are RefCounted (for unref_delete wrappers).
+  std::vector<Object *> refcounted_objects;
+  for (oi = _objects.begin(); oi != _objects.end(); ++oi) {
+    Object *object = (*oi).second;
+    if (object == nullptr || should_skip_csharp_type(object->_itype) ||
+        !is_current_native_methods_type(object->_itype) ||
+        !object->_itype.has_destructor()) {
+      continue;
     }
-    if (need_abort) {
-      break;
+    CPPType *cpptype = object->_itype._cpptype != nullptr
+      ? TypeManager::resolve_type(object->_itype._cpptype) : nullptr;
+    if (cpptype != nullptr && TypeManager::is_reference_count(cpptype)) {
+      refcounted_objects.push_back(object);
     }
-  }
-  if (need_abort) {
-    out << "#include <stdlib.h>\n\n";
   }
 
   for (Object *object : destructor_objects) {
@@ -1427,210 +1552,19 @@ write_functions(ostream &out) {
     out << "}\n\n";
   }
 
-  for (Object *object : director_objects) {
-    const InterrogateType &itype = object->_itype;
-    CPPType *cpptype = TypeManager::resolve_type(itype._cpptype);
+  // Emit unref_delete wrappers for all RefCounted types.
+  for (Object *object : refcounted_objects) {
+    CPPType *cpptype = TypeManager::resolve_type(object->_itype._cpptype);
+    string entry_point = get_supplemental_unref_destructor_entry_point(object->_itype);
+
+    out << "EXPORT_FUNC void " << entry_point << "(";
     CPPType *pointer_type = TypeManager::wrap_pointer(cpptype);
-    string class_name = get_class_name(itype);
-    string director_class_name = get_director_class_name(itype);
-    string cpp_class_name = (cpptype != nullptr) ? cpptype->get_fully_scoped_name() : class_name;
-
-    std::vector<DirectorMethod> methods;
-    for (Function *func : object->_methods) {
-      FunctionRemap *remap = best_legal_method_remap(func);
-      if (func != nullptr && remap != nullptr && func->_ifunc.is_virtual()) {
-        DirectorMethod method;
-        method.func = func;
-        method.remap = remap;
-        methods.push_back(method);
-      }
-    }
-    if (methods.empty()) {
-      continue;
-    }
-
-    for (const DirectorMethod &method : methods) {
-      string callback_typedef = "Callback_" + class_name + "_" + method.remap->_hash;
-
-      CPPType *new_return_type = method.remap->_return_type->get_new_type();
-      bool return_is_object = is_wrapped_object_type(_objects, new_return_type);
-
-      out << "typedef ";
-      if (return_is_object) {
-        out << "void *";
-      } else {
-        new_return_type->output(out, 0, &parser, false);
-      }
-      out << " (*" << callback_typedef << ")(void *";
-      size_t first_param = method.remap->_has_this ? 1 : 0;
-      for (size_t i = first_param; i < method.remap->_parameters.size(); ++i) {
-        out << ", ";
-        CPPType *param_type = method.remap->_parameters[i]._remap->get_new_type();
-        if (is_wrapped_object_type(_objects, param_type)) {
-          out << "void *";
-        } else {
-          param_type->output(out, 0, &parser, false);
-        }
-      }
-      out << ");\n";
-    }
-    out << "\n";
-
-    out << "class " << director_class_name << " : public " << cpp_class_name << " {\n"
-        << "public:\n";
-    indent(out, 2) << director_class_name << "() : _csharp_ref(nullptr)";
-    for (const DirectorMethod &method : methods) {
-      out << ", _cb_" << method.remap->_hash << "(nullptr)";
-    }
-    out << " {\n";
-    indent(out, 2) << "}\n\n";
-
-    indent(out, 2) << "void set_csharp_ref(void *csharp_ref) {\n";
-    indent(out, 4) << "_csharp_ref = csharp_ref;\n";
-    indent(out, 2) << "}\n\n";
-
-    for (const DirectorMethod &method : methods) {
-      string callback_typedef = "Callback_" + class_name + "_" + method.remap->_hash;
-      string method_name = method.func->_ifunc.get_name();
-
-      indent(out, 2) << "void set_cb_" << method.remap->_hash << "(" << callback_typedef
-                     << " cb) {\n";
-      indent(out, 4) << "_cb_" << method.remap->_hash << " = cb;\n";
-      indent(out, 2) << "}\n\n";
-
-      CPPFunctionType *ftype = method.remap->_ftype;
-      CPPParameterList *parameters = (ftype != nullptr) ? ftype->_parameters : nullptr;
-
-      indent(out, 2) << "virtual ";
-      if (ftype != nullptr) {
-        ftype->_return_type->output(out, 0, &parser, false);
-      } else {
-        method.remap->_return_type->get_orig_type()->output(out, 0, &parser, false);
-      }
-      out << " " << method_name << "(";
-
-      std::vector<string> cpp_param_names;
-      if (parameters != nullptr) {
-        for (size_t i = 0; i < parameters->_parameters.size(); ++i) {
-          if (i != 0) {
-            out << ", ";
-          }
-          CPPInstance *param = parameters->_parameters[i];
-          string param_name = param->get_simple_name();
-          if (param_name.empty()) {
-            std::ostringstream strm;
-            strm << "param" << i;
-            param_name = strm.str();
-          }
-          cpp_param_names.push_back(param_name);
-          param->_type->output_instance(out, 0, &parser, false, "", param_name);
-        }
-      }
-      out << ")";
-      if (method.remap->_const_method) {
-        out << " const";
-      }
-      out << " override {\n";
-
-      indent(out, 4) << "if (_cb_" << method.remap->_hash << " != nullptr) {\n";
-      std::ostringstream callback_call;
-      callback_call << "_cb_" << method.remap->_hash << "(_csharp_ref";
-      for (size_t i = 0; i < cpp_param_names.size(); ++i) {
-        ParameterRemap *param_remap = method.remap->_parameters[i + (method.remap->_has_this ? 1 : 0)]._remap;
-        CPPType *orig_type = param_remap->get_orig_type();
-        CPPType *new_type = param_remap->get_new_type();
-        string expr = cpp_param_names[i];
-
-        if (is_wrapped_object_type(_objects, new_type)) {
-          if (TypeManager::is_pointer(orig_type)) {
-            expr = "(void *)" + expr;
-          } else {
-            expr = "(void *)&" + expr;
-          }
-        } else if (TypeManager::is_enum(orig_type) && !TypeManager::is_enum(new_type)) {
-          expr = "(" + get_pinvoke_type(new_type, false) + ")" + expr;
-        }
-
-        callback_call << ", " << expr;
-      }
-      callback_call << ")";
-
-      CPPType *orig_return_type = method.remap->_return_type->get_orig_type();
-      CPPType *new_return_type = method.remap->_return_type->get_new_type();
-      bool ret_is_object = is_wrapped_object_type(_objects, new_return_type);
-      if (method.remap->_void_return) {
-        indent(out, 6) << callback_call.str() << ";\n";
-        indent(out, 6) << "return;\n";
-      } else if (ret_is_object) {
-        if (TypeManager::is_pointer(orig_return_type)) {
-          indent(out, 6) << "return (";
-          orig_return_type->output(out, 0, &parser, false);
-          out << ")" << callback_call.str() << ";\n";
-        } else {
-          indent(out, 6) << "return *(";
-          TypeManager::wrap_pointer(orig_return_type)->output(out, 0, &parser, false);
-          out << ")" << callback_call.str() << ";\n";
-        }
-      } else if (TypeManager::is_enum(orig_return_type) && !TypeManager::is_enum(new_return_type)) {
-        indent(out, 6) << "return (";
-        orig_return_type->output(out, 0, &parser, false);
-        out << ")" << callback_call.str() << ";\n";
-      } else {
-        indent(out, 6) << "return " << callback_call.str() << ";\n";
-      }
-      indent(out, 4) << "}\n";
-
-      if (method.remap->_cppfunc != nullptr &&
-          (method.remap->_cppfunc->_storage_class & CPPInstance::SC_pure_virtual) != 0) {
-        indent(out, 4) << "abort();\n";
-      } else {
-        indent(out, 4);
-        if (!method.remap->_void_return) {
-          out << "return ";
-        }
-        out << cpp_class_name << "::" << method_name << "(";
-        for (size_t i = 0; i < cpp_param_names.size(); ++i) {
-          if (i != 0) {
-            out << ", ";
-          }
-          out << cpp_param_names[i];
-        }
-        out << ");\n";
-      }
-
-      out << "  }\n\n";
-    }
-
-    out << "private:\n";
-    indent(out, 2) << "void *_csharp_ref;\n";
-    for (const DirectorMethod &method : methods) {
-      string callback_typedef = "Callback_" + class_name + "_" + method.remap->_hash;
-      indent(out, 2) << callback_typedef << " _cb_" << method.remap->_hash << ";\n";
-    }
-    out << "};\n\n";
-
-    out << "EXPORT_FUNC ";
-    pointer_type->output(out, 0, &parser, false);
-    out << " _inCSDir_" << class_name << "_new() {\n";
-    indent(out, 2) << "return new " << director_class_name << ";\n";
-    out << "}\n\n";
-
-    out << "EXPORT_FUNC void _inCSDir_" << class_name << "_set_csharp_ref(";
     pointer_type->output_instance(out, 0, &parser, false, "", "self");
-    out << ", void *csharp_ref) {\n";
-    indent(out, 2) << "((" << director_class_name << " *)self)->set_csharp_ref(csharp_ref);\n";
+    out << ") {\n";
+    indent(out, 2) << "if (self != nullptr) {\n";
+    indent(out, 4) << "unref_delete(self);\n";
+    indent(out, 2) << "}\n";
     out << "}\n\n";
-
-    for (const DirectorMethod &method : methods) {
-      string callback_typedef = "Callback_" + class_name + "_" + method.remap->_hash;
-
-      out << "EXPORT_FUNC void _inCSDir_" << class_name << "_set_cb_" << method.remap->_hash << "(";
-      pointer_type->output_instance(out, 0, &parser, false, "", "self");
-      out << ", " << callback_typedef << " cb) {\n";
-      indent(out, 2) << "((" << director_class_name << " *)self)->set_cb_"
-                     << method.remap->_hash << "(cb);\n";
-      out << "}\n\n";
-    }
   }
 
   for (Object *object : collection_objects) {
@@ -1649,13 +1583,52 @@ write_functions(ostream &out) {
       cpp_type = itype.get_name();
     }
 
+    // If interrogate exposed this as a pointer-to-collection type (e.g.
+    // "vector_string *" or "ConstPointerToArray<double> const *"), strip the
+    // trailing pointer so that the helpers operate on the collection directly.
+    // Without this, "new vector_string *()" allocates a vector_string** and
+    // the self parameter becomes a double-pointer.
+    while (!cpp_type.empty() && cpp_type.back() == '*') {
+      cpp_type.pop_back();
+      while (!cpp_type.empty() && cpp_type.back() == ' ') {
+        cpp_type.pop_back();
+      }
+    }
+
+    // Build base_cpp_type without a trailing cv-qualifier so that
+    // "TYPE const::value_type" (invalid C++) is never produced.
+    // cpp_type retains its const for use as function parameter types (e.g.
+    // "ConstPointerToArray<double> const *self" is correct and desirable).
+    string base_cpp_type = cpp_type;
+    if (base_cpp_type.size() >= 5 &&
+        base_cpp_type.substr(base_cpp_type.size() - 5) == "const") {
+      base_cpp_type = base_cpp_type.substr(0, base_cpp_type.size() - 5);
+      while (!base_cpp_type.empty() && base_cpp_type.back() == ' ') {
+        base_cpp_type.pop_back();
+      }
+    }
+
+    // If cpp_type had a trailing const, the type is effectively read-only:
+    // non-const member functions (push_back, clear, resize, set_element) cannot
+    // be called on it, and "new const T()" returns const T* which can't
+    // implicitly convert to void*.  Track this so we can suppress mutable
+    // helpers and use base_cpp_type for allocation.
+    bool is_const_type = (cpp_type != base_cpp_type);
+
     string element_type_value = get_collection_element_type_from_suffix(get_collection_suffix(get_csharp_type_name(itype)), false);
     bool is_string = (element_type_value == "string");
     bool is_primitive = is_csharp_primitive_type(element_type_value);
     bool is_blittable = is_csharp_blittable_type(element_type_value);
-    string e_cpp_type = cpp_type + "::value_type";
+    string e_cpp_type = base_cpp_type + "::value_type";
 
-    out << "EXPORT_FUNC void *" << helper_prefix << "empty_constructor() { return new " << cpp_type << "(); }\n";
+    // Const-qualified types are read-only: suppress mutable helpers.
+    if (is_const_type) {
+      is_mutable = false;
+    }
+
+    // Use base_cpp_type (no const) for allocation: "new const T()" returns
+    // const T* which cannot convert to void*.
+    out << "EXPORT_FUNC void *" << helper_prefix << "empty_constructor() { return new " << base_cpp_type << "(); }\n";
     out << "EXPORT_FUNC int " << helper_prefix << "size(" << cpp_type << " *self) { return self->size(); }\n";
     out << "EXPORT_FUNC ";
     if (is_string) {
@@ -1691,7 +1664,11 @@ write_functions(ostream &out) {
 
     // Bulk data helpers for blittable types (zero-copy via pointer)
     if (is_blittable) {
-      out << "EXPORT_FUNC " << e_cpp_type << " *" << helper_prefix << "get_data_ptr(" << cpp_type << " *self) { return &(*self)[0]; }\n";
+      // ConstPointerToArray::operator[] returns a const reference, so
+      // &(*self)[0] is a const pointer.  Use const_cast to obtain a mutable
+      // pointer — the C# side wraps this in ReadOnlySpan for const collections,
+      // so the cast is safe: no mutation will ever occur through the pointer.
+      out << "EXPORT_FUNC " << e_cpp_type << " *" << helper_prefix << "get_data_ptr(" << cpp_type << " *self) { return const_cast<" << e_cpp_type << " *>(&(*self)[0]); }\n";
       out << "EXPORT_FUNC int " << helper_prefix << "get_data_size_bytes(" << cpp_type << " *self) { return (int)(self->size() * sizeof(" << e_cpp_type << ")); }\n";
     }
   }
@@ -1797,12 +1774,138 @@ write_csharp_files(InterrogateModuleDef *def) {
     ensure_make_seqs(*this, (*oi).second);
   }
 
+  // Pre-mark every database that was already loaded for this module's owned
+  // types.  load_all_search_dir_databases() uses request_external_database()
+  // for de-duplication, but command-line databases loaded via idb->read_file()
+  // in main() are NOT tracked there.  If we don't mark them here,
+  // load_all_search_dir_databases() would re-load them, creating duplicate type
+  // stubs.  Re-loading a stub database AFTER its canonical database has been
+  // merged into it resets the merged data (e.g. TextEncoder at TypeIndex N
+  // goes back to 0 methods), breaking secondary-base resolution.
+  {
+    InterrogateDatabase *idb = InterrogateDatabase::get_ptr();
+    for (TypeIndex tidx : csharp_owned_type_indices) {
+      const InterrogateType &itype = idb->get_type(tidx);
+      if (itype.has_library_name()) {
+        string lib = itype.get_library_name();
+        if (!lib.empty()) {
+          _loaded_external_databases.insert(lib + ".in");
+        }
+      }
+    }
+  }
+
+  // Before loading search-dir databases, take a snapshot of every type's
+  // module assignment into csharp_type_module_map.  Search-dir merges can
+  // change _def (and thus get_library_name()) for stub types: e.g. MemoryBase
+  // is first loaded from p3dtoolbase (panda3d.core) but a later merge from
+  // p3egg.in sets _def to p3egg, making get_type_module_name() return
+  // "panda3d.egg" in the core module run.  The snapshot preserves the
+  // pre-merge attribution so code generation uses the correct namespace.
+  {
+    InterrogateDatabase *idb = InterrogateDatabase::get_ptr();
+    int n = idb->get_num_all_types();
+    for (int t = 0; t < n; ++t) {
+      TypeIndex idx = idb->get_all_type(t);
+      if (csharp_type_module_map.count(idx)) {
+        continue;  // already attributed (from command-line range tracking
+                   // or the second-pass ownership determination)
+      }
+      const InterrogateType &itype = idb->get_type(idx);
+      if (itype.has_library_name()) {
+        string lib = itype.get_library_name();
+        auto it = csharp_library_to_module.find(lib);
+        if (it != csharp_library_to_module.end()) {
+          csharp_type_module_map[idx] = it->second;
+        }
+      }
+    }
+  }
+
+  // Load all databases from the search directories before any code generation.
+  // This ensures:
+  //   1. Interface-name collision detection (e.g. ISocketStream vs SocketStream)
+  //      works regardless of build order.
+  //   2. Cross-module secondary-base types (e.g. Namable for EggNamedObject)
+  //      have their method lists available for record_secondary_base_members.
+  // New types added here are in the global database but NOT in _objects, so
+  // they will not generate extra .cs files.
+  load_all_search_dir_databases();
+
+  // After search-dir loading, search-dir merges may have changed the _def
+  // (and thus get_library_name()) of collection facade types.  Update
+  // csharp_type_module_map for facades using the post-merge library attribution
+  // so that they are generated by exactly one module — the one that canonically
+  // defines the collection element type's library.
+  {
+    InterrogateDatabase *idb = InterrogateDatabase::get_ptr();
+    int n = idb->get_num_all_types();
+    for (int t = 0; t < n; ++t) {
+      TypeIndex idx = idb->get_all_type(t);
+      const InterrogateType &itype = idb->get_type(idx);
+      if (!is_collection_facade_type(itype)) {
+        continue;
+      }
+      if (itype.has_library_name()) {
+        string lib = itype.get_library_name();
+        auto it = csharp_library_to_module.find(lib);
+        if (it != csharp_library_to_module.end()) {
+          // Overwrite with the post-merge canonical module
+          csharp_type_module_map[idx] = it->second;
+        }
+      }
+    }
+  }
+
   record_secondary_base_members();
   write_support_file(dir, cs_namespace);
   write_native_methods_file(dir, cs_namespace);
   write_enum_files(dir, cs_namespace);
   write_class_files(dir, cs_namespace);
   write_globals_file(dir, cs_namespace, def);
+}
+
+/**
+ * Marks the given database file as already loaded so that
+ * load_all_search_dir_databases() will not re-load it.  Call this for every
+ * command-line .in file before invoking load_all_search_dir_databases().
+ */
+void InterfaceMakerCSharp::
+mark_database_loaded(const Filename &database_file) {
+  _loaded_external_databases.insert(database_file.get_basename());
+}
+
+/**
+ * Loads all interrogate databases found in the configured search directories.
+ * This is called once at the beginning of write_csharp_files() so that
+ * cross-module type information is available for:
+ *   - Interface-name collision detection in get_interface_name().
+ *   - Secondary-base-type resolution in get_secondary_base_types() /
+ *     get_interface_base_list().
+ *   - NativeMethods generation for cross-module secondary bases.
+ *
+ * New types added here land only in the global database, NOT in _objects,
+ * so no extra .cs files are generated.
+ */
+void InterfaceMakerCSharp::
+load_all_search_dir_databases() {
+  std::function<void(const Filename &)> scan_dir = [&](const Filename &dir) {
+    vector_string entries;
+    if (!dir.scan_directory(entries)) return;
+    for (const string &entry : entries) {
+      if (entry == "." || entry == "..") continue;
+      Filename child(dir, entry);
+      if (child.is_directory()) {
+        scan_dir(child);
+      } else if (entry.size() > 3 && entry.substr(entry.size() - 3) == ".in") {
+        request_external_database(child);
+      }
+    }
+  };
+
+  for (const Filename &dir : database_search_dirs) {
+    scan_dir(dir);
+  }
 }
 
 /**
@@ -1862,6 +1965,11 @@ write_support_file(const string &, const string &) {
  */
 void InterfaceMakerCSharp::
 write_native_methods_file(const string &dir, const string &cs_namespace) {
+  // NativeMethods_<module>.cs is written once per module by pass 2
+  // (interrogate_csharp, csharp_database_only_pass = true).  Pass 1
+  // (interrogate --csharp) never reaches this function because
+  // write_module_support() only calls write_csharp_files() when
+  // csharp_database_only_pass is true, so there is no duplication risk.
   string safe_lib = make_csharp_identifier(library_name.empty() ? _dll_name : library_name);
   string filename = "NativeMethods_" + safe_lib + ".cs";
 
@@ -1880,16 +1988,23 @@ write_native_methods_file(const string &dir, const string &cs_namespace) {
       << "  internal static partial class NativeMethods {\n";
 
   std::set<string> emitted_pinvoke_names;
-  InterrogateDatabase *idb = InterrogateDatabase::get_ptr();
-  int num_all_types = idb->get_num_all_types();
 
+  // Emit DllImport declarations for every function recorded for this module,
+  // including secondary-base functions (e.g. Namable methods injected into
+  // EggNamedObject).  Secondary-base functions are owned by another module
+  // (so is_current_native_methods_type returns false for them), but the
+  // class file that consumes them lives in THIS module's namespace and
+  // therefore resolves NativeMethods.xxx against THIS module's partial class.
+  // Each module has its own namespace, so re-declaring the same P/Invoke in
+  // two NativeMethods classes is harmless.
   FunctionsByIndex::iterator fi;
   for (fi = _functions.begin(); fi != _functions.end(); ++fi) {
     Function *func = (*fi).second;
-    if (func == nullptr || !is_current_native_methods_type(func->_itype)) {
+    if (func == nullptr) {
       continue;
     }
     Function::Remaps::const_iterator ri;
+    bool wrote_remap = false;
     for (ri = func->_remaps.begin(); ri != func->_remaps.end(); ++ri) {
       FunctionRemap *remap = (*ri);
       if ((remap->_flags & FunctionRemap::F_explicit_self) ||
@@ -1901,10 +2016,16 @@ write_native_methods_file(const string &dir, const string &cs_namespace) {
       if (emitted_pinvoke_names.insert(friendly_name).second) {
         write_dllimport(out, remap, friendly_name);
         out << "\n";
+        wrote_remap = true;
       }
     }
 
-    if (func->_remaps.empty()) {
+    // Fall back to wrapper-based DllImport if no remap produced a legal entry.
+    // This covers cross-module secondary-base functions whose FunctionRemap
+    // objects have null CPPType* pointers (because the C++ headers weren't
+    // parsed in pass 2) but whose InterrogateFunctionWrapper entries are fully
+    // serialized and thus legal.
+    if (!wrote_remap) {
       int num_wrappers = func->_ifunc.number_of_c_wrappers();
       for (int wi = 0; wi < num_wrappers; ++wi) {
         FunctionWrapperIndex wrapper_index = func->_ifunc.get_c_wrapper(wi);
@@ -1929,8 +2050,7 @@ write_native_methods_file(const string &dir, const string &cs_namespace) {
   Objects::iterator oi;
   for (oi = _objects.begin(); oi != _objects.end(); ++oi) {
     Object *object = (*oi).second;
-    if (object == nullptr || should_skip_csharp_type(object->_itype) ||
-        !is_current_native_methods_type(object->_itype)) {
+    if (object == nullptr || should_skip_csharp_type(object->_itype)) {
       continue;
     }
 
@@ -1955,39 +2075,23 @@ write_native_methods_file(const string &dir, const string &cs_namespace) {
         out << "    internal static partial void " << destructor_name
             << "(IntPtr self);\n\n";
       }
-    }
 
-    if (!object_has_virtual_methods(object)) {
-      continue;
-    }
-
-    out << "    [LibraryImport(\"" << quote_csharp_string(_dll_name) << "\", EntryPoint = \"_inCSDir_" << class_name
-        << "_new\")]\n";
-    out << "    internal static partial IntPtr CSharpDirector_" << class_name << "_new();\n\n";
-
-    out << "    [LibraryImport(\"" << quote_csharp_string(_dll_name) << "\", EntryPoint = \"_inCSDir_" << class_name
-        << "_set_csharp_ref\")]\n";
-    out << "    internal static partial void CSharpDirector_" << class_name
-        << "_set_csharp_ref(IntPtr self, IntPtr csharpRef);\n\n";
-
-    for (Function *func : object->_methods) {
-      FunctionRemap *remap = best_legal_method_remap(func);
-      if (func == nullptr || remap == nullptr || !func->_ifunc.is_virtual()) {
-        continue;
+      // For RefCounted types, also emit an unref_delete P/Invoke.
+      TypeIndex type_index = get_type_index_for_interrogate_type(itype);
+      if (type_index != 0 && is_type_refcounted(type_index)) {
+        string unref_name = get_supplemental_unref_destructor_name(itype);
+        out << "    [LibraryImport(\"" << quote_csharp_string(_dll_name) << "\", EntryPoint = \""
+            << get_supplemental_unref_destructor_entry_point(itype) << "\")]\n";
+        out << "    internal static partial void " << unref_name
+            << "(IntPtr self);\n\n";
       }
-
-      out << "    [LibraryImport(\"" << quote_csharp_string(_dll_name) << "\", EntryPoint = \"_inCSDir_" << class_name
-          << "_set_cb_" << remap->_hash << "\")]\n";
-      out << "    internal static partial void CSharpDirector_" << class_name << "_set_cb_"
-          << remap->_hash << "(IntPtr self, " << class_name << ".DirectorCallback_"
-          << remap->_hash << " cb);\n\n";
     }
+
   }
 
   for (oi = _objects.begin(); oi != _objects.end(); ++oi) {
     Object *object = (*oi).second;
-    if (object == nullptr || should_skip_csharp_type(object->_itype) ||
-        !is_current_native_methods_type(object->_itype)) {
+    if (object == nullptr || should_skip_csharp_type(object->_itype)) {
       continue;
     }
     const InterrogateType &itype = object->_itype;
@@ -2042,6 +2146,53 @@ write_native_methods_file(const string &dir, const string &cs_namespace) {
 
       out << "    [LibraryImport(\"" << quote_csharp_string(_dll_name) << "\", EntryPoint = \"" << helper_prefix << "get_data_size_bytes\")]\n";
       out << "    internal static partial int " << helper_prefix << "get_data_size_bytes(IntPtr self);\n\n";
+    }
+  }
+
+  // Global (non-member) functions are emitted by write_globals_file() which
+  // also calls NativeMethods.xxx(...).  Emit matching DllImport declarations
+  // for every global function whose FunctionIndex is tracked in _functions.
+  {
+    InterrogateDatabase *idb_g = InterrogateDatabase::get_ptr();
+    int num_global_functions = idb_g->get_num_global_functions();
+    for (int i = 0; i < num_global_functions; ++i) {
+      FunctionIndex func_index = idb_g->get_global_function(i);
+      FunctionsByIndex::const_iterator gfi = _functions.find(func_index);
+      if (gfi == _functions.end()) {
+        continue;
+      }
+      Function *func = gfi->second;
+      if (func == nullptr) {
+        continue;
+      }
+      bool wrote_remap = false;
+      for (auto ri = func->_remaps.begin(); ri != func->_remaps.end(); ++ri) {
+        FunctionRemap *remap = *ri;
+        if ((remap->_flags & FunctionRemap::F_explicit_self) ||
+            !is_remap_legal_csharp(remap)) {
+          continue;
+        }
+        string friendly_name = get_pinvoke_name(func, remap);
+        if (emitted_pinvoke_names.insert(friendly_name).second) {
+          write_dllimport(out, remap, friendly_name);
+          out << "\n";
+          wrote_remap = true;
+        }
+      }
+      if (!wrote_remap) {
+        int num_wrappers = func->_ifunc.number_of_c_wrappers();
+        for (int wi = 0; wi < num_wrappers; ++wi) {
+          FunctionWrapperIndex wrapper_index = func->_ifunc.get_c_wrapper(wi);
+          if (wrapper_index == 0) continue;
+          const InterrogateFunctionWrapper &wrapper = idb_g->get_wrapper(wrapper_index);
+          if (!is_wrapper_legal_csharp(wrapper)) continue;
+          string friendly_name = get_pinvoke_name(func->_ifunc, wrapper);
+          if (emitted_pinvoke_names.insert(friendly_name).second) {
+            write_dllimport(out, func->_ifunc, wrapper, friendly_name);
+            out << "\n";
+          }
+        }
+      }
     }
   }
 
@@ -2166,6 +2317,20 @@ write_class_file(const string &dir, const string &cs_namespace, Object *object) 
 
   string class_name = get_class_name(object->_itype);
   bool is_collection_facade = get_collection_facade_kind(object->_itype) != CF_none;
+
+  if (is_collection_facade && csharp_database_only_pass) {
+    // Collection facades (vector<T> typedefs) carry neither F_global nor
+    // F_nested, so they appear in MULTIPLE modules' _objects.  The same file
+    // (e.g. vector_uchar.cs) would be generated — and overwritten — by each
+    // module that runs.  Use first-come-first-served: if the file already
+    // exists it was generated by an earlier module (panda3d.core always runs
+    // before other modules due to cmake dependency order).  Accept that
+    // version and skip re-generation to keep the namespace stable.
+    Filename existing = make_output_filename(dir, class_name + ".cs");
+    if (existing.exists()) {
+      return;
+    }
+  }
 
   std::ofstream out;
   if (!open_output_file(dir, class_name + ".cs", out)) {
@@ -2819,9 +2984,21 @@ write_collection_adapter_class(ostream &out, Object *object) {
     indent(out, 4) << "public override void RemoveAt(int index) => throw new NotSupportedException();\n\n";
   }
 
+  TypeIndex coll_type_index = get_type_index_for_interrogate_type(itype);
+  bool coll_is_refcounted = (coll_type_index != 0 && is_type_refcounted(coll_type_index));
+  string coll_unref_name = coll_is_refcounted ? get_supplemental_unref_destructor_name(itype) : "";
+
   indent(out, 4) << "protected override void ReleaseNative() {\n";
   if (!destructor_name.empty()) {
-    indent(out, 6) << "NativeMethods." << destructor_name << "(NativeHandle);\n";
+    if (coll_is_refcounted) {
+      indent(out, 6) << "if (Ownership == NativeOwnership.RefCounted) {\n";
+      indent(out, 8) << "NativeMethods." << coll_unref_name << "(NativeHandle);\n";
+      indent(out, 6) << "} else {\n";
+      indent(out, 8) << "NativeMethods." << destructor_name << "(NativeHandle);\n";
+      indent(out, 6) << "}\n";
+    } else {
+      indent(out, 6) << "NativeMethods." << destructor_name << "(NativeHandle);\n";
+    }
   }
   indent(out, 4) << "}\n";
   out << "  }\n";
@@ -2832,11 +3009,6 @@ write_collection_adapter_class(ostream &out, Object *object) {
  */
 void InterfaceMakerCSharp::
 write_proxy_class(ostream &out, const string &, Object *object) {
-  struct DirectorMethod {
-    Function *func;
-    FunctionRemap *remap;
-  };
-
   const InterrogateType &itype = object->_itype;
   string class_name = get_class_name(itype);
   string base_class = get_base_class_clause(itype);
@@ -2897,21 +3069,8 @@ write_proxy_class(ostream &out, const string &, Object *object) {
   }
 
   bool is_abstract = is_abstract_type(itype);
-  bool has_director = object_has_virtual_methods(object);
   std::vector<const InterrogateType *> secondary_base_types;
   get_secondary_base_types(itype, secondary_base_types);
-  std::vector<DirectorMethod> director_methods;
-  if (has_director) {
-    for (Function *func : object->_methods) {
-      FunctionRemap *remap = best_legal_method_remap(func);
-      if (func != nullptr && remap != nullptr && func->_ifunc.is_virtual()) {
-        DirectorMethod method;
-        method.func = func;
-        method.remap = remap;
-        director_methods.push_back(method);
-      }
-    }
-  }
 
   if (itype.has_comment()) {
     emit_xml_doc_comment(out, itype.get_comment(), 2);
@@ -2941,9 +3100,21 @@ write_proxy_class(ostream &out, const string &, Object *object) {
     indent(out, 4) << "internal sealed class " << opaque_class_name << " : " << class_name << " {\n";
     indent(out, 6) << "internal " << opaque_class_name << "(IntPtr ptr, NativeOwnership own) : base(ptr, own) {\n";
     indent(out, 6) << "}\n";
+    TypeIndex proxy_type_index = get_type_index_for_interrogate_type(itype);
+    bool proxy_is_refcounted = (proxy_type_index != 0 && is_type_refcounted(proxy_type_index));
+    string proxy_unref_name = proxy_is_refcounted ? get_supplemental_unref_destructor_name(itype) : "";
+
     indent(out, 6) << "protected override void ReleaseNative() {\n";
     if (!destructor_name.empty()) {
-      indent(out, 8) << "NativeMethods." << destructor_name << "(NativeHandle);\n";
+      if (proxy_is_refcounted) {
+        indent(out, 8) << "if (Ownership == NativeOwnership.RefCounted) {\n";
+        indent(out, 10) << "NativeMethods." << proxy_unref_name << "(NativeHandle);\n";
+        indent(out, 8) << "} else {\n";
+        indent(out, 10) << "NativeMethods." << destructor_name << "(NativeHandle);\n";
+        indent(out, 8) << "}\n";
+      } else {
+        indent(out, 8) << "NativeMethods." << destructor_name << "(NativeHandle);\n";
+      }
     } else if (base_class != "NativeObject") {
       indent(out, 8) << "base.ReleaseNative();\n";
     }
@@ -2972,57 +3143,6 @@ write_proxy_class(ostream &out, const string &, Object *object) {
   indent(out, 4) << "internal " << class_name
                  << "(IntPtr ptr, NativeOwnership ownership) : base(ptr, ownership) {\n";
   indent(out, 4) << "}\n\n";
-
-  if (has_director) {
-    indent(out, 4) << "private GCHandle _directorHandle;\n";
-    for (const DirectorMethod &method : director_methods) {
-      indent(out, 4) << "private DirectorCallback_" << method.remap->_hash
-                     << " _directorCallback_" << method.remap->_hash << ";\n";
-    }
-    out << "\n";
-
-    for (const DirectorMethod &method : director_methods) {
-      CPPType *return_type_cpp = method.remap->_return_type->get_new_type();
-      string return_attr = get_marshal_attribute(return_type_cpp, true);
-      if (!return_attr.empty()) {
-        indent(out, 4) << return_attr << "\n";
-      }
-      indent(out, 4) << "[UnmanagedFunctionPointer()\n";
-      indent(out, 4) << "internal delegate " << get_pinvoke_type(return_type_cpp, true)
-                     << " DirectorCallback_" << method.remap->_hash << "(IntPtr csharpRef";
-      size_t first_param = method.remap->_has_this ? 1 : 0;
-      for (size_t i = first_param; i < method.remap->_parameters.size(); ++i) {
-        CPPType *param_type_cpp = method.remap->_parameters[i]._remap->get_new_type();
-        string attr = get_marshal_attribute(param_type_cpp, false);
-        string param_name = get_csharp_parameter_name(method.remap, i);
-        out << ", ";
-        if (!attr.empty()) {
-          out << attr << " ";
-        }
-        out << get_pinvoke_type(param_type_cpp, false) << " " << param_name;
-      }
-      out << ");\n\n";
-    }
-
-    indent(out, 4) << "protected " << class_name
-                   << "(bool director) : base(NativeMethods.CSharpDirector_"
-                   << class_name << "_new(), NativeOwnership.Owned) {\n";
-    indent(out, 6) << "if (!director) {\n";
-    indent(out, 8) << "throw new ArgumentException(\"director must be true\", \"director\");\n";
-    indent(out, 6) << "}\n";
-    indent(out, 6) << "_directorHandle = GCHandle.Alloc(this);\n";
-    indent(out, 6) << "NativeMethods.CSharpDirector_" << class_name
-                   << "_set_csharp_ref(NativeHandle, GCHandle.ToIntPtr(_directorHandle));\n";
-    for (const DirectorMethod &method : director_methods) {
-      indent(out, 6) << "_directorCallback_" << method.remap->_hash
-                     << " = new DirectorCallback_" << method.remap->_hash
-                     << "(__DirectorCallback_" << method.remap->_hash << ");\n";
-      indent(out, 6) << "NativeMethods.CSharpDirector_" << class_name << "_set_cb_"
-                     << method.remap->_hash << "(NativeHandle, _directorCallback_"
-                     << method.remap->_hash << ");\n";
-    }
-    indent(out, 4) << "}\n\n";
-  }
 
   Functions::const_iterator fi;
   if (!is_abstract) {
@@ -3108,71 +3228,6 @@ write_proxy_class(ostream &out, const string &, Object *object) {
         Function *base_cast = record_function(*base_type, base_type->get_cast(ci));
         write_method(out, base_cast, object, 4, false, &method_signatures);
       }
-    }
-  }
-
-  if (has_director) {
-    for (const DirectorMethod &method : director_methods) {
-      CPPType *return_type_cpp = method.remap->_return_type->get_new_type();
-      string managed_return_type = method.remap->_void_return ? "void" :
-        get_csharp_signature_type_for_wrapper(method.remap->_return_type, is_return_nullable(method.remap));
-
-      indent(out, 4) << "private static " << get_pinvoke_type(return_type_cpp, true)
-                     << " __DirectorCallback_" << method.remap->_hash << "(IntPtr csharpRef";
-      size_t first_param = method.remap->_has_this ? 1 : 0;
-      std::vector<string> native_param_names;
-      std::vector<string> managed_args;
-      for (size_t i = first_param; i < method.remap->_parameters.size(); ++i) {
-        ParameterRemap *param_remap = method.remap->_parameters[i]._remap;
-        CPPType *param_type_cpp = param_remap->get_new_type();
-        string param_name = get_csharp_parameter_name(method.remap, i);
-        native_param_names.push_back(param_name);
-        out << ", " << get_pinvoke_type(param_type_cpp, false) << " " << param_name;
-
-        string managed_arg = param_name;
-        string managed_type = get_csharp_type_for_wrapper(param_remap, is_parameter_nullable(method.remap, i));
-        if (is_csharp_native_object_type(_objects, param_type_cpp, managed_type)) {
-          managed_arg = managed_type + ".__CreateFromNative(" + param_name +
-            ", NativeOwnership.Borrowed)";
-        } else if (TypeManager::is_enum(param_type_cpp) ||
-                   (TypeManager::is_enum(param_remap->get_orig_type()) &&
-                    get_pinvoke_type(param_type_cpp, false) == "int" && managed_type != "int")) {
-          managed_arg = "(" + managed_type + ")" + param_name;
-        }
-        managed_args.push_back(managed_arg);
-      }
-      out << ") {\n";
-      indent(out, 6) << class_name << " self = (" << class_name
-                     << ")GCHandle.FromIntPtr(csharpRef).Target;\n";
-
-      string call_expr = "self." + make_csharp_identifier(method.func->_ifunc.get_name()) + "(";
-      for (size_t i = 0; i < managed_args.size(); ++i) {
-        if (i != 0) {
-          call_expr += ", ";
-        }
-        call_expr += managed_args[i];
-      }
-      call_expr += ")";
-
-      if (method.remap->_void_return) {
-        indent(out, 6) << call_expr << ";\n";
-        indent(out, 6) << "return;\n";
-      } else if (is_wrapped_object_type(_objects, return_type_cpp)) {
-        indent(out, 6) << managed_return_type << " result = " << call_expr << ";\n";
-        indent(out, 6) << "return NativeObject.Unwrap(result);\n";
-      } else if (TypeManager::is_enum(return_type_cpp) ||
-                 (TypeManager::is_enum(method.remap->_return_type->get_orig_type()) &&
-                  get_pinvoke_type(return_type_cpp, true) == "int" && managed_return_type != "int")) {
-        indent(out, 6) << "return (" << get_pinvoke_type(return_type_cpp, true) << ")"
-                       << call_expr << ";\n";
-      } else if (TypeManager::is_char_pointer(return_type_cpp) ||
-                 TypeManager::is_const_char_pointer(return_type_cpp)) {
-        indent(out, 6) << "string result = " << call_expr << ";\n";
-        indent(out, 6) << "return result == null ? IntPtr.Zero : Marshal.StringToCoTaskMemUTF8(result);\n";
-      } else {
-        indent(out, 6) << "return " << call_expr << ";\n";
-      }
-      indent(out, 4) << "}\n\n";
     }
   }
 
@@ -3363,16 +3418,30 @@ write_constructor(ostream &out, Function *func, Object *object, int indent_level
       }
     }
 
+    {
+      bool has_skipped_param = false;
+      for (const string &pt : param_types) {
+        if (pt.empty()) { has_skipped_param = true; break; }
+      }
+      if (has_skipped_param) {
+        continue;
+      }
+    }
+
     string signature_key = build_signature_key(class_name, param_types, false);
     if (!emitted_signatures.insert("M:" + signature_key).second) {
       continue;
+    }
+
+    if (func->_ifunc.has_comment()) {
+      emit_xml_doc_comment(out, func->_ifunc.get_comment(), indent_level);
     }
 
     indent(out, indent_level) << "public " << class_name << "(";
     for (size_t i = 0; i < param_decls.size(); ++i) {
       if (i != 0) {
         out << ", ";
-    }
+      }
       out << param_decls[i];
     }
     out << ") : this(NativeMethods." << get_pinvoke_name(func, remap) << "(";
@@ -3430,9 +3499,23 @@ write_constructor(ostream &out, Function *func, Object *object, int indent_level
       }
     }
 
+    {
+      bool has_skipped_param = false;
+      for (const string &pt : param_types) {
+        if (pt.empty()) { has_skipped_param = true; break; }
+      }
+      if (has_skipped_param) {
+        continue;
+      }
+    }
+
     string signature_key = build_signature_key(class_name, param_types, false);
     if (!emitted_signatures.insert("M:" + signature_key).second) {
       continue;
+    }
+
+    if (func->_ifunc.has_comment()) {
+      emit_xml_doc_comment(out, func->_ifunc.get_comment(), indent_level);
     }
 
     indent(out, indent_level) << "public " << class_name << "(";
@@ -3520,6 +3603,23 @@ write_method(ostream &out, Function *func, Object *object, int indent_level,
       native_args.push_back(marshal_managed_argument(param_type_index, param_type, param_name));
     }
 
+    // Skip this overload if any type resolved to "" (meaning the underlying C++
+    // type is not exported / is a skipped type such as a forward-declared class
+    // that has no F_fully_defined flag).  Emitting IFoo for such a type would
+    // produce a CS0246 compile error because no IFoo.cs is ever generated.
+    if (return_type.empty()) {
+      continue;
+    }
+    {
+      bool has_skipped_param = false;
+      for (const string &pt : param_types) {
+        if (pt.empty()) { has_skipped_param = true; break; }
+      }
+      if (has_skipped_param) {
+        continue;
+      }
+    }
+
     string signature_key = build_signature_key(method_name, param_types, is_static);
     if (!signature_set.insert("M:" + signature_key).second) {
       continue;
@@ -3577,6 +3677,7 @@ write_method(ostream &out, Function *func, Object *object, int indent_level,
           signature_set.find("N:" + alias_name) == signature_set.end() &&
           signature_set.find("R:" + alias_signature_key) == signature_set.end() &&
           signature_set.insert("A:" + alias_signature_key).second) {
+        indent(out, indent_level) << "/// <inheritdoc cref=\"" << method_name << "\"/>\n";
         indent(out, indent_level) << return_type << " " << alias_name << "(";
         for (size_t i = 0; i < param_decls.size(); ++i) {
           if (i != 0) {
@@ -3760,6 +3861,19 @@ write_method(ostream &out, Function *func, Object *object, int indent_level,
       native_args.push_back(marshal_managed_argument(param_type_index, param_type, param_name));
     }
 
+    if (return_type.empty()) {
+      continue;
+    }
+    {
+      bool has_skipped_param = false;
+      for (const string &pt : param_types) {
+        if (pt.empty()) { has_skipped_param = true; break; }
+      }
+      if (has_skipped_param) {
+        continue;
+      }
+    }
+
     string signature_key = build_signature_key(method_name, param_types, is_static);
     if (!signature_set.insert("M:" + signature_key).second) {
       continue;
@@ -3817,6 +3931,7 @@ write_method(ostream &out, Function *func, Object *object, int indent_level,
           signature_set.find("N:" + alias_name) == signature_set.end() &&
           signature_set.find("R:" + alias_signature_key) == signature_set.end() &&
           signature_set.insert("A:" + alias_signature_key).second) {
+        indent(out, indent_level) << "/// <inheritdoc cref=\"" << method_name << "\"/>\n";
         indent(out, indent_level) << return_type << " " << alias_name << "(";
         for (size_t i = 0; i < param_decls.size(); ++i) {
           if (i != 0) {
@@ -4125,27 +4240,27 @@ void InterfaceMakerCSharp::
 write_dispose_pattern(ostream &out, Object *object, int indent_level) {
   string destructor_name = get_destructor_wrapper_name(object);
   string base_class = get_base_class_clause(object->_itype);
-  bool has_director = object_has_virtual_methods(object);
-
-  if (has_director) {
-    indent(out, indent_level) << "protected override void Dispose(bool disposing) {\n";
-    indent(out, indent_level + 2) << "try {\n";
-    indent(out, indent_level + 4) << "base.Dispose(disposing);\n";
-    indent(out, indent_level + 2) << "} finally {\n";
-    indent(out, indent_level + 4) << "if (_directorHandle.IsAllocated) {\n";
-    indent(out, indent_level + 6) << "_directorHandle.Free();\n";
-    indent(out, indent_level + 4) << "}\n";
-    indent(out, indent_level + 2) << "}\n";
-    indent(out, indent_level) << "}\n\n";
-  }
 
   if (destructor_name.empty() && base_class != "NativeObject") {
     return;
   }
 
+  // Check if this type is RefCounted so we can dispatch to unref_delete.
+  TypeIndex type_index = get_type_index_for_interrogate_type(object->_itype);
+  bool is_refcounted = (type_index != 0 && is_type_refcounted(type_index));
+  string unref_name = is_refcounted ? get_supplemental_unref_destructor_name(object->_itype) : "";
+
   indent(out, indent_level) << "protected override void ReleaseNative() {\n";
   if (!destructor_name.empty()) {
-    indent(out, indent_level + 2) << "NativeMethods." << destructor_name << "(NativeHandle);\n";
+    if (is_refcounted) {
+      indent(out, indent_level + 2) << "if (Ownership == NativeOwnership.RefCounted) {\n";
+      indent(out, indent_level + 4) << "NativeMethods." << unref_name << "(NativeHandle);\n";
+      indent(out, indent_level + 2) << "} else {\n";
+      indent(out, indent_level + 4) << "NativeMethods." << destructor_name << "(NativeHandle);\n";
+      indent(out, indent_level + 2) << "}\n";
+    } else {
+      indent(out, indent_level + 2) << "NativeMethods." << destructor_name << "(NativeHandle);\n";
+    }
   }
   indent(out, indent_level) << "}\n";
 }
@@ -4431,6 +4546,7 @@ write_dllimport(ostream &out, const InterrogateFunction &ifunc,
       << ((get_pinvoke_type(wrapper.get_return_type(), true) == "string" && return_nullable) ? "?" : "")
       << " " << friendly_name << "(";
 
+  std::set<string> used_param_names;
   for (int i = 0; i < wrapper.number_of_parameters(); ++i) {
     if (i != 0) {
       out << ", ";
@@ -4445,6 +4561,13 @@ write_dllimport(ostream &out, const InterrogateFunction &ifunc,
     string param_name = wrapper.parameter_has_name(i)
       ? make_csharp_identifier(wrapper.parameter_get_name(i))
       : string("param") + std::to_string(i);
+
+    // Deduplicate: if the name is already used, append the index.
+    if (!used_param_names.insert(param_name).second) {
+      param_name += std::to_string(i);
+      used_param_names.insert(param_name);
+    }
+
     string pinvoke_type = wrapper.parameter_is_this(i) ? "IntPtr" : get_pinvoke_type(type, false);
     if (pinvoke_type == "string" && wrapper.parameter_is_nullable(i)) {
       pinvoke_type += "?";
@@ -4505,7 +4628,30 @@ get_pinvoke_name(const InterrogateFunction &ifunc,
  */
 bool InterfaceMakerCSharp::
 is_current_native_methods_type(const InterrogateType &itype) const {
+  // In database-only pass (pass 2), only this module's .in files are loaded
+  // as command-line args.  However, base-class stubs from foreign modules can
+  // still end up in the InterrogateDatabase (and therefore in _objects) because
+  // the .in format encodes cross-module type references.  Use
+  // csharp_owned_type_indices to filter: only emit types whose TypeIndex was
+  // recorded as belonging to this module during main().
+  //
+  // Fall back to "true" only if the owned-index set is empty, which should
+  // not happen after the CMake --library basename fix.
   if (csharp_database_only_pass) {
+    if (!csharp_owned_type_indices.empty()) {
+      // Collection facade types (vector_uchar, vector_string, etc.) are C++
+      // typedefs, not PUBLISHED classes, so they carry neither F_global nor
+      // F_nested and are excluded from csharp_owned_type_indices.  Gate their
+      // generation on the module they are attributed to in csharp_type_module_map
+      // (set during command-line range tracking or the pre-search-dir snapshot)
+      // so that each collection type is generated by exactly one module.
+      if (is_collection_facade_type(itype)) {
+        string facade_module = get_type_module_name(itype);
+        return facade_module.empty() || facade_module == _current_module_name;
+      }
+      TypeIndex tidx = get_type_index_for_interrogate_type(itype);
+      return tidx != 0 && csharp_owned_type_indices.count(tidx) != 0;
+    }
     return true;
   }
 
@@ -5217,9 +5363,15 @@ get_csharp_signature_type(CPPType *type, bool for_return) const {
       return get_csharp_signature_type(itype->get_wrapped_type(), for_return);
     }
     if (is_collection_facade_type(*itype)) {
+      if (should_skip_csharp_type(*itype)) {
+        return "";
+      }
       return get_qualified_class_name(*itype) + (for_return ? "?" : "");
     }
     if (itype->is_class() || itype->is_struct()) {
+      if (should_skip_csharp_type(*itype)) {
+        return "";
+      }
       return get_qualified_interface_name(*itype) + (for_return ? "?" : "");
     }
   }
@@ -5236,6 +5388,9 @@ get_csharp_signature_type(CPPType *type, bool for_return) const {
   string type_name = get_csharp_type(type, for_return);
   const InterrogateType *named_type = find_csharp_object_type(type_name);
   if (named_type != nullptr) {
+    if (should_skip_csharp_type(*named_type)) {
+      return "";
+    }
     return get_qualified_interface_name(*named_type);
   }
 
@@ -5257,6 +5412,9 @@ get_csharp_signature_type(TypeIndex type_index, bool for_return) const {
   if (original_type_index != 0) {
     const InterrogateType &original_type = idb->get_type(original_type_index);
     if (is_collection_facade_type(original_type)) {
+      if (should_skip_csharp_type(original_type)) {
+        return "";
+      }
       return get_qualified_interface_name(original_type) + (for_return ? "?" : "");
     }
     if (is_empty_pointer_facade_type(original_type)) {
@@ -5275,6 +5433,9 @@ get_csharp_signature_type(TypeIndex type_index, bool for_return) const {
   const InterrogateType &itype = idb->get_type(type_index);
 
   if (is_collection_facade_type(itype)) {
+    if (should_skip_csharp_type(itype)) {
+      return "";
+    }
     return get_qualified_interface_name(itype) + (for_return ? "?" : "");
   }
 
@@ -5287,6 +5448,11 @@ get_csharp_signature_type(TypeIndex type_index, bool for_return) const {
   }
 
   if (itype.is_class() || itype.is_struct()) {
+    // If this type is not exported (skipped), return "" so callers can skip
+    // any method that references it rather than emitting an unresolvable IFoo.
+    if (should_skip_csharp_type(itype)) {
+      return "";
+    }
     return get_qualified_interface_name(itype) + (for_return ? "?" : "");
   }
   if (itype.is_pointer()) {
@@ -5294,6 +5460,9 @@ get_csharp_signature_type(TypeIndex type_index, bool for_return) const {
     if (inner != 0) {
       const InterrogateType &inner_type = idb->get_type(inner);
       if (inner_type.is_class() || inner_type.is_struct()) {
+        if (should_skip_csharp_type(inner_type)) {
+          return "";
+        }
         return get_qualified_interface_name(inner_type) + (for_return ? "?" : "");
       }
     }
@@ -5448,17 +5617,7 @@ get_class_name(const InterrogateType &itype) const {
     return get_pointer_facade_target_name(itype);
   }
 
-  if (itype.has_name()) {
-    return make_csharp_identifier(itype.get_name());
-  }
-  if (itype.has_scoped_name()) {
-    return make_csharp_identifier(InterrogateBuilder::descope(itype.get_scoped_name()));
-  }
-  if (itype._cpptype != nullptr) {
-    return make_csharp_identifier(itype._cpptype->get_local_name(&parser));
-  }
-
-  return "UnnamedType";
+  return get_csharp_type_name(itype);
 }
 
 /**
@@ -5474,47 +5633,71 @@ get_interface_name(const InterrogateType &itype) const {
     return "Ifc" + cn;
   }
 
-  Filename collision(csharp_output_dir.get_fullpath() + "/" + candidate + ".cs");
-  if (collision.exists()) {
+  // Check for a naming collision with any C++ type whose generated class name
+  // equals the candidate interface name.  All databases from the search
+  // directories are pre-loaded before writing begins (see load_all_search_dir_databases
+  // called from write_csharp_files), so this lookup is reliable regardless of
+  // build order.
+  InterrogateDatabase *idb = InterrogateDatabase::get_ptr();
+  TypeIndex collision_idx = idb->lookup_type_by_scoped_name(candidate);
+  if (collision_idx != 0) {
+    const InterrogateType &ct = idb->get_type(collision_idx);
+    if (ct.is_class() || ct.is_struct()) {
+      return candidate + "Ifc";
+    }
+  }
+
+  // Fall back to file-existence check for types already generated in this run.
+  Filename collision_file(csharp_output_dir.get_fullpath() + "/" + candidate + ".cs");
+  if (collision_file.exists()) {
     return candidate + "Ifc";
   }
 
   return candidate;
 }
 
+/**
+ * Returns the correct module name for a type, using csharp_library_to_module
+ * (from --module-map) when available to override the .in file's module_name
+ * (which may be wrong, e.g. "panda3d.net" instead of "panda3d.core").
+ */
+string InterfaceMakerCSharp::
+get_type_module_name(const InterrogateType &itype) const {
+  // First: check csharp_type_module_map, which is populated from the command-
+  // line .in file range tracking and then snapshotted before search-dir
+  // loading.  This preserves the correct module even when search-dir merges
+  // later change itype's _def (e.g. MemoryBase stub from p3dtoolbase being
+  // overwritten by p3egg's version during core-module search-dir loading).
+  TypeIndex tidx = get_type_index_for_interrogate_type(itype);
+  if (tidx != 0) {
+    auto mit = csharp_type_module_map.find(tidx);
+    if (mit != csharp_type_module_map.end() && !mit->second.empty()) {
+      return mit->second;
+    }
+  }
+  // Second: use the --module-map library→module lookup if available.
+  if (!csharp_library_to_module.empty() && itype.has_library_name()) {
+    string lib = itype.get_library_name();
+    auto it = csharp_library_to_module.find(lib);
+    if (it != csharp_library_to_module.end()) {
+      return it->second;
+    }
+  }
+  // Fall back to the .in file's module_name
+  if (itype.has_module_name()) {
+    return itype.get_module_name();
+  }
+  return string();
+}
+
 string InterfaceMakerCSharp::
 get_qualified_class_name(const InterrogateType &itype) const {
   string name = get_class_name(itype);
+  string type_module = get_type_module_name(itype);
 
-  if (csharp_database_only_pass) {
-    return name;
-  }
-
-  // Check if the type is from a different module
-  if (!_current_module_name.empty() && itype.has_module_name() &&
-      itype.get_module_name() != _current_module_name) {
-    return "global::" + prettify_namespace(itype.get_module_name()) + "." + name;
-  }
-
-  // Check if the type has no content (likely a forward-declared type from another module)
-  if (itype.number_of_methods() == 0 && itype.number_of_casts() == 0 &&
-      itype.number_of_elements() == 0 && itype.number_of_constructors() == 0 &&
-      !itype.has_destructor()) {
-    // Try to find the type in the global database
-    if (itype._cpptype != nullptr) {
-      CPPType *resolved_type = TypeManager::resolve_type(itype._cpptype);
-      if (resolved_type != nullptr) {
-        InterrogateDatabase *idb = InterrogateDatabase::get_ptr();
-        TypeIndex type_index = idb->lookup_type_by_scoped_name(resolved_type->get_fully_scoped_name());
-        if (type_index != 0) {
-          const InterrogateType &db_itype = idb->get_type(type_index);
-          if (db_itype.has_module_name() && !_current_module_name.empty() &&
-              db_itype.get_module_name() != _current_module_name) {
-            return "global::" + prettify_namespace(db_itype.get_module_name()) + "." + name;
-          }
-        }
-      }
-    }
+  if (!_current_module_name.empty() && !type_module.empty() &&
+      type_module != _current_module_name) {
+    return "global::" + prettify_namespace(type_module) + "." + name;
   }
 
   return name;
@@ -5522,41 +5705,15 @@ get_qualified_class_name(const InterrogateType &itype) const {
 
 string InterfaceMakerCSharp::
 get_qualified_interface_name(const InterrogateType &itype) const {
-  // Collection types don't have separate interface types — use the class name
   if (is_collection_facade_type(itype)) {
     return get_qualified_class_name(itype);
   }
   string name = get_interface_name(itype);
+  string type_module = get_type_module_name(itype);
 
-  if (csharp_database_only_pass) {
-    return name;
-  }
-
-  // Check if the type is from a different module
-  if (!_current_module_name.empty() && itype.has_module_name() &&
-      itype.get_module_name() != _current_module_name) {
-    return "global::" + prettify_namespace(itype.get_module_name()) + "." + name;
-  }
-
-  // Check if the type has no content (likely a forward-declared type from another module)
-  if (itype.number_of_methods() == 0 && itype.number_of_casts() == 0 &&
-      itype.number_of_elements() == 0 && itype.number_of_constructors() == 0 &&
-      !itype.has_destructor()) {
-    // Try to find the type in the global database
-    if (itype._cpptype != nullptr) {
-      CPPType *resolved_type = TypeManager::resolve_type(itype._cpptype);
-      if (resolved_type != nullptr) {
-        InterrogateDatabase *idb = InterrogateDatabase::get_ptr();
-        TypeIndex type_index = idb->lookup_type_by_scoped_name(resolved_type->get_fully_scoped_name());
-        if (type_index != 0) {
-          const InterrogateType &db_itype = idb->get_type(type_index);
-          if (db_itype.has_module_name() && !_current_module_name.empty() &&
-              db_itype.get_module_name() != _current_module_name) {
-            return "global::" + prettify_namespace(db_itype.get_module_name()) + "." + name;
-          }
-        }
-      }
-    }
+  if (!_current_module_name.empty() && !type_module.empty() &&
+      type_module != _current_module_name) {
+    return "global::" + prettify_namespace(type_module) + "." + name;
   }
 
   return name;
@@ -5567,18 +5724,27 @@ get_qualified_interface_name(const InterrogateType &itype) const {
  */
 string InterfaceMakerCSharp::
 get_base_class_clause(const InterrogateType &itype) const {
-  if (itype.number_of_derivations() == 0) {
-    return "NativeObject";
-  }
-
   InterrogateDatabase *idb = InterrogateDatabase::get_ptr();
-  TypeIndex base_index = itype.get_derivation(0);
-  if (!is_wrapped_type(base_index)) {
-    return "NativeObject";
-  }
 
-  const InterrogateType &base_type = idb->get_type(base_index);
-  return get_qualified_class_name(base_type);
+  // Walk the primary derivation chain to find the first base that is both
+  // wrapped and not an unexported C++ internal type (e.g. MemoryBase).
+  const InterrogateType *current = &itype;
+  for (int depth = 0; depth < 32; ++depth) {
+    if (current->number_of_derivations() == 0) {
+      break;
+    }
+    TypeIndex base_index = current->get_derivation(0);
+    if (!is_wrapped_type(base_index)) {
+      break;
+    }
+    const InterrogateType &base_type = idb->get_type(base_index);
+    if (!should_skip_csharp_type(base_type)) {
+      return get_qualified_class_name(base_type);
+    }
+    // Base is an unexported internal type — keep climbing.
+    current = &base_type;
+  }
+  return "NativeObject";
 }
 
 /**
@@ -5617,6 +5783,13 @@ get_interface_base_list(const InterrogateType &itype) const {
   string interface_list = " : INativeObject";
 
   InterrogateDatabase *idb = InterrogateDatabase::get_ptr();
+
+  auto has_members = [](const InterrogateType &t) {
+    return t.number_of_methods() != 0 ||
+           t.number_of_casts() != 0 ||
+           t.number_of_elements() != 0;
+  };
+
   int num_derivations = itype.number_of_derivations();
   for (int di = 0; di < num_derivations; ++di) {
     TypeIndex base_index = itype.get_derivation(di);
@@ -5628,6 +5801,44 @@ get_interface_base_list(const InterrogateType &itype) const {
     if (is_collection_facade_type(base_type)) {
       continue;
     }
+
+    // Skip C++ internal types that are not exported for scripting (e.g.
+    // MemoryBase, _object).  Without this check, IReferenceCount would
+    // inherit from IMemoryBase which has no .cs file, causing CS0246.
+    if (should_skip_csharp_type(base_type)) {
+      continue;
+    }
+
+    // For secondary bases (di > 0), only include the interface if the base
+    // actually has methods available.  A secondary base whose methods can't be
+    // resolved (e.g. a cross-module stub with a wrong library_name, like
+    // Namable referenced by EggNamedObject) would produce CS0535 because the
+    // implementing class can't satisfy the inherited interface contract.
+    if (di > 0) {
+      const InterrogateType *effective = &base_type;
+
+      // Try lazy database loading if the type has no members yet.
+      if (!has_members(*effective)) {
+        ensure_database_loaded(*effective);
+        effective = &idb->get_type(base_index);
+      }
+
+      // Try scoped-name lookup in case a richer version is in a loaded db.
+      if (!has_members(*effective) && effective->has_scoped_name()) {
+        TypeIndex resolved = idb->lookup_type_by_scoped_name(effective->get_scoped_name());
+        if (resolved != 0) {
+          const InterrogateType &rt = idb->get_type(resolved);
+          if (has_members(rt)) {
+            effective = &rt;
+          }
+        }
+      }
+
+      if (!has_members(*effective)) {
+        continue;  // Can't implement this interface – skip it.
+      }
+    }
+
     string interface_name = get_qualified_interface_name(base_type);
     if (emitted_interfaces.insert(interface_name).second) {
       interface_list += ", " + interface_name;

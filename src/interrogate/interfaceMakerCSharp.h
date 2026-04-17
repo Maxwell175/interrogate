@@ -20,11 +20,16 @@
 
 #include <deque>
 #include <fstream>
+#include <map>
 #include <set>
 
 class FunctionRemap;
 class Filename;
 class InterrogateFunctionWrapper;
+
+extern std::set<int> csharp_owned_type_indices;
+extern std::map<int, std::string> csharp_type_module_map;
+extern std::map<std::string, std::string> csharp_library_to_module;
 
 class InterfaceMakerCSharp : public InterfaceMaker {
 public:
@@ -39,6 +44,10 @@ public:
                             InterrogateModuleDef *def) override;
 
   virtual bool synthesize_this_parameter() override;
+
+  // Marks a command-line database file as already loaded so that
+  // load_all_search_dir_databases() will not re-load it.
+  void mark_database_loaded(const Filename &database_file);
 
 protected:
   virtual std::string get_wrapper_prefix() override;
@@ -130,6 +139,7 @@ private:
   std::string get_interface_name(const InterrogateType &itype) const;
   std::string get_qualified_class_name(const InterrogateType &itype) const;
   std::string get_qualified_interface_name(const InterrogateType &itype) const;
+  std::string get_type_module_name(const InterrogateType &itype) const;
   std::string get_base_class_clause(const InterrogateType &itype) const;
   std::string get_interface_list(const InterrogateType &itype) const;
   std::string get_interface_base_list(const InterrogateType &itype) const;
@@ -161,6 +171,8 @@ private:
   mutable std::deque<std::string> _external_database_paths;
   mutable std::deque<InterrogateModuleDef> _external_database_requests;
   std::set<std::string> _written_enums;
+
+  void load_all_search_dir_databases();
 
 };
 

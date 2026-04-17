@@ -119,6 +119,10 @@ private:
   bool read_new(std::istream &in, InterrogateModuleDef *def);
   void merge_from(const InterrogateDatabase &other);
 
+  // Heap-allocated module defs from read_file() — kept alive so that
+  // InterrogateComponent::_def pointers remain valid after loading.
+  std::vector<InterrogateModuleDef *> _file_module_defs;
+
   bool find_module(FunctionWrapperIndex wrapper,
                    InterrogateModuleDef *&def, int &module_index);
   int binary_search_module(int begin, int end, FunctionIndex function);

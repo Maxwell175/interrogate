@@ -103,6 +103,12 @@ namespace Interrogate {
 
         private bool _disposed;
 
+        // Conservative estimate of the minimum unmanaged allocation backing a
+        // native object.  Even a small value is enough to inform the GC that
+        // non-borrowed wrappers represent real unmanaged memory so it schedules
+        // collection/finalization more aggressively in allocation-heavy loops.
+        private const long NativeMemoryPressureHint = 512;
+
         /// <summary>
         /// Initializes a new wrapper around a native C++ pointer.
         /// </summary>
@@ -111,6 +117,9 @@ namespace Interrogate {
         protected NativeObject(IntPtr ptr, NativeOwnership ownership) {
             _handle = new HandleRef(this, ptr);
             Ownership = ownership;
+            if (ownership != NativeOwnership.Borrowed && ptr != IntPtr.Zero) {
+                GC.AddMemoryPressure(NativeMemoryPressureHint);
+            }
         }
 
         /// <summary>
@@ -198,32 +207,31 @@ namespace Interrogate {
         protected abstract void ReleaseNative();
 
         /// <summary>
-        /// Releases native resources. Only acts on <see cref="NativeOwnership.Owned"/> and
-        /// <see cref="NativeOwnership.RefCounted"/> wrappers — <see cref="NativeOwnership.Borrowed"/>
+        /// Releases native resources. Acts on both <see cref="NativeOwnership.Owned"/> and
+        /// <see cref="NativeOwnership.RefCounted"/> wrappers. <see cref="NativeOwnership.Borrowed"/>
         /// wrappers are no-ops since they don't own the pointer.
         /// </summary>
         /// <param name="disposing">
         /// <c>true</c> if called from <see cref="Dispose()"/>; <c>false</c> if called from the finalizer.
-        /// Borrowed wrappers skip cleanup regardless. Ref-counted and owned wrappers only
-        /// release when <paramref name="disposing"/> is <c>true</c> to avoid calling into
-        /// C++ during GC finalization (which may run on an arbitrary thread).
+        /// Both paths release non-borrowed native pointers:
+        ///   • <see cref="NativeOwnership.Owned"/>: calls <c>delete ptr</c> for non-refcounted types.
+        ///   • <see cref="NativeOwnership.RefCounted"/>: calls <c>unref_delete(ptr)</c>, which is
+        ///     balanced because the C++ wrapper called <c>ref()</c> when returning the pointer to C#.
         /// </param>
         protected virtual void Dispose(bool disposing) {
             if (!_disposed) {
-                if (disposing && Ownership != NativeOwnership.Borrowed && _handle.Handle != IntPtr.Zero) {
+                if (Ownership != NativeOwnership.Borrowed && _handle.Handle != IntPtr.Zero) {
                     ReleaseNative();
+                    GC.RemoveMemoryPressure(NativeMemoryPressureHint);
                 }
                 _handle = new HandleRef(null, IntPtr.Zero);
                 _disposed = true;
             }
         }
 
-        /// <summary>
-        /// Weak guarantee: if a non-borrowed wrapper is not explicitly disposed, the finalizer
-        /// zeros the handle to prevent dangling pointers but does NOT call into C++ (to avoid
-        /// thread-safety issues during GC). Always prefer explicit <c>using</c> or <see cref="Dispose()"/>.
-        /// </summary>
-        ~NativeObject() { Dispose(false); }
+        ~NativeObject() {
+            Dispose(false);
+        }
 
         /// <summary>
         /// Releases native resources held by this wrapper.

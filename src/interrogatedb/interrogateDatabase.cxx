@@ -1019,18 +1019,23 @@ read_file(const string &database_filename) {
     return false;
   }
 
-  InterrogateModuleDef def;
-  std::memset(&def, 0, sizeof(def));
-  def.file_identifier = file_identifier;
-  def.database_filename = pathname.c_str();
+  // Allocate on the heap and keep alive — InterrogateComponent::_def
+  // pointers refer to this def after read() distributes it to types.
+  InterrogateModuleDef *def = new InterrogateModuleDef;
+  std::memset(def, 0, sizeof(*def));
+  def->file_identifier = file_identifier;
+  def->database_filename = pathname.c_str();
 
-  bool ok = read(input, &def);
+  bool ok = read(input, def);
   if (!ok) {
     std::cerr << "Error reading " << pathname << ".\n";
     set_error_flag(true);
+    free_module_def_strings(*def);
+    delete def;
+  } else {
+    _file_module_defs.push_back(def);
   }
 
-  free_module_def_strings(def);
   return ok;
 }
 
