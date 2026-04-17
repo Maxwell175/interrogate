@@ -16,6 +16,7 @@
 #include "interrogateBuilder.h"
 #include "functionRemap.h"
 #include "parameterRemap.h"
+#include "parameterRemapToString.h"
 #include "typeManager.h"
 
 #include "interrogateDatabase.h"
@@ -44,6 +45,48 @@ using std::string;
 std::set<int> csharp_owned_type_indices;
 std::map<int, std::string> csharp_type_module_map;
 std::map<std::string, std::string> csharp_library_to_module;
+
+// Remap for std::wstring parameters/returns in C# mode.
+// Uses UTF-8 (char const *) at the C boundary instead of wchar_t const *,
+// converting via TextEncoder::decode_text / encode_wtext so that
+// StringMarshalling.Utf8 on the C# side round-trips correctly.
+// The reason we can't reliably use wchar is because its size is different
+// between Windows and Linux. Since the C# code is the same across
+// platforms, we just use UTF-8 stored in char.
+class ParameterRemapWStringCSharp : public ParameterRemap {
+public:
+  explicit ParameterRemapWStringCSharp(CPPType *orig_type) : ParameterRemap(orig_type) {
+    static CPPType *const_char_star = nullptr;
+    if (const_char_star == nullptr) {
+      const_char_star = parser.parse_type("const char *");
+    }
+    _new_type = const_char_star;
+  }
+
+  void pass_parameter(std::ostream &out, const std::string &variable_name) override {
+    out << "TextEncoder::decode_text(std::string(" << variable_name
+        << "), TextEncoder::E_utf8)";
+  }
+
+  std::string prepare_return_expr(std::ostream &out, int indent_level,
+                                  const std::string &expression) override {
+    InterfaceMaker::indent(out, indent_level)
+      << "static std::string string_holder = TextEncoder::encode_wtext("
+      << expression << ", TextEncoder::E_utf8);\n";
+    return "string_holder";
+  }
+
+  std::string get_return_expr(const std::string &) override {
+    return "string_holder.c_str()";
+  }
+
+  bool new_type_is_atomic_string() override { return true; }
+};
+
+// Factory called from interfaceMaker.cxx when build_csharp is set.
+ParameterRemap *make_wstring_csharp_remap(CPPType *type) {
+  return new ParameterRemapWStringCSharp(type);
+}
 
 namespace {
 

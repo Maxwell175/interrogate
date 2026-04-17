@@ -15,6 +15,10 @@
 #include "interrogateBuilder.h"
 #include "typeManager.h"
 #include "interrogate.h"
+
+// Defined in interfaceMakerCSharp.cxx; returns a remap that uses char const *
+// (UTF-8) for wstring parameters/returns instead of wchar_t const *.
+extern ParameterRemap *make_wstring_csharp_remap(CPPType *type);
 #include "functionRemap.h"
 #include "parameterRemap.h"
 #include "parameterRemapThis.h"
@@ -326,6 +330,7 @@ remap_parameter(CPPType *struct_type, CPPType *param_type) {
       return new ParameterRemapCharStarToString(param_type);
     }
     if (TypeManager::is_wchar_pointer(param_type)) {
+      if (build_csharp) return make_wstring_csharp_remap(param_type);
       return new ParameterRemapWCharStarToWString(param_type);
     }
 
@@ -345,15 +350,18 @@ remap_parameter(CPPType *struct_type, CPPType *param_type) {
         return new ParameterRemapBasicStringPtrToString(param_type);
 
       } else if (TypeManager::is_basic_string_wchar(param_type)) {
+        if (build_csharp) return make_wstring_csharp_remap(param_type);
         return new ParameterRemapBasicWStringToWString(param_type);
 
       } else if (TypeManager::is_const_ref_to_basic_string_wchar(param_type)) {
+        if (build_csharp) return make_wstring_csharp_remap(param_type);
         return new ParameterRemapBasicWStringRefToWString(param_type);
 
       } else if (TypeManager::is_const_ptr_to_basic_string_char(param_type)) {
         return new ParameterRemapBasicStringPtrToString(param_type);
 
       } else if (TypeManager::is_const_ptr_to_basic_string_wchar(param_type)) {
+        if (build_csharp) return make_wstring_csharp_remap(param_type);
         return new ParameterRemapBasicWStringPtrToWString(param_type);
 
       } else if (TypeManager::is_reference(param_type) ||
