@@ -54,6 +54,11 @@ write_prototypes(ostream &out,ostream *out_h) {
     "#define EXPORT_FUNC extern \"C\" __attribute__((used, visibility(\"default\")))\n"
     "#else\n"
     "#define EXPORT_FUNC extern \"C\"\n"
+    "#endif\n"
+    // Clang is strict about extern "C" functions returning C++ types (e.g.
+    // vector_uchar). The warning is technically correct but we expect this to be the case.
+    "#ifdef __clang__\n"
+    "#pragma clang diagnostic ignored \"-Wreturn-type-c-linkage\"\n"
     "#endif\n\n";
 
   FunctionsByIndex::iterator fi;
