@@ -1,0 +1,30 @@
+name: Build Interrogate.Core NuGet Package
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  pack:
+    name: Pack Interrogate.Core
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0'
+
+      - name: Pack
+        run: |
+          dotnet pack csharp/Interrogate.Core/Interrogate.Core.csproj \
+            -c Release \
+            -o nupkg/
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: interrogate-core-nupkg
+          path: nupkg/*.nupkg
+          if-no-files-found: error
