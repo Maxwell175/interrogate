@@ -99,6 +99,7 @@ private:
   std::string get_pinvoke_name(const InterrogateFunction &ifunc,
                                const InterrogateFunctionWrapper &wrapper) const;
   bool is_current_native_methods_type(const InterrogateType &itype) const;
+  bool is_current_native_methods_type(TypeIndex tidx, const InterrogateType &itype) const;
   std::string get_native_methods_class_name(const InterrogateType &itype) const;
   std::string get_pinvoke_call_name(Function *func, FunctionRemap *remap) const;
   std::string get_pinvoke_call_name(const InterrogateFunction &ifunc,
