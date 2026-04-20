@@ -243,12 +243,14 @@ main(int argc, char *argv[]) {
 
   // Second pass: scan every type in the IDB and determine ownership based on
   // the FINAL post-merge state.  A type is owned by this module if:
-  //   1. It is fully defined (not a stub / forward-reference),
-  //   2. It is global (F_global, 0x1) — set ONLY on the one .in file that
+  //   1. It is global (F_global, 0x1) — set ONLY on the one .in file that
   //      explicitly publishes this type (the canonical authoritative source).
   //      Cross-module .in files that include the header may carry a full
   //      definition but with F_global=0, indicating they are not the owner.
-  //   3. Its library_name (from _def, set by the winning merge) is in
+  //      NOTE: fully-defined is NOT required — forward-declared types forced
+  //      via "forcetype" in a .N file have F_global set but F_fully_defined
+  //      cleared by define_extension_type (e.g. dxGeom, dxBody from ODE).
+  //   2. Its library_name (from _def, set by the winning merge) is in
   //      owned_libraries.
   // This correctly handles types merged into pre-existing stub TypeIndex
   // values (which the range-tracking above misses) and prevents cross-module
@@ -259,9 +261,6 @@ main(int argc, char *argv[]) {
     for (int t = 0; t < n; ++t) {
       TypeIndex idx = idb->get_all_type(t);
       const InterrogateType &itype = idb->get_type(idx);
-      if (!itype.is_fully_defined()) {
-        continue;  // stub — not canonically owned by any single library
-      }
       if (!itype.is_global() && !itype.is_nested()) {
         continue;  // cross-module copy — not the canonical publication
         // Note: nested types (F_nested) don't have F_global set but are
