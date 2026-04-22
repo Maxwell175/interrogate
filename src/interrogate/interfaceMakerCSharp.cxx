@@ -1551,6 +1551,8 @@ write_functions(ostream &out) {
 
   out << "#if __GNUC__ >= 4\n"
       << "#define EXPORT_FUNC extern \"C\" __attribute__((used, visibility(\"default\")))\n"
+      << "#elif defined(_MSC_VER) && !defined(LINK_ALL_STATIC) && !defined(STATIC_BUILD)\n"
+      << "#define EXPORT_FUNC extern \"C\" __declspec(dllexport)\n"
       << "#else\n"
       << "#define EXPORT_FUNC extern \"C\"\n"
       << "#endif\n\n";
