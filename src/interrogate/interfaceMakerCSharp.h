@@ -172,6 +172,9 @@ private:
   mutable std::deque<std::string> _external_database_paths;
   mutable std::deque<InterrogateModuleDef> _external_database_requests;
   std::set<std::string> _written_enums;
+  // Lowercase class names from every module in the global database, used for
+  // case-insensitive interface-name collision detection across modules.
+  mutable std::set<std::string> _all_class_names_lower;
 
   void load_all_search_dir_databases();
 

@@ -5710,6 +5710,29 @@ get_interface_name(const InterrogateType &itype) const {
     }
   }
 
+  // Case-insensitive collision check across all modules.
+  if (_all_class_names_lower.empty()) {
+    int n = idb->get_num_all_types();
+    for (int i = 0; i < n; ++i) {
+      TypeIndex tidx = idb->get_all_type(i);
+      const InterrogateType &t = idb->get_type(tidx);
+      if (t.is_class() || t.is_struct()) {
+        string cname = get_class_name(t);
+        for (char &c : cname) {
+          c = (char)std::tolower((unsigned char)c);
+        }
+        _all_class_names_lower.insert(cname);
+      }
+    }
+  }
+  string candidate_lower = candidate;
+  for (char &c : candidate_lower) {
+    c = (char)std::tolower((unsigned char)c);
+  }
+  if (_all_class_names_lower.count(candidate_lower) != 0) {
+    return candidate + "Ifc";
+  }
+
   // Fall back to file-existence check for types already generated in this run.
   Filename collision_file(csharp_output_dir.get_fullpath() + "/" + candidate + ".cs");
   if (collision_file.exists()) {
