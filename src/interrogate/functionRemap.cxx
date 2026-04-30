@@ -36,6 +36,29 @@ using std::ostream;
 using std::ostringstream;
 using std::string;
 
+namespace {
+  /**
+   * Resolves a ParameterRemap to the TypeIndex that should be recorded in the
+   * database for its new_type: either the singleton "atomic" type (for string,
+   * stream, etc.) or the literal new_type looked up in the type table.
+   */
+  TypeIndex
+  resolve_atomic_type(ParameterRemap *remap) {
+    switch (remap->get_new_atomic_token()) {
+    case AT_string:
+      return builder.get_atomic_string_type();
+    case AT_istream:
+      return builder.get_atomic_istream_type();
+    case AT_ostream:
+      return builder.get_atomic_ostream_type();
+    case AT_iostream:
+      return builder.get_atomic_iostream_type();
+    default:
+      return builder.get_type(remap->get_new_type(), false);
+    }
+  }
+}
+
 /**
  *
  */
@@ -352,11 +375,7 @@ make_wrapper_entry(FunctionIndex function_index) {
        ++pi) {
     InterrogateFunctionWrapper::Parameter param;
     param._parameter_flags = 0;
-    if ((*pi)._remap->new_type_is_atomic_string()) {
-      param._type = builder.get_atomic_string_type();
-    } else {
-      param._type = builder.get_type((*pi)._remap->get_new_type(), false);
-    }
+    param._type = resolve_atomic_type((*pi)._remap);
     param._name = (*pi)._name;
     if ((*pi)._has_name) {
       param._parameter_flags |= InterrogateFunctionWrapper::PF_has_name;
@@ -381,12 +400,7 @@ make_wrapper_entry(FunctionIndex function_index) {
     iwrapper._flags |= InterrogateFunctionWrapper::F_has_return;
   }
 
-  if (_return_type->new_type_is_atomic_string()) {
-    iwrapper._return_type = builder.get_atomic_string_type();
-  } else {
-    iwrapper._return_type =
-      builder.get_type(_return_type->get_new_type(), false);
-  }
+  iwrapper._return_type = resolve_atomic_type(_return_type);
 
   if (_return_value_needs_management) {
     iwrapper._flags |= InterrogateFunctionWrapper::F_caller_manages;

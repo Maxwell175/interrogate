@@ -55,7 +55,13 @@ public:
   virtual bool return_value_needs_management();
   virtual FunctionIndex get_return_value_destructor();
   virtual bool return_value_should_be_simple();
-  virtual bool new_type_is_atomic_string();
+  // Returns the AtomicToken (from interrogate_interface.h) that the new_type
+  // should be recorded as in the database, or AT_not_atomic if the new_type
+  // is the literal CPPType returned by get_new_type().  This is how a remap
+  // tells interrogate "record the parameter as logically std::string / an
+  // istream / etc., even though at the C boundary it's char * / void *".
+  virtual AtomicToken get_new_atomic_token();
+  bool new_type_is_atomic_string();
   virtual bool is_this();
 
 protected:

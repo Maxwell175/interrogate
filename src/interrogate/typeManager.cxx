@@ -1913,6 +1913,94 @@ is_pointer_to_ostream(CPPType *type) {
 }
 
 /**
+ * Returns true if the indicated type is std::istream.
+ */
+bool TypeManager::is_istream(CPPType *type) {
+  switch (type->get_subtype()) {
+  case CPPDeclaration::ST_const:
+    return is_istream(type->as_const_type()->_wrapped_around);
+
+  case CPPDeclaration::ST_struct:
+    return (type->get_local_name(&parser) == "std::istream" ||
+            type->get_local_name(&parser) == "istream" ||
+            type->get_local_name(&parser) == "std::basic_istream< char >");
+
+  case CPPDeclaration::ST_typedef:
+    return is_istream(type->as_typedef_type()->_type);
+
+  default:
+    return false;
+  }
+}
+
+/**
+ * Returns true if the indicated type is a pointer or reference to std::istream.
+ */
+bool TypeManager::
+is_pointer_to_istream(CPPType *type) {
+  switch (type->get_subtype()) {
+  case CPPDeclaration::ST_const:
+    return is_pointer_to_istream(type->as_const_type()->_wrapped_around);
+
+  case CPPDeclaration::ST_reference:
+    return is_istream(type->as_reference_type()->_pointing_at);
+
+  case CPPDeclaration::ST_pointer:
+    return is_istream(type->as_pointer_type()->_pointing_at);
+
+  case CPPDeclaration::ST_typedef:
+    return is_pointer_to_istream(type->as_typedef_type()->_type);
+
+  default:
+    return false;
+  }
+}
+
+/**
+ * Returns true if the indicated type is std::iostream.
+ */
+bool TypeManager::is_iostream(CPPType *type) {
+  switch (type->get_subtype()) {
+  case CPPDeclaration::ST_const:
+    return is_iostream(type->as_const_type()->_wrapped_around);
+
+  case CPPDeclaration::ST_struct:
+    return (type->get_local_name(&parser) == "std::iostream" ||
+            type->get_local_name(&parser) == "iostream" ||
+            type->get_local_name(&parser) == "std::basic_iostream< char >");
+
+  case CPPDeclaration::ST_typedef:
+    return is_iostream(type->as_typedef_type()->_type);
+
+  default:
+    return false;
+  }
+}
+
+/**
+ * Returns true if the indicated type is a pointer or reference to std::iostream.
+ */
+bool TypeManager::
+is_pointer_to_iostream(CPPType *type) {
+  switch (type->get_subtype()) {
+  case CPPDeclaration::ST_const:
+    return is_pointer_to_iostream(type->as_const_type()->_wrapped_around);
+
+  case CPPDeclaration::ST_reference:
+    return is_iostream(type->as_reference_type()->_pointing_at);
+
+  case CPPDeclaration::ST_pointer:
+    return is_iostream(type->as_pointer_type()->_pointing_at);
+
+  case CPPDeclaration::ST_typedef:
+    return is_pointer_to_iostream(type->as_typedef_type()->_type);
+
+  default:
+    return false;
+  }
+}
+
+/**
  * Returns true if the type is an unpublished type, e.g.  a protected or
  * private nested class, or simply a type not marked as 'published', or if the
  * type is a pointer or reference to such an unpublished type, or even if the

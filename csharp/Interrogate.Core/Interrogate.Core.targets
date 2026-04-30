@@ -1,0 +1,72 @@
+<Project xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+
+  <!--
+    MSBuild integration shipped inside the Interrogate.Core NuGet package.
+
+    .NET's RID-aware native asset resolution automatically copies the correct
+    runtimes/<rid>/native/{libinterrogate_support.so,interrogate_support.dll,
+    libinterrogate_support.dylib} to the output directory, so `dotnet run` and
+    `dotnet build` work without any extra MSBuild logic.
+
+    For NativeAOT publish, we register the static archive as a
+    DirectPInvoke target so the linker resolves P/Invokes at link time and
+    bakes the implementation into the final executable.
+  -->
+
+  <PropertyGroup>
+    <_IgNativeDir>$(MSBuildThisFileDirectory)../../runtimes/$(RuntimeIdentifier)/native/</_IgNativeDir>
+  </PropertyGroup>
+
+  <!-- NativeAOT: register the static archive for static linking. -->
+  <Target Name="_InterrogateDirectPInvoke"
+          BeforeTargets="PrepareForBuild"
+          Condition="'$(PublishAot)' == 'true' AND '$(RuntimeIdentifier)' != '' AND Exists('$(_IgNativeDir)')">
+
+    <!-- Linux/macOS: libinterrogate_support.a → strip "lib" to get the P/Invoke name. -->
+    <ItemGroup Condition="!$([MSBuild]::IsOSPlatform(Windows))">
+      <_IgLib Include="$(_IgNativeDir)libinterrogate_support.a" Condition="Exists('$(_IgNativeDir)libinterrogate_support.a')" />
+      <NativeLibrary Include="@(_IgLib)" />
+      <DirectPInvoke Include="interrogate_support" Condition="'@(_IgLib)' != ''" />
+    </ItemGroup>
+
+    <!-- Windows: the static archive ships as libinterrogate_support.lib (the
+         "lib" prefix mirrors the convention src/CompilerFlags.cmake applies to
+         all static archives in the interrogate build tree).  NativeAOT's
+         DirectPInvoke matches on the P/Invoke name, not the filename, so the
+         archive still resolves "interrogate_support" correctly. -->
+    <ItemGroup Condition="$([MSBuild]::IsOSPlatform(Windows))">
+      <_IgLib Include="$(_IgNativeDir)libinterrogate_support.lib" Condition="Exists('$(_IgNativeDir)libinterrogate_support.lib')" />
+      <NativeLibrary Include="@(_IgLib)" />
+      <DirectPInvoke Include="interrogate_support" Condition="'@(_IgLib)' != ''" />
+    </ItemGroup>
+  </Target>
+
+  <!-- Always: keep .a/.lib out of the build output directory — they are only
+       used at link time during an AOT publish, never at runtime. -->
+  <Target Name="_InterrogateExcludeStaticFromBuildOutput"
+          AfterTargets="ResolvePackageAssets"
+          Condition="'$(RuntimeIdentifier)' != ''">
+    <PropertyGroup>
+      <_IgFullNativeDir>$([System.IO.Path]::GetFullPath('$(_IgNativeDir)'))</_IgFullNativeDir>
+    </PropertyGroup>
+    <ItemGroup>
+      <NativeCopyLocalItems Remove="@(NativeCopyLocalItems)"
+        Condition="$([System.String]::Copy('%(FullPath)').StartsWith('$(_IgFullNativeDir)')) AND ('%(Extension)' == '.a' OR '%(Extension)' == '.lib')" />
+    </ItemGroup>
+  </Target>
+
+  <!-- AOT publish: the binary is self-contained, so strip the shared library
+       (already baked in via DirectPInvoke) from the publish output. -->
+  <Target Name="_InterrogateExcludeFromAotPublish"
+          BeforeTargets="_ComputeResolvedFilesToPublishTypes"
+          Condition="'$(PublishAot)' == 'true' AND '$(RuntimeIdentifier)' != ''">
+    <PropertyGroup>
+      <_IgFullNativeDir>$([System.IO.Path]::GetFullPath('$(_IgNativeDir)'))</_IgFullNativeDir>
+    </PropertyGroup>
+    <ItemGroup>
+      <ResolvedFileToPublish Remove="@(ResolvedFileToPublish)"
+        Condition="$([System.String]::Copy('%(FullPath)').StartsWith('$(_IgFullNativeDir)'))" />
+    </ItemGroup>
+  </Target>
+
+</Project>

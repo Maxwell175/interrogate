@@ -2226,24 +2226,56 @@ get_make_seq(CPPMakeSeq *make_seq, CPPStructType *struct_type) {
  */
 TypeIndex InterrogateBuilder::
 get_atomic_string_type() {
-  // Make up a true name that can't possibly clash with an actual C++ type
-  // name.
-  string true_name = "atomic string";
+  return get_atomic_named_type("atomic string", AT_string);
+}
 
+/**
+ * Returns a TypeIndex for the "atomic istream" type, representing a
+ * std::istream parameter that the target language binds to its own native
+ * read-stream abstraction.  At the C calling boundary it is still an opaque
+ * pointer (void *).
+ */
+TypeIndex InterrogateBuilder::
+get_atomic_istream_type() {
+  return get_atomic_named_type("atomic istream", AT_istream);
+}
+
+/**
+ * Returns a TypeIndex for the "atomic ostream" type; see
+ * get_atomic_istream_type().
+ */
+TypeIndex InterrogateBuilder::
+get_atomic_ostream_type() {
+  return get_atomic_named_type("atomic ostream", AT_ostream);
+}
+
+/**
+ * Returns a TypeIndex for the "atomic iostream" type; see
+ * get_atomic_istream_type().
+ */
+TypeIndex InterrogateBuilder::
+get_atomic_iostream_type() {
+  return get_atomic_named_type("atomic iostream", AT_iostream);
+}
+
+/**
+ * Shared helper for all the get_atomic_*_type() variants.  Creates the named
+ * atomic singleton in the database if it doesn't already exist, and returns
+ * its TypeIndex.
+ */
+TypeIndex InterrogateBuilder::
+get_atomic_named_type(const string &true_name, AtomicToken token) {
   TypesByName::const_iterator tni = _types_by_name.find(true_name);
   if (tni != _types_by_name.end()) {
     return (*tni).second;
   }
-
-  // This is the first time the atomic string has been requested; define it
-  // now.
 
   TypeIndex index = InterrogateDatabase::get_ptr()->get_next_index();
   _types_by_name[true_name] = index;
 
   InterrogateType itype;
   itype._flags |= InterrogateType::F_atomic;
-  itype._atomic_token = AT_string;
+  itype._atomic_token = token;
   itype._true_name = true_name;
   itype._scoped_name = true_name;
   itype._name = true_name;

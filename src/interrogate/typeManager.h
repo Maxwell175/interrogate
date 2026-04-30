@@ -123,6 +123,10 @@ public:
 
   static bool is_ostream(CPPType *type);
   static bool is_pointer_to_ostream(CPPType *type);
+  static bool is_istream(CPPType *type);
+  static bool is_pointer_to_istream(CPPType *type);
+  static bool is_iostream(CPPType *type);
+  static bool is_pointer_to_iostream(CPPType *type);
 
   static CPPType *unwrap_pointer(CPPType *type);
   static CPPType *unwrap_reference(CPPType *type);

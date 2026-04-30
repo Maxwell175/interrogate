@@ -99,14 +99,22 @@ return_value_should_be_simple() {
 
 
 /**
- * Returns true if the type represented by the conversion is now the atomic
- * string type.  We have to have this crazy method for representing atomic
- * string, because there's no such type in C (and hence no corresponding
- * CPPType *).
+ * Returns the AtomicToken that the new_type should be recorded as in the
+ * InterrogateDatabase, or AT_not_atomic if the parameter's new_type is the
+ * CPPType returned by get_new_type().  See ParameterRemap.h.
+ */
+AtomicToken ParameterRemap::
+get_new_atomic_token() {
+  return AT_not_atomic;
+}
+
+/**
+ * Convenience wrapper retained for callers that only care about the
+ * string-vs-not distinction.  Prefer get_new_atomic_token() in new code.
  */
 bool ParameterRemap::
 new_type_is_atomic_string() {
-  return false;
+  return get_new_atomic_token() == AT_string;
 }
 
 /**

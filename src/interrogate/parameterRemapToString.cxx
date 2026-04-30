@@ -60,14 +60,11 @@ get_return_expr(const string &expression) {
 }
 
 /**
- * Returns true if the type represented by the conversion is now the atomic
- * string type.  We have to have this crazy method for representing atomic
- * string, because there's no such type in C (and hence no corresponding
- * CPPType *).
+ * Returns the AtomicToken representing this remap's atomic string type.
  */
-bool ParameterRemapToString::
-new_type_is_atomic_string() {
-  return true;
+AtomicToken ParameterRemapToString::
+get_new_atomic_token() {
+  return AT_string;
 }
 
 /**
@@ -104,12 +101,9 @@ get_return_expr(const string &expression) {
 }
 
 /**
- * Returns true if the type represented by the conversion is now the atomic
- * string type.  We have to have this crazy method for representing atomic
- * string, because there's no such type in C (and hence no corresponding
- * CPPType *).
+ * Returns the AtomicToken representing this remap's atomic string type.
  */
-bool ParameterRemapToWString::
-new_type_is_atomic_string() {
-  return true;
+AtomicToken ParameterRemapToWString::
+get_new_atomic_token() {
+  return AT_string;
 }

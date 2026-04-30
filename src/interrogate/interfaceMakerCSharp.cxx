@@ -80,12 +80,71 @@ public:
     return "string_holder.c_str()";
   }
 
-  bool new_type_is_atomic_string() override { return true; }
+  AtomicToken get_new_atomic_token() override { return AT_string; }
 };
 
 // Factory called from interfaceMaker.cxx when build_csharp is set.
 ParameterRemap *make_wstring_csharp_remap(CPPType *type) {
   return new ParameterRemapWStringCSharp(type);
+}
+
+// Remap for std::istream / std::ostream / std::iostream parameters in C# mode.
+// The parameter crosses the C ABI as an opaque void* that points to a C++
+// stream object created on the C# side (see Interrogate.StreamBridge).  The
+// remap's job is to reinterpret_cast that void* back to the right stream
+// pointer, dereferencing if the original declaration was a reference.
+//
+// new_type is void*; the parameter's database-recorded type is one of the
+// AT_istream/AT_ostream/AT_iostream atomic tokens, letting the C# interface
+// maker recognise the parameter as "this is a native-stream bridge" during
+// pass 2 even after the .in database round-trip.
+class ParameterRemapStreamCSharp : public ParameterRemap {
+public:
+  ParameterRemapStreamCSharp(CPPType *orig_type, AtomicToken token,
+                             const char *cpp_stream_type)
+      : ParameterRemap(orig_type), _token(token), _cpp_stream_type(cpp_stream_type) {
+    static CPPType *void_ptr = nullptr;
+    if (void_ptr == nullptr) {
+      void_ptr = parser.parse_type("void *");
+    }
+    _new_type = void_ptr;
+
+    // Remember whether the original parameter was passed by reference so that
+    // pass_parameter() knows to dereference the void* back into a reference.
+    _was_reference = TypeManager::is_reference(orig_type);
+  }
+
+  void pass_parameter(std::ostream &out, const std::string &variable_name) override {
+    if (_was_reference) {
+      out << "*reinterpret_cast<" << _cpp_stream_type << " *>("
+          << variable_name << ")";
+    } else {
+      out << "reinterpret_cast<" << _cpp_stream_type << " *>("
+          << variable_name << ")";
+    }
+  }
+
+  AtomicToken get_new_atomic_token() override { return _token; }
+
+private:
+  AtomicToken _token;
+  const char *_cpp_stream_type;
+  bool _was_reference;
+};
+
+// Factory called from interfaceMaker.cxx when build_csharp is set and the
+// parameter's original C++ type is a pointer or reference to a std stream.
+ParameterRemap *make_stream_csharp_remap(CPPType *type) {
+  if (TypeManager::is_pointer_to_iostream(type)) {
+    return new ParameterRemapStreamCSharp(type, AT_iostream, "std::iostream");
+  }
+  if (TypeManager::is_pointer_to_istream(type)) {
+    return new ParameterRemapStreamCSharp(type, AT_istream, "std::istream");
+  }
+  if (TypeManager::is_pointer_to_ostream(type)) {
+    return new ParameterRemapStreamCSharp(type, AT_ostream, "std::ostream");
+  }
+  return nullptr;
 }
 
 namespace {
@@ -783,6 +842,36 @@ marshal_managed_argument(TypeIndex param_type_index, const string &param_type,
   return param_name;
 }
 
+// If param_type_index refers to an atomic stream token, returns the
+// corresponding AtomicToken.  Otherwise returns AT_not_atomic.
+AtomicToken
+csharp_stream_token_for_type(TypeIndex param_type_index) {
+  if (param_type_index == 0) {
+    return AT_not_atomic;
+  }
+  const InterrogateType &itype =
+    InterrogateDatabase::get_ptr()->get_type(param_type_index);
+  if (!itype.is_atomic()) {
+    return AT_not_atomic;
+  }
+  AtomicToken tok = itype.get_atomic_token();
+  if (tok == AT_istream || tok == AT_ostream || tok == AT_iostream) {
+    return tok;
+  }
+  return AT_not_atomic;
+}
+
+// Name of the Interrogate.StreamBridge factory for a given direction.
+const char *
+csharp_stream_bridge_factory(AtomicToken tok) {
+  switch (tok) {
+  case AT_istream:  return "global::Interrogate.StreamBridge.ForInput";
+  case AT_ostream:  return "global::Interrogate.StreamBridge.ForOutput";
+  case AT_iostream: return "global::Interrogate.StreamBridge.ForInputOutput";
+  default:          return nullptr;
+  }
+}
+
 bool
 has_param_value_helper_name(const InterrogateType &itype) {
   string simple_name = get_csharp_type_name(itype);
@@ -1237,6 +1326,13 @@ get_pinvoke_atomic_type(const InterrogateType &itype) {
   case AT_longlong:
     return itype.is_unsigned() ? "ulong" : "long";
   case AT_null:
+    return "IntPtr";
+  case AT_istream:
+  case AT_ostream:
+  case AT_iostream:
+    // Stream parameters cross the C ABI as an opaque void* pointing at a
+    // streambuf bridge; the managed signature is System.IO.Stream, handled in
+    // get_csharp_type() below.
     return "IntPtr";
   case AT_not_atomic:
     break;
@@ -3636,6 +3732,11 @@ write_method(ostream &out, Function *func, Object *object, int indent_level,
       native_args.push_back(get_native_this_argument(object, func, remap));
     }
 
+    // Collected stream-bridge allocations needed before the native call:
+    // (bridge variable name, factory call, managed parameter name, nullable).
+    struct StreamBridgeSite { string var; string factory; string param; bool nullable; };
+    std::vector<StreamBridgeSite> stream_bridges;
+
     for (size_t i = first_param; i < remap->_parameters.size(); ++i) {
       ParameterRemap *param_remap = remap->_parameters[i]._remap;
       TypeIndex param_type_index = get_parameter_type_for_remap(remap, i);
@@ -3649,7 +3750,15 @@ write_method(ostream &out, Function *func, Object *object, int indent_level,
       param_decls.push_back(param_type + " " + param_name);
       param_names.push_back(param_name);
 
-      native_args.push_back(marshal_managed_argument(param_type_index, param_type, param_name));
+      AtomicToken stream_tok = csharp_stream_token_for_type(param_type_index);
+      if (stream_tok != AT_not_atomic) {
+        string bridge_var = "__p3stream" + std::to_string(stream_bridges.size());
+        stream_bridges.push_back({bridge_var, csharp_stream_bridge_factory(stream_tok),
+                                  param_name, param_nullable});
+        native_args.push_back(bridge_var + ".Handle");
+      } else {
+        native_args.push_back(marshal_managed_argument(param_type_index, param_type, param_name));
+      }
     }
 
     // Skip this overload if any type resolved to "" (meaning the underlying C++
@@ -3741,6 +3850,14 @@ write_method(ostream &out, Function *func, Object *object, int indent_level,
     }
 
     out << " {\n";
+
+    // Emit `using var __p3streamN = StreamBridge.For…(paramN);` for each
+    // stream parameter so the bridge is disposed as soon as the native call
+    // returns (or throws).  Null params produce a null-handle bridge.
+    for (const auto &b : stream_bridges) {
+      indent(out, indent_level + 2) << "using var " << b.var << " = "
+                                    << b.factory << "(" << b.param << ");\n";
+    }
 
     string native_call = get_pinvoke_call_name(func, remap) + "(";
     for (size_t i = 0; i < native_args.size(); ++i) {
@@ -3896,9 +4013,13 @@ write_method(ostream &out, Function *func, Object *object, int indent_level,
       native_args.push_back(get_native_this_argument(object->_itype, func->_ifunc));
     }
 
+    struct StreamBridgeSite { string var; string factory; string param; bool nullable; };
+    std::vector<StreamBridgeSite> stream_bridges;
+
     for (int i = first_param; i < wrapper.number_of_parameters(); ++i) {
       TypeIndex param_type_index = wrapper.parameter_get_type(i);
-      string param_type = get_csharp_signature_type(param_type_index, wrapper.parameter_is_nullable(i));
+      bool param_nullable = wrapper.parameter_is_nullable(i);
+      string param_type = get_csharp_signature_type(param_type_index, param_nullable);
 
       string param_name = wrapper.parameter_has_name(i)
         ? make_csharp_identifier(wrapper.parameter_get_name(i))
@@ -3907,7 +4028,15 @@ write_method(ostream &out, Function *func, Object *object, int indent_level,
       param_decls.push_back(param_type + " " + param_name);
       param_names.push_back(param_name);
 
-      native_args.push_back(marshal_managed_argument(param_type_index, param_type, param_name));
+      AtomicToken stream_tok = csharp_stream_token_for_type(param_type_index);
+      if (stream_tok != AT_not_atomic) {
+        string bridge_var = "__p3stream" + std::to_string(stream_bridges.size());
+        stream_bridges.push_back({bridge_var, csharp_stream_bridge_factory(stream_tok),
+                                  param_name, param_nullable});
+        native_args.push_back(bridge_var + ".Handle");
+      } else {
+        native_args.push_back(marshal_managed_argument(param_type_index, param_type, param_name));
+      }
     }
 
     if (return_type.empty()) {
@@ -3995,6 +4124,13 @@ write_method(ostream &out, Function *func, Object *object, int indent_level,
     }
 
     out << " {\n";
+
+    // Emit stream-bridge `using var` bindings — see the matching block above
+    // in the remap path.
+    for (const auto &b : stream_bridges) {
+      indent(out, indent_level + 2) << "using var " << b.var << " = "
+                                    << b.factory << "(" << b.param << ");\n";
+    }
 
     string native_call = get_pinvoke_call_name(func->_ifunc, wrapper) + "(";
     for (size_t i = 0; i < native_args.size(); ++i) {
@@ -5331,8 +5467,13 @@ get_csharp_type(TypeIndex type_index, bool for_return) const {
   }
 
   if (itype.is_atomic()) {
-    if (itype.get_atomic_token() == AT_string) {
+    AtomicToken tok = itype.get_atomic_token();
+    if (tok == AT_string) {
       return for_return ? "string?" : "string";
+    }
+    if (tok == AT_istream || tok == AT_ostream || tok == AT_iostream) {
+      // System.IO.Stream on the managed side; see StreamBridge.cs.
+      return for_return ? "global::System.IO.Stream?" : "global::System.IO.Stream";
     }
     return get_pinvoke_atomic_type(itype);
   }

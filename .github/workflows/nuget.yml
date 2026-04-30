@@ -3,11 +3,144 @@ name: Build Interrogate.Core NuGet Package
 on:
   push:
   workflow_dispatch:
+    inputs:
+      version:
+        description: 'Package version override (e.g. 1.0.1). Leave blank to use csproj <Version>.'
+        required: false
 
 jobs:
+  # Stage 1 — Build the interrogate_support native library for all RIDs.
+  # Matches the 8-way matrix used by panda3d/.github/workflows/nuget.yml so
+  # downstream consumers have matching shared+static artifacts.
+  build-native:
+    name: native / ${{ matrix.rid }} / ${{ matrix.link }}
+    if: "!contains(github.event.head_commit.message, '[skip ci]') && !contains(github.event.head_commit.message, '[ci skip]')"
+
+    strategy:
+      fail-fast: false
+      matrix:
+        os:   [ubuntu-24.04, windows-2022]
+        link: [shared, static]
+        include:
+          - { os: ubuntu-24.04, rid: linux-x64 }
+          - { os: windows-2022, rid: win-x64 }
+          - { os: macOS-15, link: shared, rid: osx-x64,   cmake_osx_arch: x86_64 }
+          - { os: macOS-15, link: static, rid: osx-x64,   cmake_osx_arch: x86_64 }
+          - { os: macOS-15, link: shared, rid: osx-arm64, cmake_osx_arch: arm64  }
+          - { os: macOS-15, link: static, rid: osx-arm64, cmake_osx_arch: arm64  }
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build tools (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build bison flex
+
+      - name: Install build tools (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          NINJA_VER=1.12.1
+          curl -fsSL "https://github.com/ninja-build/ninja/releases/download/v${NINJA_VER}/ninja-mac.zip" \
+            -o /tmp/ninja.zip
+          sudo unzip -o /tmp/ninja.zip -d /usr/local/bin ninja
+          sudo chmod +x /usr/local/bin/ninja
+
+      - name: Install build tools (Windows)
+        if: runner.os == 'Windows'
+        run: choco install winflexbison3 --yes
+
+      - name: Configure (Linux/macOS)
+        if: runner.os != 'Windows'
+        run: |
+          CMAKE_ARGS=(
+            -B build
+            -G Ninja
+            -DCMAKE_BUILD_TYPE=Release
+            -DBUILD_SHARED_LIBS=${{ matrix.link == 'shared' && 'ON' || 'OFF' }}
+          )
+          if [ -n "${{ matrix.cmake_osx_arch }}" ]; then
+            CMAKE_ARGS+=(-DCMAKE_OSX_ARCHITECTURES=${{ matrix.cmake_osx_arch }})
+          fi
+          cmake "${CMAKE_ARGS[@]}"
+
+      # /MT for static (matches panda3d link:static / crt:mt convention),
+      # /MD for shared (link:shared / crt:md).  This keeps the CRT matched
+      # with anything else the consumer pulls into the same AOT publish.
+      - name: Configure (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          cmake -B build `
+            -G "Visual Studio 17 2022" -A x64 `
+            "-DBUILD_SHARED_LIBS=${{ matrix.link == 'shared' && 'ON' || 'OFF' }}" `
+            "-DCMAKE_MSVC_RUNTIME_LIBRARY=${{ matrix.link == 'static' && 'MultiThreaded' || 'MultiThreadedDLL' }}"
+
+      - name: Build support library
+        run: cmake --build build --config Release --parallel 4 --target interrogate_support
+
+      # Collect the support library artifacts into dist/ in the same layout
+      # the pack job expects: shared natives from link=shared jobs, static
+      # archives from link=static jobs.
+      - name: Collect support natives (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          mkdir dist
+          if [ "${{ matrix.link }}" = "shared" ]; then
+            find build -maxdepth 5 -name "libinterrogate_support.so" -exec cp -n {} dist/ \;
+          fi
+          if [ "${{ matrix.link }}" = "static" ]; then
+            find build -maxdepth 5 -name "libinterrogate_support.a" -exec cp -n {} dist/ \;
+          fi
+          ls -la dist/
+
+      - name: Collect support natives (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          mkdir dist
+          if [ "${{ matrix.link }}" = "shared" ]; then
+            find build -maxdepth 5 -name "libinterrogate_support.dylib" -exec cp -n {} dist/ \;
+          fi
+          if [ "${{ matrix.link }}" = "static" ]; then
+            find build -maxdepth 5 -name "libinterrogate_support.a" -exec cp -n {} dist/ \;
+          fi
+          ls -la dist/
+
+      # Windows filenames: shared builds produce interrogate_support.dll plus
+      # interrogate_support.lib (DLL import lib — unneeded at runtime or link
+      # time for P/Invoke, so we skip it).  Static builds produce
+      # libinterrogate_support.lib; the "lib" prefix on .lib files is forced
+      # by src/CompilerFlags.cmake to mirror panda3d's convention.
+      - name: Collect support natives (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item dist -ItemType Directory -Force
+          if ("${{ matrix.link }}" -eq "shared") {
+            Get-ChildItem -Recurse build -Filter 'interrogate_support.dll' |
+              Copy-Item -Destination dist\ -ErrorAction SilentlyContinue
+          }
+          if ("${{ matrix.link }}" -eq "static") {
+            Get-ChildItem -Recurse build -Filter 'libinterrogate_support.lib' |
+              Copy-Item -Destination dist\ -ErrorAction SilentlyContinue
+          }
+          Get-ChildItem dist\
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: interrogate-support-native-${{ matrix.rid }}-${{ matrix.link }}
+          path: dist/
+          if-no-files-found: error
+
+  # Stage 2 — Assemble runtimes/<rid>/native/ layout from the 8 artifacts
+  # and pack the single-package Interrogate.Core.nupkg.
   pack:
     name: Pack Interrogate.Core
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    needs: build-native
 
     steps:
       - uses: actions/checkout@v4
@@ -16,14 +149,39 @@ jobs:
         with:
           dotnet-version: '8.0'
 
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: 'interrogate-support-native-*'
+          path: artifacts/
+          merge-multiple: false
+
+      - name: Assemble runtimes directory
+        run: |
+          for rid in linux-x64 win-x64 osx-x64 osx-arm64; do
+            mkdir -p "runtimes/$rid/native"
+            for link in shared static; do
+              src="artifacts/interrogate-support-native-${rid}-${link}"
+              [ -d "$src" ] && cp "$src"/* "runtimes/$rid/native/" 2>/dev/null || true
+            done
+          done
+          echo "=== runtimes layout ==="
+          find runtimes -type f | sort
+
       - name: Pack
         run: |
           dotnet pack csharp/Interrogate.Core/Interrogate.Core.csproj \
             -c Release \
+            -p:NativeRuntimesDir="${{ github.workspace }}/runtimes" \
             -o nupkg/
 
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
+      - name: List nupkg contents
+        run: |
+          for pkg in nupkg/*.nupkg; do
+            echo "=== $(basename "$pkg") ==="
+            unzip -l "$pkg" | sort
+          done
+
+      - uses: actions/upload-artifact@v4
         with:
           name: interrogate-core-nupkg
           path: nupkg/*.nupkg

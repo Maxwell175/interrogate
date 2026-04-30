@@ -33,7 +33,7 @@ public:
   virtual void pass_parameter(std::ostream &out, const std::string &variable_name);
   virtual std::string get_return_expr(const std::string &expression);
 
-  virtual bool new_type_is_atomic_string();
+  virtual AtomicToken get_new_atomic_token();
 };
 
 /**
@@ -51,7 +51,7 @@ public:
   virtual void pass_parameter(std::ostream &out, const std::string &variable_name);
   virtual std::string get_return_expr(const std::string &expression);
 
-  virtual bool new_type_is_atomic_string();
+  virtual AtomicToken get_new_atomic_token();
 };
 
 #endif

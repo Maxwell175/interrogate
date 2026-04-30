@@ -19,6 +19,11 @@
 // Defined in interfaceMakerCSharp.cxx; returns a remap that uses char const *
 // (UTF-8) for wstring parameters/returns instead of wchar_t const *.
 extern ParameterRemap *make_wstring_csharp_remap(CPPType *type);
+// Defined in interfaceMakerCSharp.cxx; returns a remap that tunnels
+// std::istream/ostream/iostream parameters as void* across the C boundary for
+// bridging with System.IO.Stream.  Returns nullptr if the type is not a
+// stream pointer/reference.
+extern ParameterRemap *make_stream_csharp_remap(CPPType *type);
 #include "functionRemap.h"
 #include "parameterRemap.h"
 #include "parameterRemapThis.h"
@@ -324,6 +329,17 @@ write_module(ostream &, ostream *out_h, InterrogateModuleDef *) {
 ParameterRemap *InterfaceMaker::
 remap_parameter(CPPType *struct_type, CPPType *param_type) {
   nassertr(param_type != nullptr, nullptr);
+
+  // Stream types: handled before the generic reference-to-pointer path so
+  // std::istream &/* etc. get bridged to the target language's native stream
+  // abstraction rather than appearing as opaque native objects.
+  if (build_csharp && (TypeManager::is_pointer_to_istream(param_type) ||
+                       TypeManager::is_pointer_to_ostream(param_type) ||
+                       TypeManager::is_pointer_to_iostream(param_type))) {
+    if (ParameterRemap *r = make_stream_csharp_remap(param_type)) {
+      return r;
+    }
+  }
 
   if (convert_strings) {
     if (TypeManager::is_char_pointer(param_type)) {

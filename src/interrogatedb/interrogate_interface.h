@@ -87,6 +87,13 @@ enum AtomicToken {
   // This is not a type that C has, but C++ and many scripting languages do;
   // it indicates a null value, or the absence of any value.
   AT_null = 9,
+
+  // These represent std::istream, std::ostream, and std::iostream parameters
+  // that the target language wants exposed as its own native stream
+  // abstraction (e.g. System.IO.Stream in C#).
+  AT_istream = 10,
+  AT_ostream = 11,
+  AT_iostream = 12,
 };
 
 EXPCL_INTERROGATEDB void interrogate_add_search_directory(const char *dirname);

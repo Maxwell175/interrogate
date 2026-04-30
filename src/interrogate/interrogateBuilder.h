@@ -116,6 +116,11 @@ public:
   get_make_seq(CPPMakeSeq *make_seq, CPPStructType *struct_type);
 
   TypeIndex get_atomic_string_type();
+  TypeIndex get_atomic_istream_type();
+  TypeIndex get_atomic_ostream_type();
+  TypeIndex get_atomic_iostream_type();
+  TypeIndex get_atomic_named_type(const std::string &true_name, AtomicToken token);
+
 
   void define_atomic_type(InterrogateType &itype, CPPSimpleType *cpptype);
   void define_wrapped_type(InterrogateType &itype, CPPPointerType *cpptype);
