@@ -2612,13 +2612,33 @@ define_struct_type(InterrogateType &itype, CPPStructType *cpptype,
       (cpptype->_file._source != CPPFile::S_local ||
        in_ignorefile(cpptype->_file._filename_as_referenced))) {
     // The struct type is defined in some other package or in an ignorable
-    // file, so don't try to output it.
-
-    // This means we also don't gather any information about its derivations
-    // or determine if an implicit destructor is necessary.  However, this is
-    // not important, and it causes problems if we do (how many implicit
-    // destructors do we need, anyway?).
+    // file, so don't try to output its methods / ctors / destructors — a
+    // later merge of this module's .in with the package's own .in would
+    // otherwise produce duplicate function wrappers.
     itype._flags &= ~InterrogateType::F_fully_defined;
+
+    // But do record the base classes.  Cross-module type walks (C#
+    // collection-facade detection, e.g.) need to reach ancestors of types
+    // declared outside this module even before the other .in is loaded.
+    // Recording just the derivation edges (no methods) is safe because
+    // the later merge overrides this stub with the fully-defined version
+    // and re-remaps the derivation indices.
+    if (itype._derivations.empty()) {
+      for (const CPPStructType::Base &base : cpptype->_derivation) {
+        if (base._vis <= V_public) {
+          CPPType *base_type = TypeManager::resolve_type(base._base, cpptype->_scope);
+          TypeIndex base_index = get_type(base_type, false);
+          if (base_index != 0) {
+            InterrogateType::Derivation d;
+            d._flags = 0;
+            d._base = base_index;
+            d._upcast = 0;
+            d._downcast = 0;
+            itype._derivations.push_back(d);
+          }
+        }
+      }
+    }
     return;
   }
 
@@ -2724,6 +2744,77 @@ define_struct_type(InterrogateType &itype, CPPStructType *cpptype,
         }
 
         itype._derivations.push_back(d);
+      }
+    }
+  }
+
+  // Smart-pointer "pointee" synthetic derivation.  If this class is, or
+  // inherits from, a smart-pointer holder (PointerTo / ConstPointerTo /
+  // PointerToBase), record a DF_pointer_to derivation to the pointed-to
+  // type so downstream consumers (C# collection-facade detection, etc.)
+  // can see what the wrapper logically contains.  is_smart_pointer is
+  // used instead of is_pointer_to_base because we want to match
+  // PointerToBase itself, not just its descendants.
+  //
+  // Prefer p()'s return type for the pointee so its const-ness feeds
+  // DF_pointer_to_const (set when p() returns `const T *`).  Fall back
+  // to the first template parameter if no p() is visible — panda3d's
+  // array wrappers declare p() only in public:, so the const-ness
+  // signal is unavailable there and pass 2 has a separate fallback.
+  if (TypeManager::is_smart_pointer(cpptype)) {
+    CPPType *pointer_type = nullptr;
+    CPPStructType *stype = cpptype->as_struct_type();
+    if (stype != nullptr) {
+      // BFS real inheritance so the nearest visible p() wins — a
+      // Const-variant's shadow p() overrides a non-const inherited one.
+      std::vector<CPPStructType *> worklist;
+      worklist.push_back(stype);
+      while (!worklist.empty() && pointer_type == nullptr) {
+        CPPStructType *cur = worklist.front();
+        worklist.erase(worklist.begin());
+        pointer_type = TypeManager::get_pointer_type(cur);
+        if (pointer_type != nullptr) break;
+        for (const CPPStructType::Base &base : cur->_derivation) {
+          if (base._vis > V_public) continue;
+          CPPType *btype = TypeManager::resolve_type(base._base);
+          if (btype == nullptr) continue;
+          CPPStructType *bstype = btype->as_struct_type();
+          if (bstype != nullptr) worklist.push_back(bstype);
+        }
+      }
+    }
+
+    // Unwrap to the raw pointee; track const-ness so pass 2 can classify
+    // ConstPointerTo / ConstPointerToArray as readonly.
+    CPPType *pointee_type = pointer_type;
+    bool is_const = false;
+    if (pointer_type != nullptr) {
+      CPPType *unwrapped = TypeManager::unwrap_pointer(pointer_type);
+      if (unwrapped != nullptr) {
+        if (unwrapped->is_const()) {
+          is_const = true;
+        }
+        pointee_type = TypeManager::unwrap_const(unwrapped);
+      }
+    }
+    if (pointee_type == nullptr) {
+      pointee_type = TypeManager::get_template_parameter_type(cpptype, 0);
+    }
+    if (pointee_type != nullptr) {
+      CPPType *resolved = TypeManager::resolve_type(pointee_type, scope);
+      if (resolved != nullptr) {
+        TypeIndex pointee_index = get_type(resolved, false);
+        if (pointee_index != 0) {
+          InterrogateType::Derivation d;
+          d._flags = InterrogateType::DF_pointer_to;
+          if (is_const) {
+            d._flags |= InterrogateType::DF_pointer_to_const;
+          }
+          d._base = pointee_index;
+          d._upcast = 0;
+          d._downcast = 0;
+          itype._derivations.push_back(d);
+        }
       }
     }
   }

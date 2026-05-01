@@ -128,6 +128,12 @@ public:
   static bool is_iostream(CPPType *type);
   static bool is_pointer_to_iostream(CPPType *type);
 
+  // Broader cousin of is_pointer_to_base(): true if the type is or
+  // inherits from a class whose simple name is PointerTo,
+  // ConstPointerTo, or PointerToBase — i.e. any smart-pointer wrapper.
+  // Used by the db builder to synthesize DF_pointer_to derivations.
+  static bool is_smart_pointer(CPPType *type);
+
   static CPPType *unwrap_pointer(CPPType *type);
   static CPPType *unwrap_reference(CPPType *type);
   static CPPType *unwrap_const(CPPType *type);

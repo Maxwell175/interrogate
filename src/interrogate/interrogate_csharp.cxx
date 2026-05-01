@@ -12,6 +12,7 @@
 
 #include "interrogate.h"
 #include "interfaceMakerCSharp.h"
+#include "interrogateBuilder.h"
 #include "interrogateDatabase.h"
 #include "pnotify.h"
 #include "panda_getopt_long.h"
@@ -287,7 +288,16 @@ main(int argc, char *argv[]) {
   InterrogateModuleDef def;
   std::memset(&def, 0, sizeof(def));
   def.library_name = library_name.c_str();
-  def.library_hash_name = library_name.c_str();
+  // Pass 1 hashes library_name via hash_string(name, 5) to produce the
+  // short prefix baked into generated symbols (`_inC<hash><remap_hash>`
+  // for C wrappers, `Collection_<hash>_...` for collection helpers).
+  // Pass 2 needs the same hash so its pinvokes match the pass-1
+  // exports — note that collection-helper naming reads the hash from
+  // the owning type's library_name, but other callers still rely on
+  // _def->library_hash_name.  Storage is static to outlive def.
+  static std::string library_hash_storage =
+    InterrogateBuilder::hash_string(library_name, 5);
+  def.library_hash_name = library_hash_storage.c_str();
   def.module_name = module_name.c_str();
 
   InterfaceMakerCSharp maker(&def);

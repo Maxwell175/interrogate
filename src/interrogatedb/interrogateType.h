@@ -107,6 +107,9 @@ public:
   INLINE bool derivation_has_downcast(int n) const;
   INLINE FunctionIndex derivation_get_downcast(int n) const;
 
+  INLINE bool derivation_is_pointer_to(int n) const;
+  INLINE bool derivation_is_pointer_to_const(int n) const;
+
   INLINE int number_of_nested_types() const;
   INLINE TypeIndex get_nested_type(int n) const;
 
@@ -175,7 +178,20 @@ public:
   enum DerivationFlags {
     DF_upcast               = 0x01,
     DF_downcast             = 0x02,
-    DF_downcast_impossible  = 0x04
+    DF_downcast_impossible  = 0x04,
+    // Synthetic, not a real C++ base.  Recorded when a class is or
+    // inherits from a smart-pointer holder (PointerToBase / PointerTo /
+    // ConstPointerTo); _base is the pointed-to type, taken from p()'s
+    // return type (stripped of pointer/const) or the wrapper's first
+    // template parameter if no p() is visible.  Consumers doing
+    // inheritance work (upcast, vtable) should skip these; consumers
+    // asking what the wrapper "contains" (C# collection-facade
+    // detection, etc.) follow them like normal bases.
+    DF_pointer_to           = 0x08,
+    // Only valid with DF_pointer_to.  Set when a visible p() returns
+    // `const T *`, i.e. the wrapper is read-only (ConstPointerTo<T>,
+    // user-defined const wrappers).
+    DF_pointer_to_const     = 0x10,
   };
 
 public:

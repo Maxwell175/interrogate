@@ -93,11 +93,33 @@ namespace Interrogate {
             new(stream, Direction.InputOutput);
 
         /// <summary>
+        /// Number of native bridge streams currently alive (created but not yet
+        /// destroyed).  Primarily useful as a leak check for tests — after
+        /// every <see cref="StreamBridge"/> has been disposed this should read
+        /// the same value it did before they were created.
+        /// </summary>
+        public static long LiveCount => NativeMethods.LiveCount();
+
+        /// <summary>
         /// Tears down the native stream and releases the <see cref="GCHandle"/>
         /// rooting the managed stream.  Does not close or dispose the wrapped
         /// <see cref="Stream"/>; ownership remains with the caller.
         /// </summary>
         public void Dispose() {
+            ReleaseNative();
+            GC.SuppressFinalize(this);
+        }
+
+        // Safety net for callers who forget `using`.  The generated bindings
+        // always wrap stream params in `using var __p3streamN`, but a caller
+        // that drops the bridge on the floor would otherwise leak the native
+        // streambuf.  Finalizers are best-effort (non-deterministic) — the
+        // `using` pattern is still the right call for predictable cleanup.
+        ~StreamBridge() {
+            ReleaseNative();
+        }
+
+        private void ReleaseNative() {
             if (_handle != IntPtr.Zero) {
                 switch (_direction) {
                     case Direction.Input:       NativeMethods.DestroyIstream(_handle); break;
@@ -187,6 +209,9 @@ namespace Interrogate {
 
             [LibraryImport(LibName, EntryPoint = "igStreamBridge_DestroyIostream")]
             internal static partial void DestroyIostream(IntPtr stream);
+
+            [LibraryImport(LibName, EntryPoint = "igStreamBridge_LiveCount")]
+            internal static partial long LiveCount();
         }
     }
 }

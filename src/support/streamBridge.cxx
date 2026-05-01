@@ -11,10 +11,16 @@
 
 #include "streamBridge.h"
 
+#include <atomic>
 #include <iostream>
 #include <streambuf>
 
 namespace {
+
+// Incremented on every successful Create*, decremented on every Destroy*.
+// Exposed via igStreamBridge_LiveCount for managed leak tests.  Atomic so
+// stream creation from multiple threads doesn't corrupt the counter.
+std::atomic<int64_t> g_live_bridges{0};
 
 /**
  * A std::streambuf implementation whose read/write/seek operations are
@@ -178,6 +184,7 @@ igStreamBridge_CreateIstream(ig_stream_read_fn read_cb,
                              ig_stream_seek_fn seek_cb,
                              void *cookie) {
   auto *buf = new BridgeBuf(read_cb, nullptr, seek_cb, cookie);
+  g_live_bridges.fetch_add(1, std::memory_order_relaxed);
   return static_cast<std::istream *>(new BridgeIstream(buf));
 }
 
@@ -186,6 +193,7 @@ igStreamBridge_CreateOstream(ig_stream_write_fn write_cb,
                              ig_stream_seek_fn seek_cb,
                              void *cookie) {
   auto *buf = new BridgeBuf(nullptr, write_cb, seek_cb, cookie);
+  g_live_bridges.fetch_add(1, std::memory_order_relaxed);
   return static_cast<std::ostream *>(new BridgeOstream(buf));
 }
 
@@ -195,22 +203,34 @@ igStreamBridge_CreateIostream(ig_stream_read_fn read_cb,
                               ig_stream_seek_fn seek_cb,
                               void *cookie) {
   auto *buf = new BridgeBuf(read_cb, write_cb, seek_cb, cookie);
+  g_live_bridges.fetch_add(1, std::memory_order_relaxed);
   return static_cast<std::iostream *>(new BridgeIostream(buf));
 }
 
 void
 igStreamBridge_DestroyIstream(void *stream) {
+  if (stream == nullptr) return;
   delete static_cast<std::istream *>(stream);
+  g_live_bridges.fetch_sub(1, std::memory_order_relaxed);
 }
 
 void
 igStreamBridge_DestroyOstream(void *stream) {
+  if (stream == nullptr) return;
   delete static_cast<std::ostream *>(stream);
+  g_live_bridges.fetch_sub(1, std::memory_order_relaxed);
 }
 
 void
 igStreamBridge_DestroyIostream(void *stream) {
+  if (stream == nullptr) return;
   delete static_cast<std::iostream *>(stream);
+  g_live_bridges.fetch_sub(1, std::memory_order_relaxed);
+}
+
+int64_t
+igStreamBridge_LiveCount() {
+  return g_live_bridges.load(std::memory_order_relaxed);
 }
 
 }  // extern "C"

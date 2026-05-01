@@ -1512,6 +1512,48 @@ is_reference_count_pointer(CPPType *type) {
 }
 
 /**
+ * Broader cousin of is_pointer_to_base(): true if the type is or
+ * inherits from PointerTo / ConstPointerTo / PointerToBase.  Unlike
+ * is_pointer_to_base this DOES match PointerToBase directly, so the db
+ * builder can synthesize DF_pointer_to for intermediates too (e.g.
+ * panda3d's PointerToArrayBase, which derives from PointerToBase but
+ * is neither PointerTo nor ConstPointerTo).
+ */
+bool TypeManager::
+is_smart_pointer(CPPType *type) {
+  if (type->get_simple_name() == "PointerTo" ||
+      type->get_simple_name() == "ConstPointerTo" ||
+      type->get_simple_name() == "PointerToBase") {
+    return true;
+  }
+
+  switch (type->get_subtype()) {
+  case CPPDeclaration::ST_const:
+    return is_smart_pointer(type->as_const_type()->_wrapped_around);
+
+  case CPPDeclaration::ST_struct:
+    {
+      CPPStructType *stype = type->as_struct_type();
+      CPPStructType::Derivation::const_iterator di;
+      for (di = stype->_derivation.begin();
+           di != stype->_derivation.end();
+           ++di) {
+        if (is_smart_pointer((*di)._base)) {
+          return true;
+        }
+      }
+    }
+    return false;
+
+  case CPPDeclaration::ST_typedef:
+    return is_smart_pointer(type->as_typedef_type()->_type);
+
+  default:
+    return false;
+  }
+}
+
+/**
  * Returns true if the indicated type is some class that derives from
  * PointerToBase, or false otherwise.
  */
@@ -1877,6 +1919,9 @@ bool TypeManager::is_ostream(CPPType *type) {
     return is_ostream(type->as_const_type()->_wrapped_around);
 
   case CPPDeclaration::ST_struct:
+  case CPPDeclaration::ST_extension:
+    // Either full class definition or forward declaration — both legitimate
+    // appearances of std::ostream in a header.
     return (type->get_local_name(&parser) == "std::ostream" ||
             type->get_local_name(&parser) == "ostream" ||
             type->get_local_name(&parser) == "std::basic_ostream< char >");
@@ -1921,6 +1966,7 @@ bool TypeManager::is_istream(CPPType *type) {
     return is_istream(type->as_const_type()->_wrapped_around);
 
   case CPPDeclaration::ST_struct:
+  case CPPDeclaration::ST_extension:
     return (type->get_local_name(&parser) == "std::istream" ||
             type->get_local_name(&parser) == "istream" ||
             type->get_local_name(&parser) == "std::basic_istream< char >");
@@ -1965,6 +2011,7 @@ bool TypeManager::is_iostream(CPPType *type) {
     return is_iostream(type->as_const_type()->_wrapped_around);
 
   case CPPDeclaration::ST_struct:
+  case CPPDeclaration::ST_extension:
     return (type->get_local_name(&parser) == "std::iostream" ||
             type->get_local_name(&parser) == "iostream" ||
             type->get_local_name(&parser) == "std::basic_iostream< char >");

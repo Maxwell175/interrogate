@@ -1,76 +1,41 @@
 //FLAGS: -promiscuous -string -refcount
 #include <string>
+#include <vector>
+
+// Exercises virtual dispatch, namespaces, and free functions with multiple
+// overloads.  Intentionally narrower than panda3d's real use so the test
+// remains tractable to implement without a full dtool stack.
 
 class Shape {
-__published:
+public:
   Shape();
   virtual ~Shape();
+
   virtual float area() const;
   virtual std::string type_name() const;
+
   int get_id() const;
-  __make_property(id, get_id);
+  void set_id(int id);
+
+private:
+  int _id;
 };
 
 class Circle : public Shape {
-__published:
+public:
   Circle(float radius);
+
   float get_radius() const;
   void set_radius(float r);
-  __make_property(radius, get_radius, set_radius);
-  virtual float area() const;
-  virtual std::string type_name() const;
+
+  virtual float area() const override;
+  virtual std::string type_name() const override;
+
+private:
+  float _radius;
 };
 
-class Serializable {
-__published:
-  Serializable();
-  virtual ~Serializable();
-  virtual std::string serialize() const;
-};
-
-class Printable {
-__published:
-  Printable();
-  virtual ~Printable();
-  virtual std::string to_string() const;
-};
-
-class Document : public Serializable, public Printable {
-__published:
-  Document(const std::string &title);
-  virtual ~Document();
-  std::string get_title() const;
-  __make_property(title, get_title);
-  virtual std::string serialize() const;
-  virtual std::string to_string() const;
-};
-
-class Renderable {
-__published:
-  virtual void render() const = 0;
-  virtual int vertex_count() const = 0;
-  virtual ~Renderable();
-};
-
-class Mesh : public Renderable {
-__published:
-  Mesh(int num_verts);
-  virtual void render() const;
-  virtual int vertex_count() const;
-};
-
-class IntArray {
-__published:
-  IntArray();
-  ~IntArray();
-  int get_num_elements() const;
-  int get_element(int n) const;
-  void add_element(int val);
-  __make_seq(get_elements, get_num_elements, get_element);
-};
-
-enum Priority {
-  P_LOW = 0,
-  P_MEDIUM = 1,
-  P_HIGH = 2,
-};
+// Free functions at module scope — test that they end up in the globals
+// class and are callable.
+int add_numbers(int a, int b);
+float add_floats(float a, float b);

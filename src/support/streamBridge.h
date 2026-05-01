@@ -65,6 +65,11 @@ IG_SUPPORT_EXPORT void igStreamBridge_DestroyIstream(void *stream);
 IG_SUPPORT_EXPORT void igStreamBridge_DestroyOstream(void *stream);
 IG_SUPPORT_EXPORT void igStreamBridge_DestroyIostream(void *stream);
 
+// Number of native bridge streams currently alive (created but not yet
+// destroyed).  Used by memory-leak tests on the managed side to verify that
+// every `using var` / finalizer path reaches Destroy.
+IG_SUPPORT_EXPORT int64_t igStreamBridge_LiveCount();
+
 #ifdef __cplusplus
 }  // extern "C"
 #endif

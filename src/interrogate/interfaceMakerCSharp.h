@@ -148,9 +148,9 @@ private:
                                             bool for_return) const;
   std::string get_collection_element_type(const InterrogateType &itype,
                                           bool for_signature) const;
-  std::string get_collection_element_type_from_suffix(const std::string &suffix,
-                                                      bool for_signature) const;
-  std::string get_collection_element_cpp_type_from_suffix(const std::string &suffix) const;
+  std::string get_collection_element_type_from_cpp_name(const std::string &cpp_name,
+                                                        bool for_signature) const;
+  std::string get_collection_element_cpp_type(const InterrogateType &itype) const;
   std::string get_collection_helper_name(const InterrogateType &itype,
                                          const std::string &op) const;
 

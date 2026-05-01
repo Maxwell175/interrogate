@@ -546,6 +546,34 @@ derivation_get_downcast(int n) const {
 }
 
 /**
+ * Returns true if the derivation at n is a synthetic smart-pointer
+ * edge (DF_pointer_to) rather than a real C++ base.  Callers walking
+ * real inheritance (method resolution, vtable layout) should skip it.
+ */
+INLINE bool InterrogateType::
+derivation_is_pointer_to(int n) const {
+  if (n >= 0 && n < (int)_derivations.size()) {
+    return (_derivations[n]._flags & DF_pointer_to) != 0;
+  } else {
+    return false;
+  }
+}
+
+/**
+ * Returns true if the derivation at n is a DF_pointer_to edge whose
+ * p() returns `const T *` — the wrapper is read-only
+ * (ConstPointerTo<T>, ConstPointerToArray<T>, etc.).
+ */
+INLINE bool InterrogateType::
+derivation_is_pointer_to_const(int n) const {
+  if (n >= 0 && n < (int)_derivations.size()) {
+    return (_derivations[n]._flags & DF_pointer_to_const) != 0;
+  } else {
+    return false;
+  }
+}
+
+/**
  *
  */
 INLINE int InterrogateType::

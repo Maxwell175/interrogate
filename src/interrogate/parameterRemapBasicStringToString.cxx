@@ -50,8 +50,16 @@ pass_parameter(ostream &out, const string &variable_name) {
  */
 string ParameterRemapBasicStringToString::
 prepare_return_expr(ostream &out, int indent_level, const string &expression) {
+  // The returned c_str() must outlive the wrapper's return statement, so
+  // that the caller can copy the bytes out.  thread_local storage keeps the
+  // pointer valid until the next call on the same thread, while still
+  // refreshing the contents on every call.  (A plain `static` would fix the
+  // first call forever; a stack-local `std::string` would free the bytes
+  // before the caller can read them.)
   InterfaceMaker::indent(out, indent_level)
-    << "static std::string string_holder = " << expression << ";\n";
+    << "thread_local std::string string_holder;\n";
+  InterfaceMaker::indent(out, indent_level)
+    << "string_holder = " << expression << ";\n";
   return "string_holder";
 }
 
@@ -96,8 +104,12 @@ pass_parameter(ostream &out, const string &variable_name) {
  */
 string ParameterRemapBasicWStringToWString::
 prepare_return_expr(ostream &out, int indent_level, const string &expression) {
+  // See ParameterRemapBasicStringToString::prepare_return_expr for the
+  // thread_local rationale.
   InterfaceMaker::indent(out, indent_level)
-    << "static std::wstring string_holder = " << expression << ";\n";
+    << "thread_local std::wstring string_holder;\n";
+  InterfaceMaker::indent(out, indent_level)
+    << "string_holder = " << expression << ";\n";
   return "string_holder";
 }
 
