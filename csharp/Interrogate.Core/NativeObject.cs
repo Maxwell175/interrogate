@@ -138,6 +138,7 @@ namespace Interrogate {
             return obj?.NativeHandle ?? IntPtr.Zero;
         }
 
+
         /// <summary>
         /// Safely casts this wrapper to a derived or sibling type in the C++ inheritance hierarchy.
         /// Creates a new <see cref="NativeOwnership.Borrowed"/> wrapper of type <typeparamref name="T"/>

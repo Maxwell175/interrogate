@@ -1090,7 +1090,16 @@ marshal_managed_argument(TypeIndex param_type_index, const string &param_type,
                          const string &param_name) {
   if (is_csharp_native_object_type(param_type_index, param_type) ||
       is_collection_type_index(param_type_index)) {
-    return "NativeObject.Unwrap(" + param_name + ")";
+    if (!param_type.empty() && param_type[0] == 'I' && param_type.size() > 1 && isupper(param_type[1])) {
+      // Strip nullable '?' suffix — 'as T?' is illegal in C#
+      string as_type = param_type;
+      if (!as_type.empty() && as_type.back() == '?') {
+        as_type.pop_back();
+      }
+      return "(" + param_name + " as " + as_type + ")?.NativeHandle ?? IntPtr.Zero";
+    } else {
+      return "NativeObject.Unwrap(" + param_name + ")";
+    }
   }
   if (!is_csharp_primitive_type(param_type) && is_csharp_enum_type(param_type_index)) {
     return "(int)" + param_name;
@@ -2811,6 +2820,11 @@ write_interface(ostream &out, Object *object) {
   out << "  " << (is_collection_facade ? "internal" : "public") << " interface " << interface_name
       << get_interface_base_list(itype) << " {\n";
 
+  string base_list = get_interface_base_list(itype);
+  if (!base_list.empty() && base_list.find("INativeObject") != string::npos) {
+    indent(out, 4) << "new IntPtr NativeHandle { get; }\n";
+  }
+
   std::set<string> method_signatures;
   auto reserve_property_names = [&](const InterrogateType &source_type) {
     for (int i = 0; i < source_type.number_of_elements(); ++i) {
@@ -3517,6 +3531,128 @@ write_proxy_class(ostream &out, const string &, Object *object) {
   std::vector<const InterrogateType *> secondary_base_types;
   get_secondary_base_types(itype, secondary_base_types);
 
+  // Use get_secondary_base_types (which handles cross-module database loading) to
+  // get the full list of types we need interface implementations for.
+  // Then categorize: types that are direct secondary derivations (have upcast functions)
+  // vs types on a secondary base's primary chain (share its pointer).
+  InterrogateDatabase *idb_collect = InterrogateDatabase::get_ptr();
+
+  // all_secondary_bases: types with their own upcast function (actual secondary derivations)
+  // secondary_base_owner: maps each such type to its direct owner (the class where di>0 points to it)
+  // primary_chain_aliases: types on a secondary base's primary chain (share its pointer)
+  std::set<const InterrogateType *> all_secondary_bases;
+  std::map<const InterrogateType *, const InterrogateType *> secondary_base_owner;
+  std::map<const InterrogateType *, const InterrogateType *> primary_chain_aliases;
+
+  // get_secondary_base_types already does all the heavy lifting of cross-module resolution.
+  // It returns ALL types we need (both actual secondaries and primary-chain aliases).
+  // We need to determine which category each type falls into.
+  std::vector<const InterrogateType *> full_secondary_list;
+  get_secondary_base_types(itype, full_secondary_list);
+
+  // For each type in the list, check if any of its "parent classes" (types whose secondary
+  // derivation leads to it) have an upcast function for it. If so, it's a real secondary base.
+  // Otherwise, it's a primary-chain alias.
+  //
+  // The key insight: get_secondary_base_types visits types in order from the visit() call.
+  // Secondary bases have upcast functions; primary-chain types don't.
+  // We identify actual secondary bases by checking if get_upcast_pinvoke_name succeeds.
+  // For that we need to find the owner that has the type as derivation[di>0].
+
+  // Build a lookup by interface name for dedup
+  std::set<string> added_names;
+
+  for (const InterrogateType *base_type : full_secondary_list) {
+    if (base_type == nullptr) continue;
+    string base_name = get_interface_name(*base_type);
+    if (!added_names.insert(base_name).second) continue;
+
+    // Try to find an upcast: search all types in the hierarchy for one that has
+    // this base_type as a secondary derivation (di > 0)
+    bool found_upcast = false;
+
+    // Check itype itself first
+    for (int di = 1; di < itype.number_of_derivations(); ++di) {
+      TypeIndex deriv_idx = itype.get_derivation(di);
+      if (!is_wrapped_type(deriv_idx)) continue;
+      const InterrogateType &dt = idb_collect->get_type(deriv_idx);
+      if (get_interface_name(dt) == base_name) {
+        string upcast = get_upcast_pinvoke_name(itype, di);
+        if (!upcast.empty()) {
+          all_secondary_bases.insert(base_type);
+          secondary_base_owner[base_type] = &itype;
+          found_upcast = true;
+        }
+        break;
+      }
+    }
+
+    if (!found_upcast) {
+      // Search through all types already in all_secondary_bases as potential owners
+      for (const InterrogateType *potential_owner : full_secondary_list) {
+        if (potential_owner == nullptr || potential_owner == base_type) continue;
+        ensure_database_loaded(*potential_owner);
+        for (int di = 1; di < potential_owner->number_of_derivations(); ++di) {
+          TypeIndex deriv_idx = potential_owner->get_derivation(di);
+          if (!is_wrapped_type(deriv_idx)) continue;
+          const InterrogateType &dt = idb_collect->get_type(deriv_idx);
+          if (get_interface_name(dt) == base_name) {
+            string upcast = get_upcast_pinvoke_name(*potential_owner, di);
+            if (!upcast.empty()) {
+              all_secondary_bases.insert(base_type);
+              secondary_base_owner[base_type] = potential_owner;
+              found_upcast = true;
+            }
+            break;
+          }
+        }
+        if (found_upcast) break;
+      }
+    }
+
+    if (!found_upcast) {
+      // Also check the primary-base chain of itype for potential owners
+      const InterrogateType *cur = &itype;
+      while (!found_upcast) {
+        ensure_database_loaded(*cur);
+        if (cur->number_of_derivations() == 0) break;
+        TypeIndex primary_idx = cur->get_derivation(0);
+        if (!is_wrapped_type(primary_idx)) break;
+        cur = &idb_collect->get_type(primary_idx);
+        for (int di = 1; di < cur->number_of_derivations(); ++di) {
+          TypeIndex deriv_idx = cur->get_derivation(di);
+          if (!is_wrapped_type(deriv_idx)) continue;
+          const InterrogateType &dt = idb_collect->get_type(deriv_idx);
+          if (get_interface_name(dt) == base_name) {
+            string upcast = get_upcast_pinvoke_name(*cur, di);
+            if (!upcast.empty()) {
+              all_secondary_bases.insert(base_type);
+              secondary_base_owner[base_type] = cur;
+              found_upcast = true;
+            }
+            break;
+          }
+        }
+      }
+    }
+
+    if (!found_upcast) {
+      // This type is on a primary chain of some secondary base — find which one
+      for (const InterrogateType *sec : all_secondary_bases) {
+        if (get_interface_name(*sec) == base_name) { found_upcast = true; break; }
+      }
+      if (!found_upcast) {
+        // Find the nearest secondary base whose primary chain includes this type
+        for (const InterrogateType *sec : all_secondary_bases) {
+          primary_chain_aliases[base_type] = sec;
+          break;
+        }
+      }
+    }
+  }
+
+  InterrogateDatabase *idb = InterrogateDatabase::get_ptr();
+
   if (itype.has_comment()) {
     emit_xml_doc_comment(out, itype.get_comment(), 2);
   }
@@ -3541,6 +3677,36 @@ write_proxy_class(ostream &out, const string &, Object *object) {
     out << ", IDisposable";
   }
   out << " {\n";
+
+  // Helper to get field name for a type
+  auto get_field_name = [&](const InterrogateType *t) -> string {
+    string iface = get_interface_name(*t);
+    string field = "_" + iface.substr(1);
+    field[1] = std::tolower((unsigned char)field[1]);
+    field += "Ptr";
+    return field;
+  };
+
+  // Generate private fields for actual secondary bases
+  for (const InterrogateType *sec_base : all_secondary_bases) {
+    if (sec_base == nullptr) continue;
+    indent(out, 4) << "private IntPtr " << get_field_name(sec_base) << ";\n";
+  }
+
+  // Generate explicit interface implementations
+  for (const InterrogateType *sec_base : all_secondary_bases) {
+    if (sec_base == nullptr) continue;
+    indent(out, 4) << "IntPtr " << get_interface_name(*sec_base) << ".NativeHandle => " << get_field_name(sec_base) << ";\n";
+  }
+  // Aliases share the pointer of their nearest secondary-base ancestor
+  for (auto &[alias_type, sec_base] : primary_chain_aliases) {
+    indent(out, 4) << "IntPtr " << get_interface_name(*alias_type) << ".NativeHandle => " << get_field_name(sec_base) << ";\n";
+  }
+
+  if (!all_secondary_bases.empty() || !primary_chain_aliases.empty()) {
+    out << "\n";
+  }
+
   if (is_abstract) {
     indent(out, 4) << "internal sealed class " << opaque_class_name << " : " << class_name << " {\n";
     indent(out, 6) << "internal " << opaque_class_name << "(IntPtr ptr, NativeOwnership own) : base(ptr, own) {\n";
@@ -3587,6 +3753,102 @@ write_proxy_class(ostream &out, const string &, Object *object) {
 
   indent(out, 4) << "internal " << class_name
                  << "(IntPtr ptr, NativeOwnership ownership) : base(ptr, ownership) {\n";
+
+  // Initialize ALL secondary base pointers (direct and inherited).
+  // Each upcast function expects a pointer to the owner type. If the owner is reachable
+  // from itype via only primary bases, that's `ptr` (same address). If the owner is itself
+  // a secondary base, we must use the already-computed pointer for that base.
+
+  // We will use a bunch of inline helper functions to make things easier here.
+  // Helper: check if 'target' is on the primary base chain of 'from' (by interface name)
+  auto is_on_primary_chain = [&](const InterrogateType &from, const InterrogateType *target) -> bool {
+    string target_name = get_interface_name(*target);
+    const InterrogateType *cur = &from;
+    while (cur != nullptr) {
+      if (get_interface_name(*cur) == target_name) return true;
+      ensure_database_loaded(*cur);
+      if (cur->number_of_derivations() == 0) break;
+      TypeIndex primary_idx = cur->get_derivation(0);
+      if (!is_wrapped_type(primary_idx)) break;
+      cur = &idb->get_type(primary_idx);
+    }
+    return false;
+  };
+
+  // Helper: get the field name for a type
+  auto get_field_name_for = [&](const InterrogateType *t) -> string {
+    string iface = get_interface_name(*t);
+    string field = "_" + iface.substr(1);
+    field[1] = std::tolower((unsigned char)field[1]);
+    field += "Ptr";
+    return field;
+  };
+
+  // Helper: find the pointer expression to use as input to an upcast owned by 'owner'.
+  // Returns "ptr" if owner is on itype's primary chain, or a field name if owner is
+  // reachable through a secondary base.
+  auto get_owner_ptr_expr = [&](const InterrogateType *owner) -> string {
+    if (is_on_primary_chain(itype, owner)) {
+      return "ptr";
+    }
+    for (const InterrogateType *sec : all_secondary_bases) {
+      if (sec == nullptr) continue;
+      if (is_on_primary_chain(*sec, owner)) {
+        return get_field_name_for(sec);
+      }
+    }
+    return "ptr";
+  };
+
+  // Process in order: direct secondary bases first (they use ptr or primary chain),
+  // then inherited ones (which may depend on already-computed fields).
+  // The set iteration order may not guarantee this, so process in two passes:
+  // Pass 1: bases whose owner is on itype's primary chain (always use ptr)
+  // Pass 2: bases whose owner is a secondary base (use that base's field)
+  std::vector<const InterrogateType *> pass1, pass2;
+  for (const InterrogateType *sec_base : all_secondary_bases) {
+    if (sec_base == nullptr) continue;
+    auto owner_it = secondary_base_owner.find(sec_base);
+    if (owner_it == secondary_base_owner.end()) continue;
+    if (is_on_primary_chain(itype, owner_it->second)) {
+      pass1.push_back(sec_base);
+    } else {
+      pass2.push_back(sec_base);
+    }
+  }
+
+  auto emit_upcast_init = [&](const InterrogateType *sec_base) {
+    auto owner_it = secondary_base_owner.find(sec_base);
+    if (owner_it == secondary_base_owner.end()) return;
+    const InterrogateType *owner = owner_it->second;
+
+    // Find the derivation index in the owner class (match by interface name, not pointer)
+    string target_name = get_interface_name(*sec_base);
+    int owner_derivation_index = -1;
+    ensure_database_loaded(*owner);
+    for (int di = 1; di < owner->number_of_derivations(); ++di) {
+      TypeIndex deriv_idx = owner->get_derivation(di);
+      if (!is_wrapped_type(deriv_idx)) continue;
+      const InterrogateType &deriv_type = idb->get_type(deriv_idx);
+      if (get_interface_name(deriv_type) == target_name) {
+        owner_derivation_index = di;
+        break;
+      }
+    }
+    if (owner_derivation_index < 0) return;
+
+    string upcast_func = get_upcast_pinvoke_name(*owner, owner_derivation_index);
+    if (upcast_func.empty()) return;
+
+    string field_name = get_field_name_for(sec_base);
+    string input_ptr = get_owner_ptr_expr(owner);
+
+    indent(out, 6) << field_name << " = " << upcast_func << "(" << input_ptr << ");\n";
+  };
+
+  for (const InterrogateType *sec_base : pass1) emit_upcast_init(sec_base);
+  for (const InterrogateType *sec_base : pass2) emit_upcast_init(sec_base);
+
   indent(out, 4) << "}\n\n";
 
   Functions::const_iterator fi;
@@ -3676,7 +3938,6 @@ write_proxy_class(ostream &out, const string &, Object *object) {
     }
   }
 
-  InterrogateDatabase *idb = InterrogateDatabase::get_ptr();
   std::set<string> emitted_proxy_props;
   auto emit_properties_for_type = [&](const InterrogateType &source_type) {
     int num_elements = source_type.number_of_elements();
@@ -3870,7 +4131,15 @@ write_constructor(ostream &out, Function *func, Object *object, int indent_level
         native_args.push_back(bridge_var + ".Handle");
       } else if (is_csharp_native_object_type(param_type_index, param_type) ||
                  is_collection_type_index(param_type_index)) {
-        native_args.push_back("NativeObject.Unwrap(" + param_name + ")");
+        if (!param_type.empty() && param_type[0] == 'I' && param_type.size() > 1 && isupper(param_type[1])) {
+          string as_type = param_type;
+          if (!as_type.empty() && as_type.back() == '?') {
+            as_type.pop_back();
+          }
+          native_args.push_back("(" + param_name + " as " + as_type + ")?.NativeHandle ?? IntPtr.Zero");
+        } else {
+          native_args.push_back("NativeObject.Unwrap(" + param_name + ")");
+        }
       } else if (!is_csharp_primitive_type(param_type) && is_csharp_enum_type(param_type_index)) {
         native_args.push_back("(int)" + param_name);
       } else {
@@ -4002,7 +4271,15 @@ write_constructor(ostream &out, Function *func, Object *object, int indent_level
         native_args.push_back(bridge_var + ".Handle");
       } else if (is_csharp_native_object_type(param_type_index, param_type) ||
                  is_collection_type_index(param_type_index)) {
-        native_args.push_back("NativeObject.Unwrap(" + param_name + ")");
+        if (!param_type.empty() && param_type[0] == 'I' && param_type.size() > 1 && isupper(param_type[1])) {
+          string as_type = param_type;
+          if (!as_type.empty() && as_type.back() == '?') {
+            as_type.pop_back();
+          }
+          native_args.push_back("(" + param_name + " as " + as_type + ")?.NativeHandle ?? IntPtr.Zero");
+        } else {
+          native_args.push_back("NativeObject.Unwrap(" + param_name + ")");
+        }
       } else if (!is_csharp_primitive_type(param_type) && is_csharp_enum_type(param_type_index)) {
         native_args.push_back("(int)" + param_name);
       } else {
@@ -5662,18 +5939,26 @@ find_upcast_chain(const InterrogateType &itype, TypeIndex target_type,
       continue;
     }
 
-    string upcast_name = get_upcast_pinvoke_name(itype, di);
-    if (upcast_name.empty()) {
-      continue;
-    }
-
     const InterrogateType &base_type = idb->get_type(base_index);
 
-    pinvoke_names.push_back(upcast_name);
+    // For secondary bases (di > 0), we need the upcast function.
+    // For the primary base (di == 0), no upcast is needed (same address), so we skip adding it.
+    string upcast_name;
+    if (di > 0) {
+      upcast_name = get_upcast_pinvoke_name(itype, di);
+      if (upcast_name.empty()) {
+        continue;
+      }
+      pinvoke_names.push_back(upcast_name);
+    }
+
     if (find_upcast_chain(base_type, target_type, pinvoke_names, visited)) {
       return true;
     }
-    pinvoke_names.pop_back();
+
+    if (di > 0) {
+      pinvoke_names.pop_back();
+    }
   }
 
   return false;
@@ -6395,15 +6680,34 @@ get_base_class_clause(const InterrogateType &itype) const {
  */
 string InterfaceMakerCSharp::
 get_interface_list(const InterrogateType &itype) const {
-  std::vector<const InterrogateType *> secondary_base_types;
-  get_secondary_base_types(itype, secondary_base_types);
-
+  // Collect ALL secondary bases from the entire primary-base ancestry chain.
+  // C# explicit interface implementations don't inherit, so each class must
+  // declare every secondary base interface it implements, not just direct ones.
+  std::set<const InterrogateType *> all_secondary_bases;
   std::set<string> emitted_interfaces;
   string interface_list;
-  for (const InterrogateType *base_type : secondary_base_types) {
-    if (base_type == nullptr) {
-      continue;
+
+  std::function<void(const InterrogateType &)> collect;
+  collect = [&](const InterrogateType &t) {
+    std::vector<const InterrogateType *> secondaries;
+    get_secondary_base_types(t, secondaries);
+    for (const InterrogateType *sec : secondaries) {
+      if (sec != nullptr && all_secondary_bases.insert(sec).second) {
+        collect(*sec);
+      }
     }
+    if (t.number_of_derivations() > 0) {
+      TypeIndex primary_idx = t.get_derivation(0);
+      if (is_wrapped_type(primary_idx)) {
+        InterrogateDatabase *idb = InterrogateDatabase::get_ptr();
+        const InterrogateType &primary = idb->get_type(primary_idx);
+        collect(primary);
+      }
+    }
+  };
+  collect(itype);
+
+  for (const InterrogateType *base_type : all_secondary_bases) {
     if (is_collection_facade_type(*base_type)) {
       continue;
     }
