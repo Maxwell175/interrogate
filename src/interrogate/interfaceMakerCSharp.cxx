@@ -3699,7 +3699,9 @@ write_proxy_class(ostream &out, const string &, Object *object) {
     indent(out, 4) << "IntPtr " << get_interface_name(*sec_base) << ".NativeHandle => " << get_field_name(sec_base) << ";\n";
   }
   // Aliases share the pointer of their nearest secondary-base ancestor
-  for (auto &[alias_type, sec_base] : primary_chain_aliases) {
+  for (auto it = primary_chain_aliases.begin(); it != primary_chain_aliases.end(); ++it) {
+    const InterrogateType *alias_type = it->first;
+    const InterrogateType *sec_base = it->second;
     indent(out, 4) << "IntPtr " << get_interface_name(*alias_type) << ".NativeHandle => " << get_field_name(sec_base) << ";\n";
   }
 
