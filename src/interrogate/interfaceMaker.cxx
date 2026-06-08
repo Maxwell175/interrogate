@@ -606,7 +606,7 @@ record_function(const InterrogateType &itype, FunctionIndex func_index) {
   // Binary .in databases carry no _instances; synthesize from _cpptype when
   // available (preserved by InterrogateType::merge_with for live parse runs).
   InterrogateFunction::Instances synthetic_instances;
-  if (ifunc._instances == nullptr && itype._cpptype != nullptr) {
+  if (build_csharp && ifunc._instances == nullptr && itype._cpptype != nullptr) {
     CPPType *resolved = TypeManager::resolve_type(itype._cpptype);
     CPPStructType *struct_type = resolved ? resolved->as_struct_type() : nullptr;
     if (struct_type != nullptr && struct_type->_scope != nullptr &&
@@ -817,6 +817,19 @@ manage_return_value(ostream &out, int indent_level,
       type->output_instance(out, "refcount", &parser);
       out << " = " << return_expr << ";\n";
 
+      if (!build_csharp) {
+        // Upstream behaviour: output_ref() is a no-op for a PointerTo
+        // temporary (see output_ref()), so ref the source expression here to
+        // hand the caller a live pointer.  For build_csharp, output_ref()
+        // refs the temporary instead — same net count, one ref to the caller.
+        indent(out, indent_level)
+          << "if (" << return_expr << " != nullptr) {\n";
+        indent(out, indent_level + 2)
+          << "(" << return_expr << ")->ref();\n";
+        indent(out, indent_level)
+          << "}\n";
+      }
+
       output_ref(out, indent_level, remap, "refcount");
       return remap->_return_type->temporary_to_return("refcount");
     }
@@ -853,15 +866,23 @@ output_ref(ostream &out, int indent_level, FunctionRemap *remap,
            const string &varname) const {
 
   if (TypeManager::is_pointer_to_base(remap->_return_type->get_temporary_type())) {
-    // Stored in a PointerTo, but the extern "C" wrapper returns a raw
-    // pointer.  The PointerTo destructor unrefs when the local goes out of
-    // scope, so we need an explicit ref to keep the object alive for the caller.
-    indent(out, indent_level)
-      << "if (" << varname << " != nullptr) {\n";
-    indent(out, indent_level + 2)
-      << varname << "->ref();\n";
-    indent(out, indent_level)
-      << "}\n";
+    // Stored in a PointerTo.  Upstream — and the Python-native back-end —
+    // rely on the PointerTo temporary holding the ref and emit nothing here
+    // (manage_return_value() instead refs the source expression directly).
+    //
+    // The C# back-end consumes the extern "C" wrapper, which returns a raw
+    // pointer after the PointerTo local destructs and drops its ref, so it
+    // needs an explicit ref here to keep the object alive for the caller.
+    // Keeping this gated leaves Python's generated ref-counting identical to
+    // upstream while giving C# the extra ref it needs.
+    if (build_csharp) {
+      indent(out, indent_level)
+        << "if (" << varname << " != nullptr) {\n";
+      indent(out, indent_level + 2)
+        << varname << "->ref();\n";
+      indent(out, indent_level)
+        << "}\n";
+    }
     return;
   }
 

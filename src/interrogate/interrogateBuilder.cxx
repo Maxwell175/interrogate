@@ -2617,13 +2617,13 @@ define_struct_type(InterrogateType &itype, CPPStructType *cpptype,
     // otherwise produce duplicate function wrappers.
     itype._flags &= ~InterrogateType::F_fully_defined;
 
-    // But do record the base classes.  Cross-module type walks (C#
+    // But do record the base classes for C#.  Cross-module type walks (C#
     // collection-facade detection, e.g.) need to reach ancestors of types
     // declared outside this module even before the other .in is loaded.
     // Recording just the derivation edges (no methods) is safe because
     // the later merge overrides this stub with the fully-defined version
     // and re-remaps the derivation indices.
-    if (itype._derivations.empty()) {
+    if (build_csharp && itype._derivations.empty()) {
       for (const CPPStructType::Base &base : cpptype->_derivation) {
         if (base._vis <= V_public) {
           CPPType *base_type = TypeManager::resolve_type(base._base, cpptype->_scope);
@@ -2761,7 +2761,7 @@ define_struct_type(InterrogateType &itype, CPPStructType *cpptype,
   // to the first template parameter if no p() is visible — panda3d's
   // array wrappers declare p() only in public:, so the const-ness
   // signal is unavailable there and pass 2 has a separate fallback.
-  if (TypeManager::is_smart_pointer(cpptype)) {
+  if (build_csharp && TypeManager::is_smart_pointer(cpptype)) {
     CPPType *pointer_type = nullptr;
     CPPStructType *stype = cpptype->as_struct_type();
     if (stype != nullptr) {
