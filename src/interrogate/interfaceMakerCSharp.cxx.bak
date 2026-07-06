@@ -34,7 +34,6 @@
 #include "filename.h"
 
 #include <cctype>
-#include <cstring>
 #include <functional>
 #include <fstream>
 #include <set>
@@ -71,12 +70,8 @@ public:
 
   std::string prepare_return_expr(std::ostream &out, int indent_level,
                                   const std::string &expression) override {
-    // thread_local so the c_str() pointer outlives the return but is
-    // refreshed on every call; see ParameterRemapBasicStringToString.
     InterfaceMaker::indent(out, indent_level)
-      << "thread_local std::string string_holder;\n";
-    InterfaceMaker::indent(out, indent_level)
-      << "string_holder = TextEncoder::encode_wtext("
+      << "static std::string string_holder = TextEncoder::encode_wtext("
       << expression << ", TextEncoder::E_utf8);\n";
     return "string_holder";
   }
@@ -85,82 +80,12 @@ public:
     return "string_holder.c_str()";
   }
 
-  AtomicToken get_new_atomic_token() override { return AT_string; }
+  bool new_type_is_atomic_string() override { return true; }
 };
 
 // Factory called from interfaceMaker.cxx when build_csharp is set.
 ParameterRemap *make_wstring_csharp_remap(CPPType *type) {
   return new ParameterRemapWStringCSharp(type);
-}
-
-// Remap for std::istream / std::ostream / std::iostream parameters in C# mode.
-// The parameter crosses the C ABI as an opaque void* that points to a C++
-// stream object created on the C# side (see Interrogate.StreamBridge).  The
-// remap's job is to reinterpret_cast that void* back to the right stream
-// pointer, dereferencing if the original declaration was a reference.
-//
-// new_type is void*; the parameter's database-recorded type is one of the
-// AT_istream/AT_ostream/AT_iostream atomic tokens, letting the C# interface
-// maker recognise the parameter as "this is a native-stream bridge" during
-// pass 2 even after the .in database round-trip.
-class ParameterRemapStreamCSharp : public ParameterRemap {
-public:
-  ParameterRemapStreamCSharp(CPPType *orig_type, AtomicToken token,
-                             const char *cpp_stream_type)
-      : ParameterRemap(orig_type), _token(token), _cpp_stream_type(cpp_stream_type) {
-    static CPPType *void_ptr = nullptr;
-    if (void_ptr == nullptr) {
-      void_ptr = parser.parse_type("void *");
-    }
-    _new_type = void_ptr;
-
-    // Remember whether the original parameter was passed by reference so that
-    // pass_parameter() knows to dereference the void* back into a reference.
-    _was_reference = TypeManager::is_reference(orig_type);
-  }
-
-  void pass_parameter(std::ostream &out, const std::string &variable_name) override {
-    if (_was_reference) {
-      out << "*reinterpret_cast<" << _cpp_stream_type << " *>("
-          << variable_name << ")";
-    } else {
-      out << "reinterpret_cast<" << _cpp_stream_type << " *>("
-          << variable_name << ")";
-    }
-  }
-
-  // Cast the C++ stream expression (reference or pointer) to the void*
-  // the C wrapper returns.  The C# side receives it as IntPtr — see
-  // get_csharp_type — since we don't yet wrap returned streams back
-  // into System.IO.Stream.
-  std::string get_return_expr(const std::string &expression) override {
-    if (_was_reference) {
-      return "reinterpret_cast<void *>(&(" + expression + "))";
-    }
-    return "reinterpret_cast<void *>(" + expression + ")";
-  }
-
-  AtomicToken get_new_atomic_token() override { return _token; }
-
-private:
-  AtomicToken _token;
-  const char *_cpp_stream_type;
-  bool _was_reference;
-};
-
-// Factory called from interfaceMaker.cxx when build_csharp is set and the
-// parameter's original C++ type is a pointer or reference to a std stream.
-ParameterRemap *make_stream_csharp_remap(CPPType *type) {
-  if (TypeManager::is_pointer_to_iostream(type)) {
-    return new ParameterRemapStreamCSharp(type, AT_iostream, "std::iostream");
-  }
-  if (TypeManager::is_pointer_to_istream(type)) {
-    return new ParameterRemapStreamCSharp(type, AT_istream, "std::istream");
-  }
-  if (TypeManager::is_pointer_to_ostream(type)) {
-    return new ParameterRemapStreamCSharp(type, AT_ostream, "std::ostream");
-  }
-  return nullptr;
 }
 
 namespace {
@@ -300,22 +225,6 @@ prettify_namespace(const string &module_name) {
     }
   }
 
-  return result;
-}
-
-// Name of the C# class holding a module's free functions.  Prettified
-// namespace with dots removed: "panda3d.core" -> "Panda3DCoreGlobals".
-string
-get_globals_class_name(const string &module_name) {
-  string pretty = prettify_namespace(module_name);
-  string result;
-  result.reserve(pretty.size() + 7);
-  for (char c : pretty) {
-    if (c != '.') {
-      result += c;
-    }
-  }
-  result += "Globals";
   return result;
 }
 
@@ -715,284 +624,60 @@ get_csharp_type_name(const InterrogateType &itype) {
 
 enum CollectionFacadeKind {
   CF_none,
+  CF_array_base,
   CF_readonly_array,
   CF_mutable_array
 };
 
-// Template heads whose instantiations (and anything reaching them via
-// typedef / inheritance / DF_pointer_to edges) are treated as
-// collection facades.  std::vector is the only entry: panda3d's
-// pvector, ReferenceCountedVector, etc. all inherit from it;
-// PointerToArray<T> reaches it via the DF_pointer_to edge on its
-// PointerToBase<ReferenceCountedVector<T>> base.
-static const char *const kCollectionTemplates[] = {
-  "std::vector",
-};
-
-// Template heads that are smart-pointer holders, not facades.  A type
-// whose own true_name matches one of these is never itself emitted as
-// IList<T>, though its DF_pointer_to edge is still followed when it
-// appears as a base of another class (so PointerToArray<T> etc. can
-// still be detected).
-static const char *const kPointerHolderTemplates[] = {
-  "PointerToBase",
-  "PointerTo",
-  "ConstPointerTo",
-};
-
-// Extracts the first template argument from a true_name like
-// "std::vector< int >" or "std::vector< std::string, allocator<...> >",
-// tracking angle-bracket depth so nested templates don't split early.
-// Returns whitespace-stripped; empty if true_name isn't a template.
-static string extract_first_template_argument(const string &true_name) {
-  string::size_type open = true_name.find('<');
-  if (open == string::npos) {
-    return string();
+static CollectionFacadeKind get_collection_facade_kind_from_name(const string &name) {
+  if (name.compare(0, 20, "ConstPointerToArray_") == 0) return CF_readonly_array;
+  if (name.compare(0, 15, "PointerToArray_") == 0) return CF_mutable_array;
+  if (name.compare(0, 8, "pvector_") == 0) return CF_mutable_array;
+  if (name.compare(0, 7, "vector_") == 0 && name.find("iterator") == string::npos) return CF_mutable_array;
+  if (name.compare(0, 15, "ConstPointerTo_") == 0) {
+    if (name.find("Array") != string::npos || name.find("vector") != string::npos) return CF_array_base;
   }
-  int depth = 1;
-  string::size_type i = open + 1;
-  string::size_type arg_end = string::npos;
-  for (; i < true_name.size(); ++i) {
-    char c = true_name[i];
-    if (c == '<') {
-      ++depth;
-    } else if (c == '>') {
-      --depth;
-      if (depth == 0) {
-        arg_end = i;
-        break;
-      }
-    } else if (c == ',' && depth == 1) {
-      arg_end = i;
-      break;
-    }
-  }
-  if (arg_end == string::npos) {
-    return string();
-  }
-  string arg = true_name.substr(open + 1, arg_end - (open + 1));
-  while (!arg.empty() && (arg.front() == ' ' || arg.front() == '\t')) arg.erase(arg.begin());
-  while (!arg.empty() && (arg.back() == ' ' || arg.back() == '\t')) arg.pop_back();
-  return arg;
-}
-
-// Returns true if true_name's template head (bit before '<') matches
-// one of `templates`, either fully ("std::vector") or as the simple
-// name after the last "::" ("PointerTo" matches "NS::PointerTo<T>").
-// Mirrors the simple-name check in TypeManager::is_pointer_to_base.
-static bool matches_collection_template(const string &true_name,
-                                        const char *const *templates,
-                                        size_t templates_count) {
-  string::size_type lt = true_name.find('<');
-  if (lt == string::npos) {
-    return false;
-  }
-  string head = true_name.substr(0, lt);
-  // Simple name: whatever comes after the last "::".
-  string::size_type colon = head.rfind("::");
-  string simple = (colon == string::npos) ? head : head.substr(colon + 2);
-
-  for (size_t i = 0; i < templates_count; ++i) {
-    const char *tmpl = templates[i];
-    if (head == tmpl || simple == tmpl) {
-      return true;
-    }
-  }
-  return false;
-}
-
-static TypeIndex unwrap_type_aliases(TypeIndex type_index);
-
-// Walks itype's typedef chain (via _wrapped_type) and then its
-// derivations (real bases + DF_pointer_to), looking for an instantiation
-// of a kCollectionTemplates entry.  On a hit, writes the element-type
-// name to element_true_name_out and returns CF_mutable_array; the
-// caller refines mutable-vs-readonly via collection_facade_is_readonly.
-// Uses only serialized fields so pass 1 and pass 2 agree.
-static CollectionFacadeKind walk_for_vector_base(
-    const InterrogateType &itype,
-    string &element_true_name_out) {
-  InterrogateDatabase *idb = InterrogateDatabase::get_ptr();
-  constexpr size_t N = sizeof(kCollectionTemplates) / sizeof(kCollectionTemplates[0]);
-
-  // Peel typedef / pointer / const wrapping to reach the underlying type
-  // (vector_int, vector_int *, const std::vector<int> &, etc.).
-  const InterrogateType *cur = &itype;
-  int guard = 32;
-  while (guard-- > 0) {
-    if (matches_collection_template(cur->_true_name,
-                                    kCollectionTemplates, N)) {
-      element_true_name_out = extract_first_template_argument(cur->_true_name);
-      return element_true_name_out.empty() ? CF_none : CF_mutable_array;
-    }
-    if ((cur->is_typedef() || cur->is_wrapped() || cur->is_pointer()) &&
-        cur->_wrapped_type != 0) {
-      TypeIndex inner = unwrap_type_aliases(cur->_wrapped_type);
-      if (inner == 0) break;
-      cur = &idb->get_type(inner);
-    } else {
-      break;
-    }
-  }
-
-  // Walk derivations — real bases and DF_pointer_to edges alike — so
-  // smart-pointer wrappers transit to their pointee.  E.g.
-  // PointerToArray<T> → PointerToBase<ReferenceCountedVector<T>> →
-  // (DF_pointer_to) → ReferenceCountedVector<T> → pvector<T> →
-  // std::vector<T>, all from the DB.
-  for (int i = 0; i < cur->number_of_derivations(); ++i) {
-    TypeIndex base_index = cur->get_derivation(i);
-    if (base_index == 0) continue;
-    const InterrogateType &base = idb->get_type(base_index);
-    CollectionFacadeKind kind = walk_for_vector_base(base, element_true_name_out);
-    if (kind != CF_none) {
-      return kind;
-    }
+  if (name.compare(0, 10, "PointerTo_") == 0) {
+    if (name.find("Array") != string::npos || name.find("vector") != string::npos) return CF_array_base;
   }
   return CF_none;
 }
 
-// Does itype have a method (own or inherited) with this name?  Used to
-// weed out abstract intermediates like PointerToArrayBase<T> that reach
-// std::vector but don't themselves expose size() / operator[].  Walks
-// only real C++ inheritance: methods reachable only via p()->foo() on a
-// DF_pointer_to edge aren't callable on the holder.
-static bool type_has_method(const InterrogateType &itype, const string &name) {
-  InterrogateDatabase *idb = InterrogateDatabase::get_ptr();
-  for (int i = 0; i < itype.number_of_methods(); ++i) {
-    FunctionIndex fi = itype.get_method(i);
-    if (fi == 0) continue;
-    const InterrogateFunction &func = idb->get_function(fi);
-    if (func.has_name() && func.get_name() == name) {
-      return true;
-    }
-  }
-  for (int i = 0; i < itype.number_of_derivations(); ++i) {
-    if (itype.derivation_is_pointer_to(i)) continue;
-    TypeIndex base_index = itype.get_derivation(i);
-    if (base_index == 0) continue;
-    if (type_has_method(idb->get_type(base_index), name)) {
-      return true;
-    }
-  }
-  return false;
-}
-
-// True iff itype (or a real-inheritance ancestor) has a
-// DF_pointer_to_const edge, meaning pass 1 saw a p() returning
-// `const T *`.  Positive answer is authoritative (readonly); negative
-// isn't, since p() may have been unpublished.
-static bool has_pointer_to_const_edge(const InterrogateType &itype) {
-  InterrogateDatabase *idb = InterrogateDatabase::get_ptr();
-  for (int i = 0; i < itype.number_of_derivations(); ++i) {
-    if (itype.derivation_is_pointer_to_const(i)) {
-      return true;
-    }
-  }
-  for (int i = 0; i < itype.number_of_derivations(); ++i) {
-    if (itype.derivation_is_pointer_to(i)) continue;
-    TypeIndex base_index = itype.get_derivation(i);
-    if (base_index == 0) continue;
-    if (has_pointer_to_const_edge(idb->get_type(base_index))) {
-      return true;
-    }
-  }
-  return false;
-}
-
-// Classifies a collection facade as readonly vs mutable.
-//
-// Primary: DF_pointer_to_const, set in pass 1 when p() returned
-// `const T *`.  Authoritative when p() was visible (PUBLISHED or
-// -promiscuous).
-//
-// Fallback: infer from the method set — a readonly wrapper won't
-// expose push_back / set_element.  Only trusted when std::vector was
-// reached through inheritance; a direct typedef to external std::vector
-// carries no methods in the db and would falsely look read-only.
-static bool collection_facade_is_readonly(const InterrogateType &itype,
-                                          bool via_typedef_only) {
-  if (has_pointer_to_const_edge(itype)) {
-    return true;
-  }
-  if (via_typedef_only) {
-    return false;
-  }
-  return !type_has_method(itype, "push_back") &&
-         !type_has_method(itype, "set_element");
-}
-
-static CollectionFacadeKind detect_collection_facade_kind(
-    const InterrogateType &itype,
-    string &element_true_name_out) {
-  InterrogateDatabase *idb = InterrogateDatabase::get_ptr();
-  constexpr size_t N = sizeof(kCollectionTemplates) / sizeof(kCollectionTemplates[0]);
-  constexpr size_t NP = sizeof(kPointerHolderTemplates) / sizeof(kPointerHolderTemplates[0]);
-
-  // Reject the smart-pointer holders themselves — their DF_pointer_to
-  // edge can reach std::vector, but only subclasses that forward vector
-  // methods (PointerToArray<T>, FancyArray<T>) should surface as IList<T>.
-  if (matches_collection_template(itype._true_name,
-                                  kPointerHolderTemplates, NP)) {
-    return CF_none;
-  }
-
-  CollectionFacadeKind kind = walk_for_vector_base(itype, element_true_name_out);
-  if (kind == CF_none) {
-    return CF_none;
-  }
-
-  // If a plain typedef/wrapping peel lands on std::vector (e.g.
-  // `typedef std::vector<int> vector_int`), the type IS a vector
-  // instantiation — no method check needed.  Otherwise we got here via
-  // inheritance, where an abstract intermediate like PointerToArrayBase<T>
-  // can reach std::vector without itself exposing size() / operator[];
-  // require a size() method so the generated helpers compile.
-  const InterrogateType *cur = &itype;
-  int guard = 32;
-  bool reaches_vector_via_typedef_only = false;
-  while (guard-- > 0) {
-    if (matches_collection_template(cur->_true_name,
-                                    kCollectionTemplates, N)) {
-      reaches_vector_via_typedef_only = true;
-      break;
-    }
-    if ((cur->is_typedef() || cur->is_wrapped() || cur->is_pointer()) &&
-        cur->_wrapped_type != 0) {
-      TypeIndex inner = unwrap_type_aliases(cur->_wrapped_type);
-      if (inner == 0) break;
-      cur = &idb->get_type(inner);
-    } else {
-      break;
-    }
-  }
-  if (!reaches_vector_via_typedef_only && !type_has_method(itype, "size")) {
-    return CF_none;
-  }
-
-  if (collection_facade_is_readonly(itype, reaches_vector_via_typedef_only)) {
-    return CF_readonly_array;
-  }
-
-  return kind;
-}
-
 static CollectionFacadeKind get_collection_facade_kind(const InterrogateType &itype) {
-  string unused;
-  return detect_collection_facade_kind(itype, unused);
+  string cn = get_csharp_type_name(itype);
+  if (cn.empty()) return CF_none;
+  return get_collection_facade_kind_from_name(cn);
 }
 
 static bool is_collection_facade_type(const InterrogateType &itype) {
   return get_collection_facade_kind(itype) != CF_none;
 }
 
+static TypeIndex unwrap_type_aliases(TypeIndex type_index);
+
 static bool is_collection_type_index(TypeIndex type_index) {
   InterrogateDatabase *idb = InterrogateDatabase::get_ptr();
   if (type_index == 0) return false;
-  // detect_collection_facade_kind already peels pointer / reference / const
-  // / typedef wrapping and walks the inheritance chain, so we don't need a
-  // second pass here.
-  return is_collection_facade_type(idb->get_type(type_index));
+  const InterrogateType &itype = idb->get_type(type_index);
+  if (is_collection_facade_type(itype)) return true;
+  // Also check through pointer/reference/const/alias wrapping
+  if (itype.is_pointer() || itype.is_wrapped()) {
+    TypeIndex inner = unwrap_type_aliases(itype.get_wrapped_type());
+    if (inner != 0 && inner != type_index) {
+      return is_collection_type_index(inner);
+    }
+  }
+  return false;
+}
+
+static string get_collection_suffix(const string &name) {
+  if (name.compare(0, 20, "ConstPointerToArray_") == 0) return name.substr(20);
+  if (name.compare(0, 15, "PointerToArray_") == 0) return name.substr(15);
+  if (name.compare(0, 15, "ConstPointerTo_") == 0) return name.substr(15);
+  if (name.compare(0, 10, "PointerTo_") == 0) return name.substr(10);
+  if (name.compare(0, 8, "pvector_") == 0) return name.substr(8);
+  if (name.compare(0, 7, "vector_") == 0) return name.substr(7);
+  return name;
 }
 
 bool
@@ -1090,51 +775,12 @@ marshal_managed_argument(TypeIndex param_type_index, const string &param_type,
                          const string &param_name) {
   if (is_csharp_native_object_type(param_type_index, param_type) ||
       is_collection_type_index(param_type_index)) {
-    if (!param_type.empty() && param_type[0] == 'I' && param_type.size() > 1 && isupper(param_type[1])) {
-      // Strip nullable '?' suffix — 'as T?' is illegal in C#
-      string as_type = param_type;
-      if (!as_type.empty() && as_type.back() == '?') {
-        as_type.pop_back();
-      }
-      return "(" + param_name + " as " + as_type + ")?.NativeHandle ?? IntPtr.Zero";
-    } else {
-      return "NativeObject.Unwrap(" + param_name + ")";
-    }
+    return "NativeObject.Unwrap(" + param_name + ")";
   }
   if (!is_csharp_primitive_type(param_type) && is_csharp_enum_type(param_type_index)) {
     return "(int)" + param_name;
   }
   return param_name;
-}
-
-// If param_type_index refers to an atomic stream token, returns the
-// corresponding AtomicToken.  Otherwise returns AT_not_atomic.
-AtomicToken
-csharp_stream_token_for_type(TypeIndex param_type_index) {
-  if (param_type_index == 0) {
-    return AT_not_atomic;
-  }
-  const InterrogateType &itype =
-    InterrogateDatabase::get_ptr()->get_type(param_type_index);
-  if (!itype.is_atomic()) {
-    return AT_not_atomic;
-  }
-  AtomicToken tok = itype.get_atomic_token();
-  if (tok == AT_istream || tok == AT_ostream || tok == AT_iostream) {
-    return tok;
-  }
-  return AT_not_atomic;
-}
-
-// Name of the Interrogate.StreamBridge factory for a given direction.
-const char *
-csharp_stream_bridge_factory(AtomicToken tok) {
-  switch (tok) {
-  case AT_istream:  return "global::Interrogate.StreamBridge.ForInput";
-  case AT_ostream:  return "global::Interrogate.StreamBridge.ForOutput";
-  case AT_iostream: return "global::Interrogate.StreamBridge.ForInputOutput";
-  default:          return nullptr;
-  }
 }
 
 bool
@@ -1252,15 +898,6 @@ is_csharp_type_legal(CPPType *in_ctype) {
   CPPType *type = TypeManager::resolve_type(in_ctype);
   if (TypeManager::is_rvalue_reference(type)) {
     return false;
-  }
-
-  // Stream types are allowed in both pointer and reference form; the C#
-  // backend bridges them to System.IO.Stream via StreamBridge.  Recognise
-  // these before the generic std::-prefix rejection below.
-  if (TypeManager::is_pointer_to_istream(in_ctype) ||
-      TypeManager::is_pointer_to_ostream(in_ctype) ||
-      TypeManager::is_pointer_to_iostream(in_ctype)) {
-    return true;
   }
 
   type = TypeManager::unwrap(type);
@@ -1572,7 +1209,7 @@ is_char_type(TypeIndex type_index) {
 }
 
 string
-get_pinvoke_atomic_type(const InterrogateType &itype, bool for_return) {
+get_pinvoke_atomic_type(const InterrogateType &itype) {
   if (!itype.is_atomic()) {
     return "IntPtr";
   }
@@ -1587,13 +1224,7 @@ get_pinvoke_atomic_type(const InterrogateType &itype, bool for_return) {
   case AT_double:
     return "double";
   case AT_string:
-    // As a parameter, the [LibraryImport] source generator marshals the
-    // managed string -> UTF-8 -> char const *.  As a return, however, it
-    // would also attempt to free the returned pointer (CoTaskMemFree), and
-    // the pointer we return is into C++ static/member storage — not a
-    // CoTaskMem allocation.  Return as IntPtr so the caller can copy into a
-    // managed string with Marshal.PtrToStringUTF8 without freeing.
-    return for_return ? "IntPtr" : "string";
+    return "string";
   case AT_char:
     if (itype.is_unsigned()) return "byte";
     if (itype.is_signed()) return "sbyte";
@@ -1606,13 +1237,6 @@ get_pinvoke_atomic_type(const InterrogateType &itype, bool for_return) {
   case AT_longlong:
     return itype.is_unsigned() ? "ulong" : "long";
   case AT_null:
-    return "IntPtr";
-  case AT_istream:
-  case AT_ostream:
-  case AT_iostream:
-    // Stream parameters cross the C ABI as an opaque void* pointing at a
-    // streambuf bridge; the managed signature is System.IO.Stream, handled in
-    // get_csharp_type() below.
     return "IntPtr";
   case AT_not_atomic:
     break;
@@ -1916,7 +1540,7 @@ write_functions(ostream &out) {
     }
 
     CollectionFacadeKind facade_kind = get_collection_facade_kind(object->_itype);
-    if (facade_kind != CF_none) {
+    if (facade_kind != CF_none && facade_kind != CF_array_base) {
       collection_objects.push_back(object);
     }
   }
@@ -1927,8 +1551,6 @@ write_functions(ostream &out) {
 
   out << "#if __GNUC__ >= 4\n"
       << "#define EXPORT_FUNC extern \"C\" __attribute__((used, visibility(\"default\")))\n"
-      << "#elif defined(_MSC_VER) && !defined(LINK_ALL_STATIC) && !defined(STATIC_BUILD)\n"
-      << "#define EXPORT_FUNC extern \"C\" __declspec(dllexport)\n"
       << "#else\n"
       << "#define EXPORT_FUNC extern \"C\"\n"
       << "#endif\n\n";
@@ -1990,22 +1612,13 @@ write_functions(ostream &out) {
     out << "}\n\n";
   }
 
-  // Several InterrogateTypes can share the same collection class name
-  // (e.g. "vector_int" and its const-qualified variant both derive their
-  // helper prefix from the base class name).  Track emitted prefixes so the
-  // second registration doesn't produce duplicate `extern "C"` definitions.
-  std::set<string> emitted_collection_prefixes;
-
   for (Object *object : collection_objects) {
     const InterrogateType &itype = object->_itype;
     CollectionFacadeKind facade_kind = get_collection_facade_kind(itype);
-    if (facade_kind == CF_none) continue;
+    if (facade_kind == CF_none || facade_kind == CF_array_base) continue;
 
     bool is_mutable = (facade_kind == CF_mutable_array);
     string helper_prefix = get_collection_helper_name(itype, "");
-    if (!emitted_collection_prefixes.insert(helper_prefix).second) {
-      continue;
-    }
     string cpp_type;
     if (itype._cpptype != nullptr) {
       cpp_type = itype._cpptype->get_local_name(&parser);
@@ -2047,7 +1660,7 @@ write_functions(ostream &out) {
     // helpers and use base_cpp_type for allocation.
     bool is_const_type = (cpp_type != base_cpp_type);
 
-    string element_type_value = get_collection_element_type(itype, false);
+    string element_type_value = get_collection_element_type_from_suffix(get_collection_suffix(get_csharp_type_name(itype)), false);
     bool is_string = (element_type_value == "string");
     bool is_primitive = is_csharp_primitive_type(element_type_value);
     bool is_blittable = is_csharp_blittable_type(element_type_value);
@@ -2521,11 +2134,6 @@ write_native_methods_file(const string &dir, const string &cs_namespace) {
 
   }
 
-  // Mirror the dedup used by the C++ helper emission above — const variants
-  // of the same collection share the helper prefix and must only appear in
-  // NativeMethods once.
-  std::set<string> emitted_pinvoke_prefixes;
-
   for (oi = _objects.begin(); oi != _objects.end(); ++oi) {
     Object *object = (*oi).second;
     if (object == nullptr || should_skip_csharp_type(object->_itype)) {
@@ -2533,24 +2141,16 @@ write_native_methods_file(const string &dir, const string &cs_namespace) {
     }
     const InterrogateType &itype = object->_itype;
     CollectionFacadeKind facade_kind = get_collection_facade_kind(itype);
-    if (facade_kind == CF_none) continue;
+    if (facade_kind == CF_none || facade_kind == CF_array_base) continue;
 
     bool is_mutable = (facade_kind == CF_mutable_array);
     string helper_prefix = get_collection_helper_name(itype, "");
-    if (!emitted_pinvoke_prefixes.insert(helper_prefix).second) {
-      continue;
-    }
-    string element_type_value = get_collection_element_type(itype, false);
+    string element_type_value = get_collection_element_type_from_suffix(get_collection_suffix(get_csharp_type_name(itype)), false);
     bool is_string = (element_type_value == "string");
     bool is_primitive = is_csharp_primitive_type(element_type_value);
     bool is_blittable = is_csharp_blittable_type(element_type_value);
 
-    // For string elements: the return-side pinvoke is IntPtr (not string),
-    // because [LibraryImport] + StringMarshalling.Utf8 on a string return
-    // calls CoTaskMemFree on the returned pointer, but the native helper
-    // returns a pointer into C++ storage.  Parameters as string are fine —
-    // managed-to-native string marshalling just copies bytes.
-    string cs_ret_type = is_string ? "IntPtr" : (is_primitive ? element_type_value : "IntPtr");
+    string cs_ret_type = is_string ? "string" : (is_primitive ? element_type_value : "IntPtr");
     string cs_param_type = is_string ? "string" : (is_primitive ? element_type_value : "IntPtr");
 
     out << "    [LibraryImport(\"" << quote_csharp_string(_dll_name) << "\", EntryPoint = \"" << helper_prefix << "empty_constructor\")]\n";
@@ -2559,7 +2159,9 @@ write_native_methods_file(const string &dir, const string &cs_namespace) {
     out << "    [LibraryImport(\"" << quote_csharp_string(_dll_name) << "\", EntryPoint = \"" << helper_prefix << "size\")]\n";
     out << "    internal static partial int " << helper_prefix << "size(IntPtr self);\n\n";
 
-    out << "    [LibraryImport(\"" << quote_csharp_string(_dll_name) << "\", EntryPoint = \"" << helper_prefix << "get_element\")]\n";
+    out << "    [LibraryImport(\"" << quote_csharp_string(_dll_name) << "\", EntryPoint = \"" << helper_prefix << "get_element\"";
+    if (is_string) out << ", StringMarshalling = StringMarshalling.Utf8";
+    out << ")]\n";
     out << "    internal static partial " << cs_ret_type << " " << helper_prefix << "get_element(IntPtr self, int index);\n\n";
 
     if (is_mutable) {
@@ -2820,11 +2422,6 @@ write_interface(ostream &out, Object *object) {
   out << "  " << (is_collection_facade ? "internal" : "public") << " interface " << interface_name
       << get_interface_base_list(itype) << " {\n";
 
-  string base_list = get_interface_base_list(itype);
-  if (!base_list.empty() && base_list.find("INativeObject") != string::npos) {
-    indent(out, 4) << "new IntPtr NativeHandle { get; }\n";
-  }
-
   std::set<string> method_signatures;
   auto reserve_property_names = [&](const InterrogateType &source_type) {
     for (int i = 0; i < source_type.number_of_elements(); ++i) {
@@ -2986,14 +2583,7 @@ write_interface(ostream &out, Object *object) {
 
     string pn = to_pascal_case(make_csharp_identifier(ielement.get_name()));
     if (emitted_prop_names.insert(pn).second) {
-      if (property._getter_remaps.empty() && property._setter_remaps.empty()) {
-        // Pass 2 (binary .in) can't rebuild FunctionRemaps for interrogate-synthesized data-member
-        // getters/setters (no CPPInstance available). Fall back to the .in C-wrapper records, exactly
-        // as methods do, so public data members (incl. enum-typed) still emit as properties.
-        write_property_from_wrapper(out, ielement, object, 4, true);
-      } else {
-        write_property(out, &property, object, 4, true);
-      }
+      write_property(out, &property, object, 4, true);
     }
   }
 
@@ -3009,8 +2599,8 @@ void InterfaceMakerCSharp::
 write_collection_adapter_class(ostream &out, Object *object) {
   const InterrogateType &itype = object->_itype;
   string class_name = get_class_name(itype);
-  string element_type = get_collection_element_type(itype, true);
-  string element_value_type = get_collection_element_type(itype, false);
+  string element_type = get_collection_element_type_from_suffix(get_collection_suffix(class_name), true);
+  string element_value_type = get_collection_element_type_from_suffix(get_collection_suffix(class_name), false);
   string destructor_name = get_destructor_wrapper_name(object);
   CollectionFacadeKind facade_kind = get_collection_facade_kind(itype);
   bool is_mutable = facade_kind == CF_mutable_array;
@@ -3078,6 +2668,10 @@ write_collection_adapter_class(ostream &out, Object *object) {
         indexer_element_remap = best_legal_method_remap(method);
       }
     }
+  }
+
+  if (facade_kind == CF_array_base) {
+    return;
   }
 
   Function *set_element_func = nullptr;
@@ -3160,11 +2754,8 @@ write_collection_adapter_class(ostream &out, Object *object) {
     }
   }
 
-  // Use helpers (which call operator[] / size() / push_back() directly) when
-  // the class doesn't provide its own user-defined get_element method.  If
-  // get_element IS user-defined we route through it instead so any custom
-  // logic stays in the binding.
-  if (indexer_element_remap == nullptr && indexer_element_wrapper == nullptr) {
+  if (indexer_length_remap == nullptr && indexer_length_wrapper == nullptr &&
+      indexer_element_remap == nullptr && indexer_element_wrapper == nullptr) {
     use_collection_helpers = true;
   }
 
@@ -3177,14 +2768,7 @@ write_collection_adapter_class(ostream &out, Object *object) {
   indent(out, 6) << "return ptr == IntPtr.Zero ? null : new " << class_name << "(ptr, own);\n";
   indent(out, 4) << "}\n\n";
 
-  // Emit the default constructor from the collection helper ONLY when the
-  // type itself doesn't expose any constructors — typedef-based facades
-  // (vector_int, vector_string, etc.) fall into this bucket.  A concrete
-  // subclass of std::vector or a PointerToBase-derived wrapper has real
-  // C++ constructors that write_constructor() will emit below, and
-  // emitting our own Collection_*_empty_constructor version on top would
-  // collide with the real default ctor.
-  if (use_collection_helpers && object->_constructors.empty()) {
+  if (use_collection_helpers) {
     indent(out, 4) << "public " << class_name << "() : base(NativeMethods."
                    << get_collection_helper_name(itype, "empty_constructor") << "(), NativeOwnership.Owned) {}\n\n";
   }
@@ -3293,12 +2877,9 @@ write_collection_adapter_class(ostream &out, Object *object) {
   if (use_collection_helpers) {
     string native_call = "NativeMethods." + get_collection_helper_name(itype, "get_element") + "(NativeHandle, index)";
     indent(out, 4) << "protected override " << element_type << " GetItem(int index) {\n";
-    string element_type_value = get_collection_element_type(itype, false);
+    string element_type_value = get_collection_element_type_from_suffix(get_collection_suffix(get_csharp_type_name(itype)), false);
     if (element_type_value == "string") {
-      // Pinvoke returns IntPtr (see write_dllimport for collection helpers);
-      // convert by copying into a managed string without freeing native mem.
-      indent(out, 6) << "IntPtr result = " << native_call << ";\n";
-      indent(out, 6) << "return result == IntPtr.Zero ? throw new InvalidOperationException(\"Native method returned null.\") : Marshal.PtrToStringUTF8(result)!;\n";
+      indent(out, 6) << "return " << native_call << "!;\n";
     } else if (is_csharp_primitive_type(element_type_value)) {
       indent(out, 6) << "return " << native_call << ";\n";
     } else {
@@ -3369,7 +2950,7 @@ write_collection_adapter_class(ostream &out, Object *object) {
     if (use_collection_helpers) {
       indent(out, 4) << "protected override void SetItem(int index, " << element_type << " value) {\n";
       indent(out, 6) << "NativeMethods." << get_collection_helper_name(itype, "set_element") << "(NativeHandle, index, ";
-      string element_type_value = get_collection_element_type(itype, false);
+      string element_type_value = get_collection_element_type_from_suffix(get_collection_suffix(get_csharp_type_name(itype)), false);
       if (is_csharp_primitive_type(element_type_value) || element_type_value == "string") {
         out << "value";
       } else {
@@ -3401,7 +2982,7 @@ write_collection_adapter_class(ostream &out, Object *object) {
     if (use_collection_helpers) {
       indent(out, 4) << "public override void Add(" << element_type << " item) {\n";
       indent(out, 6) << "NativeMethods." << get_collection_helper_name(itype, "push_back") << "(NativeHandle, ";
-      string element_type_value = get_collection_element_type(itype, false);
+      string element_type_value = get_collection_element_type_from_suffix(get_collection_suffix(get_csharp_type_name(itype)), false);
       if (is_csharp_primitive_type(element_type_value) || element_type_value == "string") {
         out << "item";
       } else {
@@ -3538,128 +3119,6 @@ write_proxy_class(ostream &out, const string &, Object *object) {
   std::vector<const InterrogateType *> secondary_base_types;
   get_secondary_base_types(itype, secondary_base_types);
 
-  // Use get_secondary_base_types (which handles cross-module database loading) to
-  // get the full list of types we need interface implementations for.
-  // Then categorize: types that are direct secondary derivations (have upcast functions)
-  // vs types on a secondary base's primary chain (share its pointer).
-  InterrogateDatabase *idb_collect = InterrogateDatabase::get_ptr();
-
-  // all_secondary_bases: types with their own upcast function (actual secondary derivations)
-  // secondary_base_owner: maps each such type to its direct owner (the class where di>0 points to it)
-  // primary_chain_aliases: types on a secondary base's primary chain (share its pointer)
-  std::set<const InterrogateType *> all_secondary_bases;
-  std::map<const InterrogateType *, const InterrogateType *> secondary_base_owner;
-  std::map<const InterrogateType *, const InterrogateType *> primary_chain_aliases;
-
-  // get_secondary_base_types already does all the heavy lifting of cross-module resolution.
-  // It returns ALL types we need (both actual secondaries and primary-chain aliases).
-  // We need to determine which category each type falls into.
-  std::vector<const InterrogateType *> full_secondary_list;
-  get_secondary_base_types(itype, full_secondary_list);
-
-  // For each type in the list, check if any of its "parent classes" (types whose secondary
-  // derivation leads to it) have an upcast function for it. If so, it's a real secondary base.
-  // Otherwise, it's a primary-chain alias.
-  //
-  // The key insight: get_secondary_base_types visits types in order from the visit() call.
-  // Secondary bases have upcast functions; primary-chain types don't.
-  // We identify actual secondary bases by checking if get_upcast_pinvoke_name succeeds.
-  // For that we need to find the owner that has the type as derivation[di>0].
-
-  // Build a lookup by interface name for dedup
-  std::set<string> added_names;
-
-  for (const InterrogateType *base_type : full_secondary_list) {
-    if (base_type == nullptr) continue;
-    string base_name = get_interface_name(*base_type);
-    if (!added_names.insert(base_name).second) continue;
-
-    // Try to find an upcast: search all types in the hierarchy for one that has
-    // this base_type as a secondary derivation (di > 0)
-    bool found_upcast = false;
-
-    // Check itype itself first
-    for (int di = 1; di < itype.number_of_derivations(); ++di) {
-      TypeIndex deriv_idx = itype.get_derivation(di);
-      if (!is_wrapped_type(deriv_idx)) continue;
-      const InterrogateType &dt = idb_collect->get_type(deriv_idx);
-      if (get_interface_name(dt) == base_name) {
-        string upcast = get_upcast_pinvoke_name(itype, di);
-        if (!upcast.empty()) {
-          all_secondary_bases.insert(base_type);
-          secondary_base_owner[base_type] = &itype;
-          found_upcast = true;
-        }
-        break;
-      }
-    }
-
-    if (!found_upcast) {
-      // Search through all types already in all_secondary_bases as potential owners
-      for (const InterrogateType *potential_owner : full_secondary_list) {
-        if (potential_owner == nullptr || potential_owner == base_type) continue;
-        ensure_database_loaded(*potential_owner);
-        for (int di = 1; di < potential_owner->number_of_derivations(); ++di) {
-          TypeIndex deriv_idx = potential_owner->get_derivation(di);
-          if (!is_wrapped_type(deriv_idx)) continue;
-          const InterrogateType &dt = idb_collect->get_type(deriv_idx);
-          if (get_interface_name(dt) == base_name) {
-            string upcast = get_upcast_pinvoke_name(*potential_owner, di);
-            if (!upcast.empty()) {
-              all_secondary_bases.insert(base_type);
-              secondary_base_owner[base_type] = potential_owner;
-              found_upcast = true;
-            }
-            break;
-          }
-        }
-        if (found_upcast) break;
-      }
-    }
-
-    if (!found_upcast) {
-      // Also check the primary-base chain of itype for potential owners
-      const InterrogateType *cur = &itype;
-      while (!found_upcast) {
-        ensure_database_loaded(*cur);
-        if (cur->number_of_derivations() == 0) break;
-        TypeIndex primary_idx = cur->get_derivation(0);
-        if (!is_wrapped_type(primary_idx)) break;
-        cur = &idb_collect->get_type(primary_idx);
-        for (int di = 1; di < cur->number_of_derivations(); ++di) {
-          TypeIndex deriv_idx = cur->get_derivation(di);
-          if (!is_wrapped_type(deriv_idx)) continue;
-          const InterrogateType &dt = idb_collect->get_type(deriv_idx);
-          if (get_interface_name(dt) == base_name) {
-            string upcast = get_upcast_pinvoke_name(*cur, di);
-            if (!upcast.empty()) {
-              all_secondary_bases.insert(base_type);
-              secondary_base_owner[base_type] = cur;
-              found_upcast = true;
-            }
-            break;
-          }
-        }
-      }
-    }
-
-    if (!found_upcast) {
-      // This type is on a primary chain of some secondary base — find which one
-      for (const InterrogateType *sec : all_secondary_bases) {
-        if (get_interface_name(*sec) == base_name) { found_upcast = true; break; }
-      }
-      if (!found_upcast) {
-        // Find the nearest secondary base whose primary chain includes this type
-        for (const InterrogateType *sec : all_secondary_bases) {
-          primary_chain_aliases[base_type] = sec;
-          break;
-        }
-      }
-    }
-  }
-
-  InterrogateDatabase *idb = InterrogateDatabase::get_ptr();
-
   if (itype.has_comment()) {
     emit_xml_doc_comment(out, itype.get_comment(), 2);
   }
@@ -3684,38 +3143,6 @@ write_proxy_class(ostream &out, const string &, Object *object) {
     out << ", IDisposable";
   }
   out << " {\n";
-
-  // Helper to get field name for a type
-  auto get_field_name = [&](const InterrogateType *t) -> string {
-    string iface = get_interface_name(*t);
-    string field = "_" + iface.substr(1);
-    field[1] = std::tolower((unsigned char)field[1]);
-    field += "Ptr";
-    return field;
-  };
-
-  // Generate private fields for actual secondary bases
-  for (const InterrogateType *sec_base : all_secondary_bases) {
-    if (sec_base == nullptr) continue;
-    indent(out, 4) << "private IntPtr " << get_field_name(sec_base) << ";\n";
-  }
-
-  // Generate explicit interface implementations
-  for (const InterrogateType *sec_base : all_secondary_bases) {
-    if (sec_base == nullptr) continue;
-    indent(out, 4) << "IntPtr " << get_interface_name(*sec_base) << ".NativeHandle => " << get_field_name(sec_base) << ";\n";
-  }
-  // Aliases share the pointer of their nearest secondary-base ancestor
-  for (auto it = primary_chain_aliases.begin(); it != primary_chain_aliases.end(); ++it) {
-    const InterrogateType *alias_type = it->first;
-    const InterrogateType *sec_base = it->second;
-    indent(out, 4) << "IntPtr " << get_interface_name(*alias_type) << ".NativeHandle => " << get_field_name(sec_base) << ";\n";
-  }
-
-  if (!all_secondary_bases.empty() || !primary_chain_aliases.empty()) {
-    out << "\n";
-  }
-
   if (is_abstract) {
     indent(out, 4) << "internal sealed class " << opaque_class_name << " : " << class_name << " {\n";
     indent(out, 6) << "internal " << opaque_class_name << "(IntPtr ptr, NativeOwnership own) : base(ptr, own) {\n";
@@ -3762,102 +3189,6 @@ write_proxy_class(ostream &out, const string &, Object *object) {
 
   indent(out, 4) << "internal " << class_name
                  << "(IntPtr ptr, NativeOwnership ownership) : base(ptr, ownership) {\n";
-
-  // Initialize ALL secondary base pointers (direct and inherited).
-  // Each upcast function expects a pointer to the owner type. If the owner is reachable
-  // from itype via only primary bases, that's `ptr` (same address). If the owner is itself
-  // a secondary base, we must use the already-computed pointer for that base.
-
-  // We will use a bunch of inline helper functions to make things easier here.
-  // Helper: check if 'target' is on the primary base chain of 'from' (by interface name)
-  auto is_on_primary_chain = [&](const InterrogateType &from, const InterrogateType *target) -> bool {
-    string target_name = get_interface_name(*target);
-    const InterrogateType *cur = &from;
-    while (cur != nullptr) {
-      if (get_interface_name(*cur) == target_name) return true;
-      ensure_database_loaded(*cur);
-      if (cur->number_of_derivations() == 0) break;
-      TypeIndex primary_idx = cur->get_derivation(0);
-      if (!is_wrapped_type(primary_idx)) break;
-      cur = &idb->get_type(primary_idx);
-    }
-    return false;
-  };
-
-  // Helper: get the field name for a type
-  auto get_field_name_for = [&](const InterrogateType *t) -> string {
-    string iface = get_interface_name(*t);
-    string field = "_" + iface.substr(1);
-    field[1] = std::tolower((unsigned char)field[1]);
-    field += "Ptr";
-    return field;
-  };
-
-  // Helper: find the pointer expression to use as input to an upcast owned by 'owner'.
-  // Returns "ptr" if owner is on itype's primary chain, or a field name if owner is
-  // reachable through a secondary base.
-  auto get_owner_ptr_expr = [&](const InterrogateType *owner) -> string {
-    if (is_on_primary_chain(itype, owner)) {
-      return "ptr";
-    }
-    for (const InterrogateType *sec : all_secondary_bases) {
-      if (sec == nullptr) continue;
-      if (is_on_primary_chain(*sec, owner)) {
-        return get_field_name_for(sec);
-      }
-    }
-    return "ptr";
-  };
-
-  // Process in order: direct secondary bases first (they use ptr or primary chain),
-  // then inherited ones (which may depend on already-computed fields).
-  // The set iteration order may not guarantee this, so process in two passes:
-  // Pass 1: bases whose owner is on itype's primary chain (always use ptr)
-  // Pass 2: bases whose owner is a secondary base (use that base's field)
-  std::vector<const InterrogateType *> pass1, pass2;
-  for (const InterrogateType *sec_base : all_secondary_bases) {
-    if (sec_base == nullptr) continue;
-    auto owner_it = secondary_base_owner.find(sec_base);
-    if (owner_it == secondary_base_owner.end()) continue;
-    if (is_on_primary_chain(itype, owner_it->second)) {
-      pass1.push_back(sec_base);
-    } else {
-      pass2.push_back(sec_base);
-    }
-  }
-
-  auto emit_upcast_init = [&](const InterrogateType *sec_base) {
-    auto owner_it = secondary_base_owner.find(sec_base);
-    if (owner_it == secondary_base_owner.end()) return;
-    const InterrogateType *owner = owner_it->second;
-
-    // Find the derivation index in the owner class (match by interface name, not pointer)
-    string target_name = get_interface_name(*sec_base);
-    int owner_derivation_index = -1;
-    ensure_database_loaded(*owner);
-    for (int di = 1; di < owner->number_of_derivations(); ++di) {
-      TypeIndex deriv_idx = owner->get_derivation(di);
-      if (!is_wrapped_type(deriv_idx)) continue;
-      const InterrogateType &deriv_type = idb->get_type(deriv_idx);
-      if (get_interface_name(deriv_type) == target_name) {
-        owner_derivation_index = di;
-        break;
-      }
-    }
-    if (owner_derivation_index < 0) return;
-
-    string upcast_func = get_upcast_pinvoke_name(*owner, owner_derivation_index);
-    if (upcast_func.empty()) return;
-
-    string field_name = get_field_name_for(sec_base);
-    string input_ptr = get_owner_ptr_expr(owner);
-
-    indent(out, 6) << field_name << " = " << upcast_func << "(" << input_ptr << ");\n";
-  };
-
-  for (const InterrogateType *sec_base : pass1) emit_upcast_init(sec_base);
-  for (const InterrogateType *sec_base : pass2) emit_upcast_init(sec_base);
-
   indent(out, 4) << "}\n\n";
 
   Functions::const_iterator fi;
@@ -3947,6 +3278,7 @@ write_proxy_class(ostream &out, const string &, Object *object) {
     }
   }
 
+  InterrogateDatabase *idb = InterrogateDatabase::get_ptr();
   std::set<string> emitted_proxy_props;
   auto emit_properties_for_type = [&](const InterrogateType &source_type) {
     int num_elements = source_type.number_of_elements();
@@ -3994,12 +3326,7 @@ write_proxy_class(ostream &out, const string &, Object *object) {
 
       string pn = to_pascal_case(make_csharp_identifier(ielement.get_name()));
       if (emitted_proxy_props.insert(pn).second) {
-        if (property._getter_remaps.empty() && property._setter_remaps.empty()) {
-          // See the interface loop: fall back to .in C-wrappers for synthesized data-member accessors.
-          write_property_from_wrapper(out, ielement, object, 4, false);
-        } else {
-          write_property(out, &property, object, 4, false);
-        }
+        write_property(out, &property, object, 4, false);
       }
     }
   };
@@ -4114,11 +3441,7 @@ write_constructor(ostream &out, Function *func, Object *object, int indent_level
 
     std::vector<string> param_types;
     std::vector<string> param_decls;
-    std::vector<string> param_names;
     std::vector<string> native_args;
-
-    struct StreamBridgeSite { string var; string factory; string param; };
-    std::vector<StreamBridgeSite> stream_bridges;
 
     for (size_t i = 0; i < remap->_parameters.size(); ++i) {
       ParameterRemap *param_remap = remap->_parameters[i]._remap;
@@ -4127,33 +3450,14 @@ write_constructor(ostream &out, Function *func, Object *object, int indent_level
       string param_type = (param_type_index != 0)
         ? get_csharp_signature_type(param_type_index, param_nullable)
         : get_csharp_signature_type_for_wrapper(param_remap, param_nullable);
-
-      AtomicToken stream_tok = csharp_stream_token_for_type(param_type_index);
-      if (stream_tok != AT_not_atomic) {
-        param_type = "global::System.IO.Stream";
-      }
-
+      // param_type is already resolved by get_csharp_signature_type
       string param_name = get_csharp_parameter_name(remap, i);
       param_types.push_back(param_type);
       param_decls.push_back(param_type + " " + param_name);
-      param_names.push_back(param_name);
 
-      if (stream_tok != AT_not_atomic) {
-        string bridge_var = "__p3stream" + std::to_string(stream_bridges.size());
-        stream_bridges.push_back({bridge_var, csharp_stream_bridge_factory(stream_tok),
-                                  param_name});
-        native_args.push_back(bridge_var + ".Handle");
-      } else if (is_csharp_native_object_type(param_type_index, param_type) ||
-                 is_collection_type_index(param_type_index)) {
-        if (!param_type.empty() && param_type[0] == 'I' && param_type.size() > 1 && isupper(param_type[1])) {
-          string as_type = param_type;
-          if (!as_type.empty() && as_type.back() == '?') {
-            as_type.pop_back();
-          }
-          native_args.push_back("(" + param_name + " as " + as_type + ")?.NativeHandle ?? IntPtr.Zero");
-        } else {
-          native_args.push_back("NativeObject.Unwrap(" + param_name + ")");
-        }
+      if (is_csharp_native_object_type(param_type_index, param_type) ||
+          is_collection_type_index(param_type_index)) {
+        native_args.push_back("NativeObject.Unwrap(" + param_name + ")");
       } else if (!is_csharp_primitive_type(param_type) && is_csharp_enum_type(param_type_index)) {
         native_args.push_back("(int)" + param_name);
       } else {
@@ -4180,61 +3484,25 @@ write_constructor(ostream &out, Function *func, Object *object, int indent_level
       emit_xml_doc_comment(out, func->_ifunc.get_comment(), indent_level);
     }
 
-    string ownership =
-      (wrapper != nullptr) ? get_native_ownership_name(*wrapper, true)
-                           : get_native_ownership_name(remap, true);
-
-    if (stream_bridges.empty()) {
-      // No stream bridges needed — fast path with chained `: this(…)`.
-      indent(out, indent_level) << "public " << class_name << "(";
-      for (size_t i = 0; i < param_decls.size(); ++i) {
-        if (i != 0) { out << ", "; }
-        out << param_decls[i];
+    indent(out, indent_level) << "public " << class_name << "(";
+    for (size_t i = 0; i < param_decls.size(); ++i) {
+      if (i != 0) {
+        out << ", ";
       }
-      out << ") : this(NativeMethods." << get_pinvoke_name(func, remap) << "(";
-      for (size_t i = 0; i < native_args.size(); ++i) {
-        if (i != 0) { out << ", "; }
-        out << native_args[i];
-      }
-      out << "), " << ownership << ") {\n";
-      indent(out, indent_level) << "}\n\n";
-    } else {
-      // Stream params need `using var` lifetime management, which a chained
-      // initializer can't provide.  Route through a private static helper
-      // that owns the bridge for the duration of the native call.
-      string helper_name = "__p3Create" + get_pinvoke_name(func, remap);
-      indent(out, indent_level) << "public " << class_name << "(";
-      for (size_t i = 0; i < param_decls.size(); ++i) {
-        if (i != 0) { out << ", "; }
-        out << param_decls[i];
-      }
-      out << ") : this(" << helper_name << "(";
-      for (size_t i = 0; i < param_names.size(); ++i) {
-        if (i != 0) { out << ", "; }
-        out << param_names[i];
-      }
-      out << "), " << ownership << ") {\n";
-      indent(out, indent_level) << "}\n";
-
-      indent(out, indent_level) << "private static IntPtr " << helper_name << "(";
-      for (size_t i = 0; i < param_decls.size(); ++i) {
-        if (i != 0) { out << ", "; }
-        out << param_decls[i];
-      }
-      out << ") {\n";
-      for (const auto &b : stream_bridges) {
-        indent(out, indent_level + 2) << "using var " << b.var << " = "
-                                      << b.factory << "(" << b.param << ");\n";
-      }
-      indent(out, indent_level + 2) << "return NativeMethods."
-                                    << get_pinvoke_name(func, remap) << "(";
-      for (size_t i = 0; i < native_args.size(); ++i) {
-        if (i != 0) { out << ", "; }
-        out << native_args[i];
-      }
-      out << ");\n";
-      indent(out, indent_level) << "}\n\n";
+      out << param_decls[i];
     }
+    out << ") : this(NativeMethods." << get_pinvoke_name(func, remap) << "(";
+    for (size_t i = 0; i < native_args.size(); ++i) {
+      if (i != 0) {
+        out << ", ";
+      }
+      out << native_args[i];
+    }
+    out << "), "
+        << ((wrapper != nullptr) ? get_native_ownership_name(*wrapper, true)
+                                 : get_native_ownership_name(remap, true))
+        << ") {\n";
+    indent(out, indent_level) << "}\n\n";
   }
 
   if (!func->_remaps.empty()) {
@@ -4256,44 +3524,21 @@ write_constructor(ostream &out, Function *func, Object *object, int indent_level
 
     std::vector<string> param_types;
     std::vector<string> param_decls;
-    std::vector<string> param_names;
     std::vector<string> native_args;
-
-    struct StreamBridgeSite { string var; string factory; string param; };
-    std::vector<StreamBridgeSite> stream_bridges;
 
     for (int i = 0; i < wrapper.number_of_parameters(); ++i) {
       TypeIndex param_type_index = wrapper.parameter_get_type(i);
       string param_type = get_csharp_signature_type(param_type_index, wrapper.parameter_is_nullable(i));
-
-      AtomicToken stream_tok = csharp_stream_token_for_type(param_type_index);
-      if (stream_tok != AT_not_atomic) {
-        param_type = "global::System.IO.Stream";
-      }
 
       string param_name = wrapper.parameter_has_name(i)
         ? make_csharp_identifier(wrapper.parameter_get_name(i))
         : string("param") + std::to_string(i);
       param_types.push_back(param_type);
       param_decls.push_back(param_type + " " + param_name);
-      param_names.push_back(param_name);
 
-      if (stream_tok != AT_not_atomic) {
-        string bridge_var = "__p3stream" + std::to_string(stream_bridges.size());
-        stream_bridges.push_back({bridge_var, csharp_stream_bridge_factory(stream_tok),
-                                  param_name});
-        native_args.push_back(bridge_var + ".Handle");
-      } else if (is_csharp_native_object_type(param_type_index, param_type) ||
-                 is_collection_type_index(param_type_index)) {
-        if (!param_type.empty() && param_type[0] == 'I' && param_type.size() > 1 && isupper(param_type[1])) {
-          string as_type = param_type;
-          if (!as_type.empty() && as_type.back() == '?') {
-            as_type.pop_back();
-          }
-          native_args.push_back("(" + param_name + " as " + as_type + ")?.NativeHandle ?? IntPtr.Zero");
-        } else {
-          native_args.push_back("NativeObject.Unwrap(" + param_name + ")");
-        }
+      if (is_csharp_native_object_type(param_type_index, param_type) ||
+          is_collection_type_index(param_type_index)) {
+        native_args.push_back("NativeObject.Unwrap(" + param_name + ")");
       } else if (!is_csharp_primitive_type(param_type) && is_csharp_enum_type(param_type_index)) {
         native_args.push_back("(int)" + param_name);
       } else {
@@ -4320,55 +3565,22 @@ write_constructor(ostream &out, Function *func, Object *object, int indent_level
       emit_xml_doc_comment(out, func->_ifunc.get_comment(), indent_level);
     }
 
-    string ownership = get_native_ownership_name(wrapper, true);
-
-    if (stream_bridges.empty()) {
-      indent(out, indent_level) << "public " << class_name << "(";
-      for (size_t i = 0; i < param_decls.size(); ++i) {
-        if (i != 0) { out << ", "; }
-        out << param_decls[i];
+    indent(out, indent_level) << "public " << class_name << "(";
+    for (size_t i = 0; i < param_decls.size(); ++i) {
+      if (i != 0) {
+        out << ", ";
       }
-      out << ") : this(NativeMethods." << get_pinvoke_name(func->_ifunc, wrapper) << "(";
-      for (size_t i = 0; i < native_args.size(); ++i) {
-        if (i != 0) { out << ", "; }
-        out << native_args[i];
-      }
-      out << "), " << ownership << ") {\n";
-      indent(out, indent_level) << "}\n\n";
-    } else {
-      string helper_name = "__p3Create" + get_pinvoke_name(func->_ifunc, wrapper);
-      indent(out, indent_level) << "public " << class_name << "(";
-      for (size_t i = 0; i < param_decls.size(); ++i) {
-        if (i != 0) { out << ", "; }
-        out << param_decls[i];
-      }
-      out << ") : this(" << helper_name << "(";
-      for (size_t i = 0; i < param_names.size(); ++i) {
-        if (i != 0) { out << ", "; }
-        out << param_names[i];
-      }
-      out << "), " << ownership << ") {\n";
-      indent(out, indent_level) << "}\n";
-
-      indent(out, indent_level) << "private static IntPtr " << helper_name << "(";
-      for (size_t i = 0; i < param_decls.size(); ++i) {
-        if (i != 0) { out << ", "; }
-        out << param_decls[i];
-      }
-      out << ") {\n";
-      for (const auto &b : stream_bridges) {
-        indent(out, indent_level + 2) << "using var " << b.var << " = "
-                                      << b.factory << "(" << b.param << ");\n";
-      }
-      indent(out, indent_level + 2) << "return NativeMethods."
-                                    << get_pinvoke_name(func->_ifunc, wrapper) << "(";
-      for (size_t i = 0; i < native_args.size(); ++i) {
-        if (i != 0) { out << ", "; }
-        out << native_args[i];
-      }
-      out << ");\n";
-      indent(out, indent_level) << "}\n\n";
+      out << param_decls[i];
     }
+    out << ") : this(NativeMethods." << get_pinvoke_name(func->_ifunc, wrapper) << "(";
+    for (size_t i = 0; i < native_args.size(); ++i) {
+      if (i != 0) {
+        out << ", ";
+      }
+      out << native_args[i];
+    }
+    out << "), " << get_native_ownership_name(wrapper, true) << ") {\n";
+    indent(out, indent_level) << "}\n\n";
   }
 }
 
@@ -4422,11 +3634,6 @@ write_method(ostream &out, Function *func, Object *object, int indent_level,
       native_args.push_back(get_native_this_argument(object, func, remap));
     }
 
-    // Collected stream-bridge allocations needed before the native call:
-    // (bridge variable name, factory call, managed parameter name, nullable).
-    struct StreamBridgeSite { string var; string factory; string param; bool nullable; };
-    std::vector<StreamBridgeSite> stream_bridges;
-
     for (size_t i = first_param; i < remap->_parameters.size(); ++i) {
       ParameterRemap *param_remap = remap->_parameters[i]._remap;
       TypeIndex param_type_index = get_parameter_type_for_remap(remap, i);
@@ -4435,27 +3642,12 @@ write_method(ostream &out, Function *func, Object *object, int indent_level,
         ? get_csharp_signature_type(param_type_index, param_nullable)
         : get_csharp_signature_type_for_wrapper(param_remap, param_nullable);
 
-      // Stream parameters: override the default IntPtr mapping with
-      // System.IO.Stream on the managed side — the StreamBridge emitted
-      // below handles conversion back to the IntPtr the pinvoke needs.
-      AtomicToken stream_tok = csharp_stream_token_for_type(param_type_index);
-      if (stream_tok != AT_not_atomic) {
-        param_type = "global::System.IO.Stream";
-      }
-
       string param_name = get_csharp_parameter_name(remap, i);
       param_types.push_back(param_type);
       param_decls.push_back(param_type + " " + param_name);
       param_names.push_back(param_name);
 
-      if (stream_tok != AT_not_atomic) {
-        string bridge_var = "__p3stream" + std::to_string(stream_bridges.size());
-        stream_bridges.push_back({bridge_var, csharp_stream_bridge_factory(stream_tok),
-                                  param_name, param_nullable});
-        native_args.push_back(bridge_var + ".Handle");
-      } else {
-        native_args.push_back(marshal_managed_argument(param_type_index, param_type, param_name));
-      }
+      native_args.push_back(marshal_managed_argument(param_type_index, param_type, param_name));
     }
 
     // Skip this overload if any type resolved to "" (meaning the underlying C++
@@ -4548,14 +3740,6 @@ write_method(ostream &out, Function *func, Object *object, int indent_level,
 
     out << " {\n";
 
-    // Emit `using var __p3streamN = StreamBridge.For…(paramN);` for each
-    // stream parameter so the bridge is disposed as soon as the native call
-    // returns (or throws).  Null params produce a null-handle bridge.
-    for (const auto &b : stream_bridges) {
-      indent(out, indent_level + 2) << "using var " << b.var << " = "
-                                    << b.factory << "(" << b.param << ");\n";
-    }
-
     string native_call = get_pinvoke_call_name(func, remap) + "(";
     for (size_t i = 0; i < native_args.size(); ++i) {
       if (i != 0) {
@@ -4628,7 +3812,7 @@ write_method(ostream &out, Function *func, Object *object, int indent_level,
       if (object != nullptr) {
         alias_call = type_prefix + get_class_name(object->_itype) + "." + method_name;
       } else {
-        alias_call = type_prefix + get_globals_class_name(_current_module_name) +
+        alias_call = type_prefix + make_csharp_identifier(_current_module_name + string("Globals")) +
           "." + method_name;
       }
     }
@@ -4710,18 +3894,9 @@ write_method(ostream &out, Function *func, Object *object, int indent_level,
       native_args.push_back(get_native_this_argument(object->_itype, func->_ifunc));
     }
 
-    struct StreamBridgeSite { string var; string factory; string param; bool nullable; };
-    std::vector<StreamBridgeSite> stream_bridges;
-
     for (int i = first_param; i < wrapper.number_of_parameters(); ++i) {
       TypeIndex param_type_index = wrapper.parameter_get_type(i);
-      bool param_nullable = wrapper.parameter_is_nullable(i);
-      string param_type = get_csharp_signature_type(param_type_index, param_nullable);
-
-      AtomicToken stream_tok = csharp_stream_token_for_type(param_type_index);
-      if (stream_tok != AT_not_atomic) {
-        param_type = "global::System.IO.Stream";
-      }
+      string param_type = get_csharp_signature_type(param_type_index, wrapper.parameter_is_nullable(i));
 
       string param_name = wrapper.parameter_has_name(i)
         ? make_csharp_identifier(wrapper.parameter_get_name(i))
@@ -4730,14 +3905,7 @@ write_method(ostream &out, Function *func, Object *object, int indent_level,
       param_decls.push_back(param_type + " " + param_name);
       param_names.push_back(param_name);
 
-      if (stream_tok != AT_not_atomic) {
-        string bridge_var = "__p3stream" + std::to_string(stream_bridges.size());
-        stream_bridges.push_back({bridge_var, csharp_stream_bridge_factory(stream_tok),
-                                  param_name, param_nullable});
-        native_args.push_back(bridge_var + ".Handle");
-      } else {
-        native_args.push_back(marshal_managed_argument(param_type_index, param_type, param_name));
-      }
+      native_args.push_back(marshal_managed_argument(param_type_index, param_type, param_name));
     }
 
     if (return_type.empty()) {
@@ -4826,13 +3994,6 @@ write_method(ostream &out, Function *func, Object *object, int indent_level,
 
     out << " {\n";
 
-    // Emit stream-bridge `using var` bindings — see the matching block above
-    // in the remap path.
-    for (const auto &b : stream_bridges) {
-      indent(out, indent_level + 2) << "using var " << b.var << " = "
-                                    << b.factory << "(" << b.param << ");\n";
-    }
-
     string native_call = get_pinvoke_call_name(func->_ifunc, wrapper) + "(";
     for (size_t i = 0; i < native_args.size(); ++i) {
       if (i != 0) {
@@ -4899,7 +4060,7 @@ write_method(ostream &out, Function *func, Object *object, int indent_level,
       if (object != nullptr) {
         alias_call = type_prefix + get_class_name(object->_itype) + "." + method_name;
       } else {
-        alias_call = type_prefix + get_globals_class_name(_current_module_name) +
+        alias_call = type_prefix + make_csharp_identifier(_current_module_name + string("Globals")) +
           "." + method_name;
       }
     }
@@ -5120,168 +4281,6 @@ write_property(ostream &out, Property *prop, Object *object, int indent_level,
 }
 
 /**
- * Emits a data-member property directly from the .in C-wrapper records, for the pass-2 (binary .in)
- * case where FunctionRemaps can't be rebuilt for interrogate-synthesized getters/setters (no
- * CPPInstance is available). This is the property analog of the wrapper-based method fallback, and it
- * is what lets public data members — including enum-typed ones — surface as C# properties.
- */
-void InterfaceMakerCSharp::
-write_property_from_wrapper(ostream &out, const InterrogateElement &ielement,
-                            Object *object, int indent_level, bool is_interface) {
-  InterrogateDatabase *idb = InterrogateDatabase::get_ptr();
-
-  auto first_legal_wrapper = [&](FunctionIndex func_index, Function *&out_func)
-      -> const InterrogateFunctionWrapper * {
-    out_func = nullptr;
-    if (func_index == 0) return nullptr;
-    FunctionsByIndex::const_iterator it = _functions.find(func_index);
-    if (it == _functions.end()) return nullptr;
-    out_func = it->second;
-    int n = out_func->_ifunc.number_of_c_wrappers();
-    for (int wi = 0; wi < n; ++wi) {
-      FunctionWrapperIndex widx = out_func->_ifunc.get_c_wrapper(wi);
-      if (widx == 0) continue;
-      const InterrogateFunctionWrapper &w = idb->get_wrapper(widx);
-      if (w.is_explicit_self() || !is_wrapper_legal_csharp(w)) continue;
-      return &w;
-    }
-    return nullptr;
-  };
-
-  Function *getter_func = nullptr;
-  Function *setter_func = nullptr;
-  const InterrogateFunctionWrapper *getter_w =
-    ielement.has_getter() ? first_legal_wrapper(ielement.get_getter(), getter_func) : nullptr;
-  const InterrogateFunctionWrapper *setter_w =
-    ielement.has_setter() ? first_legal_wrapper(ielement.get_setter(), setter_func) : nullptr;
-
-  if (getter_w == nullptr && setter_w == nullptr) {
-    return;
-  }
-
-  bool has_this;
-  if (getter_w != nullptr) {
-    has_this = getter_w->number_of_parameters() != 0 && getter_w->parameter_is_this(0);
-  } else {
-    has_this = setter_w->number_of_parameters() != 0 && setter_w->parameter_is_this(0);
-  }
-  // We can only reach the native "this" through an Object.
-  if (has_this && object == nullptr) {
-    return;
-  }
-  if (is_interface && !has_this) {
-    return;
-  }
-
-  // Determine the property type from the getter's return, falling back to the setter's value.
-  string property_type;
-  TypeIndex ret_idx = 0;
-  bool ret_nullable = false;
-  if (getter_w != nullptr) {
-    if (!getter_w->has_return_value()) {
-      getter_w = nullptr;
-    } else {
-      ret_idx = getter_w->get_return_type();
-      ret_nullable = getter_w->is_return_nullable();
-      property_type = get_csharp_signature_type(ret_idx, ret_nullable);
-    }
-  }
-
-  TypeIndex value_idx = 0;
-  if (setter_w != nullptr) {
-    int vparam = (setter_w->number_of_parameters() != 0 && setter_w->parameter_is_this(0)) ? 1 : 0;
-    if (vparam < setter_w->number_of_parameters()) {
-      value_idx = setter_w->parameter_get_type(vparam);
-      string value_type = get_csharp_signature_type(value_idx, setter_w->parameter_is_nullable(vparam));
-      if (property_type.empty()) {
-        property_type = value_type;
-      } else if (value_type != property_type) {
-        setter_w = nullptr;   // getter/setter type mismatch — emit read-only.
-      }
-    } else {
-      setter_w = nullptr;
-    }
-  }
-
-  if (property_type.empty() || property_type == "void") {
-    return;
-  }
-
-  string property_name = to_pascal_case(make_csharp_identifier(ielement.get_name()));
-  if (property_name.empty() || property_name == "void") {
-    return;
-  }
-
-  bool is_static = !has_this;
-
-  if (ielement.has_comment()) {
-    emit_xml_doc_comment(out, ielement.get_comment(), indent_level);
-  }
-
-  indent(out, indent_level);
-  if (!is_interface) {
-    out << "public ";
-    if (is_static) {
-      out << "static ";
-    }
-  }
-  out << property_type << " " << property_name;
-
-  if (is_interface) {
-    out << " {";
-    if (getter_w != nullptr) out << " get;";
-    if (setter_w != nullptr) out << " set;";
-    out << " }\n";
-    return;
-  }
-
-  out << " {\n";
-
-  if (getter_w != nullptr) {
-    indent(out, indent_level + 2) << "get {\n";
-    string this_arg = has_this ? get_native_this_argument(object->_itype, getter_func->_ifunc) : "";
-    string native_call = get_pinvoke_call_name(getter_func->_ifunc, *getter_w) + "(" + this_arg + ")";
-
-    if (is_csharp_enum_type(ret_idx)) {
-      indent(out, indent_level + 4) << "return (" << property_type << ")" << native_call << ";\n";
-    } else if (is_csharp_native_object_type(ret_idx, property_type)) {
-      indent(out, indent_level + 4) << "IntPtr result = " << native_call << ";\n";
-      indent(out, indent_level + 4) << "return " << property_type << ".__CreateFromNative(result, "
-                                    << get_native_ownership_name(*getter_w, false) << ")";
-      if (!ret_nullable) {
-        out << " ?? throw new InvalidOperationException(\"Native getter returned null.\")";
-      }
-      out << ";\n";
-    } else if (get_pinvoke_type(ret_idx, true) == "string") {
-      if (ret_nullable) {
-        indent(out, indent_level + 4) << "return " << native_call << ";\n";
-      } else {
-        indent(out, indent_level + 4) << "return " << native_call
-                                      << " ?? throw new InvalidOperationException(\"Native getter returned null.\");\n";
-      }
-    } else {
-      indent(out, indent_level + 4) << "return " << native_call << ";\n";
-    }
-    indent(out, indent_level + 2) << "}\n";
-  }
-
-  if (setter_w != nullptr) {
-    indent(out, indent_level + 2) << "set {\n";
-    string this_arg = has_this ? get_native_this_argument(object->_itype, setter_func->_ifunc) : "";
-    string value_type = get_csharp_signature_type(value_idx, false);
-    string native_call = get_pinvoke_call_name(setter_func->_ifunc, *setter_w) + "(";
-    if (has_this) {
-      native_call += this_arg + ", ";
-    }
-    native_call += marshal_managed_argument(value_idx, value_type, "value") + ")";
-    indent(out, indent_level + 4) << native_call << ";\n";
-    indent(out, indent_level + 2) << "}\n";
-  }
-
-  indent(out, indent_level) << "}\n\n";
-}
-
-/**
  *
  */
 void InterfaceMakerCSharp::
@@ -5320,8 +4319,9 @@ void InterfaceMakerCSharp::
 write_globals_file(const string &dir, const string &cs_namespace,
                    InterrogateModuleDef *def) {
   std::ofstream out;
-  string globals_name = get_globals_class_name(
-    (def != nullptr && def->module_name != nullptr) ? def->module_name : module_name);
+  string globals_name = make_csharp_identifier(
+    ((def != nullptr && def->module_name != nullptr) ? def->module_name : module_name) +
+    string("Globals"));
 
   if (!open_output_file(dir, globals_name + ".cs", out)) {
     return;
@@ -5681,12 +4681,16 @@ is_current_native_methods_type(const InterrogateType &itype) const {
   // the .in format encodes cross-module type references.  Use
   // csharp_owned_type_indices to filter: only emit types whose TypeIndex was
   // recorded as belonging to this module during main().
+  //
+  // Fall back to "true" only if the owned-index set is empty, which should
+  // not happen after the CMake --library basename fix.
   if (csharp_database_only_pass) {
     if (!csharp_owned_type_indices.empty()) {
       // Collection facade types (vector_uchar, vector_string, etc.) are C++
       // typedefs, not PUBLISHED classes, so they carry neither F_global nor
       // F_nested and are excluded from csharp_owned_type_indices.  Gate their
       // generation on the module they are attributed to in csharp_type_module_map
+      // (set during command-line range tracking or the pre-search-dir snapshot)
       // so that each collection type is generated by exactly one module.
       if (is_collection_facade_type(itype)) {
         string facade_module = get_type_module_name(itype);
@@ -6115,26 +5119,18 @@ find_upcast_chain(const InterrogateType &itype, TypeIndex target_type,
       continue;
     }
 
-    const InterrogateType &base_type = idb->get_type(base_index);
-
-    // For secondary bases (di > 0), we need the upcast function.
-    // For the primary base (di == 0), no upcast is needed (same address), so we skip adding it.
-    string upcast_name;
-    if (di > 0) {
-      upcast_name = get_upcast_pinvoke_name(itype, di);
-      if (upcast_name.empty()) {
-        continue;
-      }
-      pinvoke_names.push_back(upcast_name);
+    string upcast_name = get_upcast_pinvoke_name(itype, di);
+    if (upcast_name.empty()) {
+      continue;
     }
 
+    const InterrogateType &base_type = idb->get_type(base_index);
+
+    pinvoke_names.push_back(upcast_name);
     if (find_upcast_chain(base_type, target_type, pinvoke_names, visited)) {
       return true;
     }
-
-    if (di > 0) {
-      pinvoke_names.pop_back();
-    }
+    pinvoke_names.pop_back();
   }
 
   return false;
@@ -6209,7 +5205,7 @@ get_pinvoke_type(TypeIndex type_index, bool for_return) const {
   const InterrogateType &itype = idb->get_type(type_index);
 
   if (itype.is_atomic()) {
-    return get_pinvoke_atomic_type(itype, for_return);
+    return get_pinvoke_atomic_type(itype);
   }
   if (itype.is_pointer()) {
     TypeIndex inner = unwrap_type_aliases(itype.get_wrapped_type());
@@ -6337,22 +5333,10 @@ get_csharp_type(TypeIndex type_index, bool for_return) const {
   }
 
   if (itype.is_atomic()) {
-    AtomicToken tok = itype.get_atomic_token();
-    if (tok == AT_string) {
+    if (itype.get_atomic_token() == AT_string) {
       return for_return ? "string?" : "string";
     }
-    if (tok == AT_istream || tok == AT_ostream || tok == AT_iostream) {
-      // Default mapping for atomic stream tokens is IntPtr — that's the
-      // correct managed type for return values (since we don't yet support
-      // reverse bridging: wrapping a C++ stream as a System.IO.Stream).
-      //
-      // Parameters are overridden to System.IO.Stream in write_method /
-      // write_constructor by checking csharp_stream_token_for_type before
-      // calling this function; those callsites emit a StreamBridge.For…
-      // using block around the P/Invoke call.
-      return "IntPtr";
-    }
-    return get_pinvoke_atomic_type(itype, for_return);
+    return get_pinvoke_atomic_type(itype);
   }
   if (itype.is_pointer()) {
     TypeIndex inner = unwrap_type_aliases(itype.get_wrapped_type());
@@ -6728,29 +5712,6 @@ get_interface_name(const InterrogateType &itype) const {
     }
   }
 
-  // Case-insensitive collision check across all modules.
-  if (_all_class_names_lower.empty()) {
-    int n = idb->get_num_all_types();
-    for (int i = 0; i < n; ++i) {
-      TypeIndex tidx = idb->get_all_type(i);
-      const InterrogateType &t = idb->get_type(tidx);
-      if (t.is_class() || t.is_struct()) {
-        string cname = get_class_name(t);
-        for (char &c : cname) {
-          c = (char)std::tolower((unsigned char)c);
-        }
-        _all_class_names_lower.insert(cname);
-      }
-    }
-  }
-  string candidate_lower = candidate;
-  for (char &c : candidate_lower) {
-    c = (char)std::tolower((unsigned char)c);
-  }
-  if (_all_class_names_lower.count(candidate_lower) != 0) {
-    return candidate + "Ifc";
-  }
-
   // Fall back to file-existence check for types already generated in this run.
   Filename collision_file(csharp_output_dir.get_fullpath() + "/" + candidate + ".cs");
   if (collision_file.exists()) {
@@ -6856,34 +5817,15 @@ get_base_class_clause(const InterrogateType &itype) const {
  */
 string InterfaceMakerCSharp::
 get_interface_list(const InterrogateType &itype) const {
-  // Collect ALL secondary bases from the entire primary-base ancestry chain.
-  // C# explicit interface implementations don't inherit, so each class must
-  // declare every secondary base interface it implements, not just direct ones.
-  std::set<const InterrogateType *> all_secondary_bases;
+  std::vector<const InterrogateType *> secondary_base_types;
+  get_secondary_base_types(itype, secondary_base_types);
+
   std::set<string> emitted_interfaces;
   string interface_list;
-
-  std::function<void(const InterrogateType &)> collect;
-  collect = [&](const InterrogateType &t) {
-    std::vector<const InterrogateType *> secondaries;
-    get_secondary_base_types(t, secondaries);
-    for (const InterrogateType *sec : secondaries) {
-      if (sec != nullptr && all_secondary_bases.insert(sec).second) {
-        collect(*sec);
-      }
+  for (const InterrogateType *base_type : secondary_base_types) {
+    if (base_type == nullptr) {
+      continue;
     }
-    if (t.number_of_derivations() > 0) {
-      TypeIndex primary_idx = t.get_derivation(0);
-      if (is_wrapped_type(primary_idx)) {
-        InterrogateDatabase *idb = InterrogateDatabase::get_ptr();
-        const InterrogateType &primary = idb->get_type(primary_idx);
-        collect(primary);
-      }
-    }
-  };
-  collect(itype);
-
-  for (const InterrogateType *base_type : all_secondary_bases) {
     if (is_collection_facade_type(*base_type)) {
       continue;
     }
@@ -6987,53 +5929,27 @@ get_collection_interface_type(const InterrogateType &itype, bool for_return) con
 }
 
 /**
- * Maps a C++ element true_name (as it appears inside std::vector< ... >) to
- * the C# type name to use in generated code.
  *
- * `for_signature=true` returns the interface name (e.g. IFoo) for
- * user-defined types, used in public interface signatures.  `false`
- * returns the concrete class name (e.g. Foo).
- *
- * Handles the usual primitives plus std::string/std::wstring.  For
- * anything else we look the name up in the database (by true_name, falling
- * back to scoped name) and return the associated C# class/interface name.
  */
 string InterfaceMakerCSharp::
-get_collection_element_type_from_cpp_name(const string &cpp_name, bool for_signature) const {
-  // Normalise whitespace that cppparser sometimes leaves: "std::vector< int >"
-  // gives us " int ".  Trim surrounding spaces.
-  string clean = cpp_name;
-  while (!clean.empty() && (clean.front() == ' ' || clean.front() == '\t')) clean.erase(clean.begin());
-  while (!clean.empty() && (clean.back() == ' ' || clean.back() == '\t')) clean.pop_back();
+get_collection_element_type_from_suffix(const string &suffix, bool for_signature) const {
+  string clean_suffix = suffix;
+  if (clean_suffix.length() > 6 && clean_suffix.substr(clean_suffix.length() - 6) == "_const") {
+    clean_suffix = clean_suffix.substr(0, clean_suffix.length() - 6);
+  }
 
-  // Primitive / string mappings.  These must match get_pinvoke_type's
-  // behaviour so Count/Item pinvokes line up with the helper declarations.
-  if (clean == "unsigned char") return "byte";
-  if (clean == "signed char") return "sbyte";
-  if (clean == "char") return "sbyte";
-  if (clean == "unsigned short" || clean == "unsigned short int") return "ushort";
-  if (clean == "short" || clean == "short int") return "short";
-  if (clean == "unsigned int" || clean == "unsigned") return "uint";
-  if (clean == "int") return "int";
-  if (clean == "long" || clean == "long int") return "int";
-  if (clean == "unsigned long" || clean == "unsigned long int") return "uint";
-  if (clean == "long long" || clean == "long long int") return "long";
-  if (clean == "unsigned long long" || clean == "unsigned long long int") return "ulong";
-  if (clean == "float") return "float";
-  if (clean == "double") return "double";
-  if (clean == "bool") return "bool";
-  if (clean == "std::string" || clean == "string" ||
-      clean == "std::wstring" || clean == "wstring") return "string";
+  if (clean_suffix == "unsigned_char" || clean_suffix == "uchar") return "byte";
+  if (clean_suffix == "signed_char" || clean_suffix == "char") return "sbyte";
+  if (clean_suffix == "unsigned_short_int" || clean_suffix == "ushort") return "ushort";
+  if (clean_suffix == "short_int" || clean_suffix == "short") return "short";
+  if (clean_suffix == "unsigned_int" || clean_suffix == "uint") return "uint";
+  if (clean_suffix == "int") return "int";
+  if (clean_suffix == "float") return "float";
+  if (clean_suffix == "double") return "double";
+  if (clean_suffix == "string" || clean_suffix == "wstring" || clean_suffix == "string_const") return "string";
 
-  // Fall back to a database lookup for user-defined types.
   InterrogateDatabase *idb = InterrogateDatabase::get_ptr();
-  TypeIndex type_index = idb->lookup_type_by_true_name(clean);
-  if (type_index == 0) {
-    type_index = idb->lookup_type_by_scoped_name(clean);
-  }
-  if (type_index == 0) {
-    type_index = idb->lookup_type_by_name(clean);
-  }
+  TypeIndex type_index = idb->lookup_type_by_name(clean_suffix);
   if (type_index != 0) {
     type_index = unwrap_type_aliases(type_index);
     if (type_index != 0) {
@@ -7042,37 +5958,51 @@ get_collection_element_type_from_cpp_name(const string &cpp_name, bool for_signa
     }
   }
 
-  // Last resort: mangle whatever we got into an identifier.
-  return make_csharp_identifier(clean);
+  string class_name = make_csharp_identifier(clean_suffix);
+  const InterrogateType *named_type = find_csharp_object_type(class_name);
+  if (named_type != nullptr) {
+    return for_signature ? get_interface_name(*named_type) : get_class_name(*named_type);
+  }
+
+  return class_name;
 }
 
 /**
- * Returns the element type's C# name for a collection facade type.
- * Internally walks the inheritance chain to find the template
- * instantiation (e.g. std::vector<T>) and extracts T.
+ *
  */
 string InterfaceMakerCSharp::
-get_collection_element_type(const InterrogateType &itype, bool for_signature) const {
-  string element_cpp_name;
-  if (detect_collection_facade_kind(itype, element_cpp_name) == CF_none) {
-    return string();
+get_collection_element_cpp_type_from_suffix(const string &suffix) const {
+  string clean_suffix = suffix;
+  if (clean_suffix.length() > 6 && clean_suffix.substr(clean_suffix.length() - 6) == "_const") {
+    clean_suffix = clean_suffix.substr(0, clean_suffix.length() - 6);
   }
-  return get_collection_element_type_from_cpp_name(element_cpp_name, for_signature);
-}
 
-/**
- * Like get_collection_element_type but returns the raw C++ element name
- * (e.g. "int", "std::string") for use inside generated C++ helpers.
- */
-string InterfaceMakerCSharp::
-get_collection_element_cpp_type(const InterrogateType &itype) const {
-  string element_cpp_name;
-  if (detect_collection_facade_kind(itype, element_cpp_name) == CF_none) {
-    return string();
+  if (clean_suffix == "unsigned_char" || clean_suffix == "uchar") return "unsigned char";
+  if (clean_suffix == "signed_char" || clean_suffix == "char") return "signed char";
+  if (clean_suffix == "unsigned_short_int" || clean_suffix == "ushort") return "unsigned short int";
+  if (clean_suffix == "short_int" || clean_suffix == "short") return "short int";
+  if (clean_suffix == "unsigned_int" || clean_suffix == "uint") return "unsigned int";
+  if (clean_suffix == "int") return "int";
+  if (clean_suffix == "float") return "float";
+  if (clean_suffix == "double") return "double";
+  if (clean_suffix == "string" || clean_suffix == "string_const") return "std::string";
+  if (clean_suffix == "wstring") return "std::wstring";
+
+  InterrogateDatabase *idb = InterrogateDatabase::get_ptr();
+  TypeIndex type_index = idb->lookup_type_by_name(clean_suffix);
+  if (type_index != 0) {
+    type_index = unwrap_type_aliases(type_index);
+    if (type_index != 0) {
+      const InterrogateType &itype = idb->get_type(type_index);
+      if (itype.has_true_name()) {
+        return itype.get_true_name();
+      } else if (itype.has_scoped_name()) {
+        return itype.get_scoped_name();
+      }
+    }
   }
-  while (!element_cpp_name.empty() && (element_cpp_name.front() == ' ' || element_cpp_name.front() == '\t')) element_cpp_name.erase(element_cpp_name.begin());
-  while (!element_cpp_name.empty() && (element_cpp_name.back() == ' ' || element_cpp_name.back() == '\t')) element_cpp_name.pop_back();
-  return element_cpp_name;
+
+  return clean_suffix;
 }
 
 /**
@@ -7080,28 +6010,23 @@ get_collection_element_cpp_type(const InterrogateType &itype) const {
  */
 string InterfaceMakerCSharp::
 get_collection_helper_name(const InterrogateType &itype, const string &op) const {
-  // Use the class name (e.g. "vector_int") as the stable part — it's
-  // unique within a module and agrees across pass 1 and pass 2, unlike
-  // TypeIndex which can shift.  Prefix with the owning library's hash
-  // to disambiguate modules that both emit helpers for "vector_string"
-  // (mirrors the `_inC<hash><remap_hash>` scheme in get_c_wrapper_name).
-  //
-  // The hash must come from the type's own library, not the currently
-  // emitting C# library: in pass 2 multiple native modules merge into
-  // one C# assembly, so `_def->library_hash_name` wouldn't match the
-  // pass-1 export.
   std::ostringstream strm;
-  strm << "Collection_";
-  if (itype.has_library_name()) {
-    const char *lib = itype.get_library_name();
-    if (lib != nullptr && *lib != '\0') {
-      strm << InterrogateBuilder::hash_string(lib, 5) << "_";
-    }
-  } else if (_def != nullptr && _def->library_hash_name != nullptr) {
-    strm << _def->library_hash_name << "_";
+  strm << "Collection_" << get_class_name(itype) << "_";
+  TypeIndex type_index = get_type_index_for_interrogate_type(itype);
+  if (type_index != 0) {
+    strm << type_index << "_";
   }
-  strm << get_class_name(itype) << "_" << op;
+  strm << op;
   return strm.str();
+}
+
+/**
+ *
+ */
+string InterfaceMakerCSharp::
+get_collection_element_type(const InterrogateType &itype, bool for_signature) const {
+  string suffix = get_collection_suffix(get_csharp_type_name(itype));
+  return get_collection_element_type_from_suffix(suffix, for_signature);
 }
 
 /**

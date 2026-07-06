@@ -82,6 +82,10 @@ private:
                     std::set<std::string> *emitted_signatures = nullptr);
   void write_property(std::ostream &out, Property *prop, Object *object,
                       int indent_level, bool is_interface);
+  void write_property_from_wrapper(std::ostream &out,
+                                   const InterrogateElement &ielement,
+                                   Object *object, int indent_level,
+                                   bool is_interface);
   void write_dispose_pattern(std::ostream &out, Object *object,
                              int indent_level);
 
