@@ -78,6 +78,7 @@ public:
   INLINE bool is_union() const;
   INLINE bool is_final() const;
   INLINE bool is_abstract() const;
+  INLINE bool has_forced_complex_inheritance() const;
 
   INLINE bool is_fully_defined() const;
   INLINE bool is_unpublished() const;
@@ -150,6 +151,7 @@ private:
     F_final                =0x1000000,
     F_deprecated           =0x2000000,
     F_abstract             =0x4000000,
+    F_forced_complex_inheritance =0x8000000,
   };
 
 public:

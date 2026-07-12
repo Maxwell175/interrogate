@@ -316,6 +316,16 @@ is_abstract() const {
 }
 
 /**
+ * Returns true if this type has been explicitly declared to need complex
+ * inheritance compatibility even if no multiple-inheritance edge is visible in
+ * the loaded interrogate databases.
+ */
+INLINE bool InterrogateType::
+has_forced_complex_inheritance() const {
+  return (_flags & F_forced_complex_inheritance) != 0;
+}
+
+/**
  *
  */
 INLINE bool InterrogateType::

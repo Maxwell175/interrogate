@@ -74,6 +74,7 @@ public:
                          const std::string &params);
 
   bool in_forcetype(const std::string &name) const;
+  bool in_forcecomplexinheritance(const std::string &name) const;
   std::string in_renametype(const std::string &name) const;
   bool in_ignoretype(const std::string &name) const;
   std::string in_defconstruct(const std::string &name) const;
@@ -154,6 +155,7 @@ public:
   IncludeFiles _include_files;
 
   Commands _forcetype;
+  Commands _forcecomplexinheritance;
   CommandParams _renametype;
   Commands _ignoretype;
   CommandParams _defconstruct;

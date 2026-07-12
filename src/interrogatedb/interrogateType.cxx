@@ -121,19 +121,21 @@ operator = (const InterrogateType &copy) {
  */
 void InterrogateType::
 merge_with(const InterrogateType &other) {
-  // The only thing we care about copying from the non-fully-defined type
-  // right now is the global flag.
+  // Keep lightweight metadata from non-winning definitions.  The global flag
+  // indicates database ownership; forced complex inheritance comes from .N
+  // metadata and must survive merges between stubs and full definitions.
+  const int preserved_flags = F_global | F_forced_complex_inheritance;
 
   if (is_fully_defined() &&
       (!other.is_fully_defined() || (other._flags & F_global) == 0)) {
     // We win.
-    _flags |= (other._flags & F_global);
+    _flags |= (other._flags & preserved_flags);
 
   } else {
     // They win.  Binary .in files never carry _cpptype; keep ours if present.
     CPPType  *saved_cpptype  = _cpptype;
     CPPScope *saved_cppscope = _cppscope;
-    int old_flags = (_flags & F_global);
+    int old_flags = (_flags & preserved_flags);
     (*this) = other;
     _flags |= old_flags;
     if (_cpptype == nullptr && saved_cpptype != nullptr) {
@@ -237,6 +239,9 @@ write(std::ostream &out, int indent_level) const {
     }
     if (_flags & F_deprecated) {
       out << " deprecated";
+    }
+    if (_flags & F_forced_complex_inheritance) {
+      out << " forced_complex_inheritance";
     }
     out << "\n";
   }

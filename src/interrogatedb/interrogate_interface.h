@@ -491,6 +491,7 @@ EXPCL_INTERROGATEDB bool interrogate_type_is_struct(TypeIndex type);
 EXPCL_INTERROGATEDB bool interrogate_type_is_class(TypeIndex type);
 EXPCL_INTERROGATEDB bool interrogate_type_is_union(TypeIndex type);
 EXPCL_INTERROGATEDB bool interrogate_type_is_abstract(TypeIndex type);
+EXPCL_INTERROGATEDB bool interrogate_type_has_forced_complex_inheritance(TypeIndex type);
 
 // If is_fully_defined() returns false, this classstruct was a forward
 // reference, and we really don't know anything about it.  (In this case, it

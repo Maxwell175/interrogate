@@ -930,6 +930,12 @@ interrogate_type_is_abstract(TypeIndex type) {
 }
 
 bool
+interrogate_type_has_forced_complex_inheritance(TypeIndex type) {
+  // cerr << "interrogate_type_has_forced_complex_inheritance(" << type << ")\n";
+  return InterrogateDatabase::get_ptr()->get_type(type).has_forced_complex_inheritance();
+}
+
+bool
 interrogate_type_is_fully_defined(TypeIndex type) {
   // cerr << "interrogate_type_is_fully_defined(" << type << ")\n";
   return InterrogateDatabase::get_ptr()->get_type(type).is_fully_defined();

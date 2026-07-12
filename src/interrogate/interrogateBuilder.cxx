@@ -149,6 +149,18 @@ do_command(const string &command, const string &params) {
       _forcetype.insert(type->get_local_name(&parser));
     }
 
+  } else if (command == "forcecomplexinheritance") {
+    // forcecomplexinheritance declares that the given type must keep complex
+    // inheritance compatibility even if no multiple-inheritance edge is visible
+    // in the loaded interrogate databases.
+    CPPType *type = parser.parse_type(params);
+    if (type == nullptr) {
+      nout << "Unknown type: forcecomplexinheritance " << params << "\n";
+    } else {
+      type = type->resolve_type(&parser, &parser);
+      _forcecomplexinheritance.insert(type->get_local_name(&parser));
+    }
+
   } else if (command == "renametype") {
     // rename exports the type as the indicated name.  We strip off the last
     // word as the new name; the new name may not contain spaces (although the
@@ -742,6 +754,15 @@ insert_param_list(InterrogateBuilder::Commands &commands,
 bool InterrogateBuilder::
 in_forcetype(const string &name) const {
   return (_forcetype.count(name) != 0);
+}
+
+/**
+ * Returns true if the indicated name is one that the user identified with a
+ * forcecomplexinheritance command.
+ */
+bool InterrogateBuilder::
+in_forcecomplexinheritance(const string &name) const {
+  return (_forcecomplexinheritance.count(name) != 0);
 }
 
 /**
@@ -2335,6 +2356,7 @@ get_type(CPPType *type, bool global) {
   }
 
   bool forced = in_forcetype(true_name);
+  bool force_complex_inheritance = in_forcecomplexinheritance(true_name);
 
   if (index == 0) {
     // It isn't already there, so we have to define it.
@@ -2353,6 +2375,9 @@ get_type(CPPType *type, bool global) {
 
   InterrogateType &itype =
     InterrogateDatabase::get_ptr()->update_type(index);
+  if (force_complex_inheritance) {
+    itype._flags |= InterrogateType::F_forced_complex_inheritance;
+  }
 
   itype._name = get_preferred_name(type);
 
