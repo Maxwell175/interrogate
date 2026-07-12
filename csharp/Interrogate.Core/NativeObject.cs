@@ -46,6 +46,44 @@ namespace Interrogate {
         /// <param name="ownership">How the wrapper should manage the pointer's lifetime.</param>
         /// <returns>A new wrapper instance, or <c>null</c> if <paramref name="ptr"/> is zero.</returns>
         static abstract TSelf? CreateFromNative(IntPtr ptr, NativeOwnership ownership);
+
+        /// <summary>
+        /// The registered runtime type handle for <typeparamref name="TSelf"/>, when its C++ type
+        /// participates in a runtime type system (i.e. derives from a type exposing <c>is_of_type</c>).
+        /// <c>0</c> by default (not runtime-checkable); the generator overrides it for type-system
+        /// classes so <see cref="NativeObjectExtensions.CastTo{T}"/> can verify the dynamic type.
+        /// </summary>
+        static virtual int TypeHandle => 0;
+    }
+
+    /// <summary>
+    /// Implemented by wrappers whose underlying C++ type participates in a runtime type system
+    /// (interrogate/dtool's <c>TypedObject</c>). The generator adds this to the type that declares
+    /// <c>is_of_type</c>, so every derived wrapper inherits it. It lets
+    /// <see cref="NativeObjectExtensions.CastTo{T}"/> perform a checked downcast without reflection and
+    /// without a library-specific dependency.
+    /// </summary>
+    public interface IRuntimeTyped {
+        /// <summary>
+        /// Whether the underlying C++ object is dynamically an instance of the given registered type
+        /// handle (see <see cref="INativeType{TSelf}.TypeHandle"/>). Maps to C++ <c>is_of_type</c>.
+        /// <para>
+        /// <b>Precondition:</b> only valid when <see cref="GetTypeIndex"/> is non-zero. The C++
+        /// <c>is_of_type</c> looks the object's own type up in the type registry; if that type is
+        /// unregistered (index 0 / <c>TypeHandle::none()</c>) the lookup dereferences a null registry
+        /// node and crashes. Callers (e.g. <see cref="NativeObjectExtensions.CastTo{T}"/>) must gate
+        /// this call on <see cref="GetTypeIndex"/> being non-zero.
+        /// </para>
+        /// </summary>
+        bool IsOfType(int typeHandle);
+
+        /// <summary>
+        /// The registered type-registry index of the object's own dynamic type, or <c>0</c> if its
+        /// type is unregistered (<c>TypeHandle::none()</c>). Maps to C++ <c>get_type_index</c> — a
+        /// plain field read that never touches the registry, so it is always safe to call. Used to
+        /// decide whether <see cref="IsOfType"/> can be called safely for a checked downcast.
+        /// </summary>
+        int GetTypeIndex();
     }
 
     /// <summary>
@@ -60,11 +98,17 @@ namespace Interrogate {
         /// <typeparam name="T">The target generated binding class type.</typeparam>
         /// <param name="obj">The interface-typed wrapper to cast, or <c>null</c>.</param>
         /// <returns>
-        /// A borrowed wrapper of type <typeparamref name="T"/>, or <c>null</c> if
-        /// <paramref name="obj"/> is null or wraps a null pointer.
+        /// A borrowed wrapper of type <typeparamref name="T"/>, or <c>null</c> if <paramref name="obj"/>
+        /// is null, wraps a null pointer, or is not dynamically a <typeparamref name="T"/>.
         /// </returns>
         public static T? CastTo<T>(this INativeObject? obj) where T : NativeObject, INativeType<T> {
             if (obj == null || obj.NativeHandle == IntPtr.Zero) {
+                return null;
+            }
+
+            int typeHandle = T.TypeHandle;
+            if (typeHandle != 0 && obj is IRuntimeTyped typed && typed.GetTypeIndex() != 0
+                    && !typed.IsOfType(typeHandle)) {
                 return null;
             }
 
@@ -144,18 +188,18 @@ namespace Interrogate {
         /// Creates a new <see cref="NativeOwnership.Borrowed"/> wrapper of type <typeparamref name="T"/>
         /// pointing to the same native object.
         /// <para>
-        /// This does not perform a C++ <c>dynamic_cast</c> — it trusts the caller that the
-        /// underlying object is actually of (or derived from) type <typeparamref name="T"/>.
-        /// If the underlying C++ class supports runtime type information, prefer
-        /// verifying the type before casting when the concrete type is uncertain.
+        /// When <typeparamref name="T"/>'s C++ type participates in a runtime type system (dtool's
+        /// <c>TypedObject</c>) and this object does too, the cast is <b>checked</b>: it verifies the
+        /// object's dynamic type and returns <c>null</c> on a mismatch (like C# <c>as</c> or a pointer
+        /// <c>dynamic_cast</c>). For types without a runtime type system it is an unchecked reinterpret.
         /// </para>
         /// </summary>
         /// <typeparam name="T">
         /// The target type. Must be a generated binding class implementing <see cref="INativeType{T}"/>.
         /// </typeparam>
         /// <returns>
-        /// A borrowed wrapper of type <typeparamref name="T"/>, or <c>null</c> if this wrapper
-        /// holds a null pointer.
+        /// A borrowed wrapper of type <typeparamref name="T"/>, or <c>null</c> if this wrapper holds a
+        /// null pointer or is not dynamically a <typeparamref name="T"/>.
         /// </returns>
         /// <example>
         /// <code>
@@ -166,6 +210,11 @@ namespace Interrogate {
         /// </example>
         public T? CastTo<T>() where T : NativeObject, INativeType<T> {
             if (_handle.Handle == IntPtr.Zero) return null;
+            int typeHandle = T.TypeHandle;
+            if (typeHandle != 0 && this is IRuntimeTyped typed && typed.GetTypeIndex() != 0
+                    && !typed.IsOfType(typeHandle)) {
+                return null;
+            }
             return T.CreateFromNative(_handle.Handle, NativeOwnership.Borrowed);
         }
 
