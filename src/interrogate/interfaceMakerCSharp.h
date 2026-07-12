@@ -80,6 +80,10 @@ private:
   void write_method(std::ostream &out, Function *func, Object *object,
                     int indent_level, bool is_interface,
                     std::set<std::string> *emitted_signatures = nullptr);
+  void write_operator_aliases(std::ostream &out, Object *object,
+                              int indent_level,
+                              std::set<std::string> *emitted_signatures,
+                              bool is_interface);
   void write_property(std::ostream &out, Property *prop, Object *object,
                       int indent_level, bool is_interface);
   void write_property_from_wrapper(std::ostream &out,
@@ -144,6 +148,26 @@ private:
   std::string get_interface_name(const InterrogateType &itype) const;
   std::string get_qualified_class_name(const InterrogateType &itype) const;
   std::string get_qualified_interface_name(const InterrogateType &itype) const;
+  bool uses_csharp_interface(const InterrogateType &itype) const;
+  void rebuild_csharp_interface_cache() const;
+  bool mark_csharp_interface_base_chain(TypeIndex type_index,
+                                        std::set<TypeIndex> &visited) const;
+  std::string get_public_native_object_type_name(const InterrogateType &itype,
+                                                 bool for_return) const;
+
+  // Nested-type support. get_class_name / get_interface_name return the FLAT
+  // name (filenames, P/Invoke names, opaque helpers, collision keys); the helpers
+  // below give the simple (definition) and dotted (reference) forms.
+  bool should_nest_type(const InterrogateType &itype) const;
+  void get_outer_class_chain(const InterrogateType &itype,
+                             std::vector<const InterrogateType *> &out) const;
+  std::string get_flat_display_name(const InterrogateType &itype) const;
+  std::string get_simple_class_name(const InterrogateType &itype) const;
+  std::string get_nested_class_name(const InterrogateType &itype) const;
+  std::string get_simple_interface_name(const InterrogateType &itype) const;
+  std::string get_nested_interface_name(const InterrogateType &itype) const;
+  int open_nesting_wrappers(std::ostream &out, const InterrogateType &itype) const;
+  void close_nesting_wrappers(std::ostream &out, int count) const;
   std::string get_type_module_name(const InterrogateType &itype) const;
   std::string get_base_class_clause(const InterrogateType &itype) const;
   std::string get_interface_list(const InterrogateType &itype) const;
@@ -161,6 +185,7 @@ private:
   int inherited_method_signature_kind(const InterrogateType &itype,
                                       const std::string &method_name,
                                       const std::vector<std::string> &param_types,
+                                      const std::string &return_type,
                                       bool is_static,
                                       bool primary_chain_only);
 
@@ -175,6 +200,9 @@ private:
   mutable std::set<std::string> _loaded_external_databases;
   mutable std::deque<std::string> _external_database_paths;
   mutable std::deque<InterrogateModuleDef> _external_database_requests;
+  mutable bool _csharp_interface_cache_valid;
+  mutable int _csharp_interface_cache_type_count;
+  mutable std::set<TypeIndex> _csharp_interface_type_indices;
   std::set<std::string> _written_enums;
   // Lowercase class names from every module in the global database, used for
   // case-insensitive interface-name collision detection across modules.

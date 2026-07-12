@@ -236,6 +236,55 @@ make_csharp_identifier(const string &name) {
   return ident;
 }
 
+// Converts a C++ enum-value name to one idiomatic PascalCase C# identifier.
+//   LEFT_X / left_x -> LeftX     NONE / none -> None     X / x -> X
+//   M_off -> MOff                CS_zup_right -> CsZupRight
+string
+make_csharp_enum_member(const string &name) {
+  bool has_underscore = name.find('_') != string::npos;
+  bool all_upper = true;
+  bool all_lower = true;
+  for (char c : name) {
+    if (std::isalpha((unsigned char)c)) {
+      if (std::islower((unsigned char)c)) all_upper = false;
+      if (std::isupper((unsigned char)c)) all_lower = false;
+    }
+  }
+
+  string result;
+  if (has_underscore || all_upper || all_lower) {
+    // snake_case / FLAT_CASE: PascalCase each underscore-delimited word.
+    bool new_word = true;
+    for (char c : name) {
+      if (c == '_') {
+        new_word = true;
+        continue;
+      }
+      if (new_word) {
+        result += (char)std::toupper((unsigned char)c);
+        new_word = false;
+      } else {
+        result += (char)std::tolower((unsigned char)c);
+      }
+    }
+  } else {
+    // mixed-case, no separators: keep internal casing, upper the first letter.
+    result = name;
+    if (!result.empty()) {
+      result[0] = (char)std::toupper((unsigned char)result[0]);
+    }
+  }
+
+  if (result.empty()) {
+    result = "Value";
+  }
+  if (std::isdigit((unsigned char)result[0])) {
+    result = "_" + result;
+  }
+
+  return make_csharp_identifier(result);
+}
+
 string
 quote_csharp_string(const string &value) {
   string result;
@@ -676,6 +725,230 @@ build_signature_key(const string &name, const std::vector<string> &param_types,
   return strm.str();
 }
 
+struct CSharpOperatorParam {
+  string type;
+  string name;
+  bool nullable_reference;
+  bool native_object;
+};
+
+struct CSharpOperatorCandidate {
+  string method_name;
+  string symbol;
+  string return_type;
+  std::vector<CSharpOperatorParam> parameters;
+};
+
+string
+get_csharp_operator_symbol(const string &method_name) {
+  static const struct { const char *method; const char *symbol; } op_map[] = {
+    {"op_eq", "=="}, {"op_ne", "!="},
+    {"op_lt", "<"}, {"op_gt", ">"}, {"op_le", "<="}, {"op_ge", ">="},
+    {"op_add", "+"}, {"op_sub", "-"}, {"op_mul", "*"}, {"op_div", "/"},
+    {"op_mod", "%"}, {"op_and", "&"}, {"op_or", "|"}, {"op_xor", "^"},
+    {"op_inv", "~"}, {"op_not", "!"},
+    {"op_lshift", "<<"}, {"op_rshift", ">>"},
+    {"op_inc", "++"}, {"op_dec", "--"},
+  };
+
+  for (size_t i = 0; i < sizeof(op_map) / sizeof(op_map[0]); ++i) {
+    if (method_name == op_map[i].method) {
+      return op_map[i].symbol;
+    }
+  }
+  return string();
+}
+
+bool
+is_csharp_operator_value_type_name(const string &type_name) {
+  static const char *const value_types[] = {
+    "bool", "byte", "sbyte", "short", "ushort", "int", "uint",
+    "long", "ulong", "float", "double", "IntPtr"
+  };
+  for (size_t i = 0; i < sizeof(value_types) / sizeof(value_types[0]); ++i) {
+    if (type_name == value_types[i]) {
+      return true;
+    }
+  }
+  if (type_name == "string" || type_name == "string?") {
+    return false;
+  }
+
+  // Generated native-object parameters are surfaced as interfaces (IFoo or
+  // global::Namespace.IFoo).  Everything else that reaches this path is treated
+  // as a value-like type for nullable-annotation purposes, which covers enums.
+  size_t last_dot = type_name.rfind('.');
+  size_t first = (last_dot == string::npos) ? 0 : last_dot + 1;
+  return !(first < type_name.size() && type_name[first] == 'I');
+}
+
+string
+make_nullable_operator_type(const CSharpOperatorParam &param) {
+  if (!param.nullable_reference || param.type.empty() || param.type[param.type.size() - 1] == '?') {
+    return param.type;
+  }
+  return param.type + "?";
+}
+
+string
+strip_nullable_operator_type(const string &type_name) {
+  if (!type_name.empty() && type_name[type_name.size() - 1] == '?') {
+    return type_name.substr(0, type_name.size() - 1);
+  }
+  return type_name;
+}
+
+string
+operator_operand_key(const CSharpOperatorCandidate &candidate) {
+  std::ostringstream strm;
+  strm << '(';
+  for (size_t i = 0; i < candidate.parameters.size(); ++i) {
+    if (i != 0) {
+      strm << ',';
+    }
+    strm << candidate.parameters[i].type;
+  }
+  strm << ')';
+  return strm.str();
+}
+
+string
+operator_signature_key(const string &symbol, const CSharpOperatorCandidate &candidate) {
+  return symbol + operator_operand_key(candidate);
+}
+
+bool
+is_unary_csharp_operator(const string &symbol) {
+  return symbol == "+" || symbol == "-" || symbol == "!" || symbol == "~" ||
+         symbol == "++" || symbol == "--";
+}
+
+bool
+is_binary_csharp_operator(const string &symbol) {
+  return symbol == "+" || symbol == "-" || symbol == "*" || symbol == "/" ||
+         symbol == "%" || symbol == "&" || symbol == "|" || symbol == "^" ||
+         symbol == "<<" || symbol == ">>";
+}
+
+bool
+is_equality_csharp_operator(const string &symbol) {
+  return symbol == "==" || symbol == "!=";
+}
+
+bool
+is_ordered_csharp_operator(const string &symbol) {
+  return symbol == "<" || symbol == ">" || symbol == "<=" || symbol == ">=";
+}
+
+string
+opposite_ordered_operator(const string &symbol) {
+  if (symbol == "<") return ">";
+  if (symbol == ">") return "<";
+  if (symbol == "<=") return ">=";
+  if (symbol == ">=") return "<=";
+  return string();
+}
+
+TypeIndex get_type_index_for_interrogate_type(const InterrogateType &itype);
+
+string
+get_local_csharp_type_name(const InterrogateType &itype) {
+  if (itype.has_name()) {
+    return make_csharp_identifier(itype.get_name());
+  }
+  if (itype.has_scoped_name()) {
+    return make_csharp_identifier(InterrogateBuilder::descope(itype.get_scoped_name()));
+  }
+  if (itype._cpptype != nullptr) {
+    return make_csharp_identifier(itype._cpptype->get_local_name(&parser));
+  }
+
+  return string();
+}
+
+string
+get_raw_type_name(const InterrogateType &itype) {
+  if (itype.has_true_name()) {
+    return itype.get_true_name();
+  }
+  if (itype.has_scoped_name()) {
+    return itype.get_scoped_name();
+  }
+  if (itype.has_name()) {
+    return itype.get_name();
+  }
+  if (itype._cpptype != nullptr) {
+    return itype._cpptype->get_local_name(&parser);
+  }
+
+  return string();
+}
+
+bool
+is_template_instantiation_name(const string &name) {
+  string::size_type open = name.find('<');
+  return open != string::npos && name.find('>', open + 1) != string::npos;
+}
+
+string
+get_direct_typedef_csharp_type_name(const InterrogateType &itype) {
+  if (!(itype.is_class() || itype.is_struct()) ||
+      !is_template_instantiation_name(get_raw_type_name(itype))) {
+    return string();
+  }
+
+  TypeIndex target_index = get_type_index_for_interrogate_type(itype);
+  if (target_index == 0) {
+    return string();
+  }
+
+  InterrogateDatabase *idb = InterrogateDatabase::get_ptr();
+  string best_name;
+  int best_score = -1;
+
+  int n = idb->get_num_all_types();
+  for (int t = 0; t < n; ++t) {
+    TypeIndex alias_index = idb->get_all_type(t);
+    if (alias_index == 0 || alias_index == target_index) {
+      continue;
+    }
+
+    const InterrogateType &alias = idb->get_type(alias_index);
+    if (!alias.is_typedef() || alias.get_wrapped_type() != target_index) {
+      continue;
+    }
+    if (!alias.is_global() && !alias.is_nested()) {
+      continue;
+    }
+
+    string alias_name = get_local_csharp_type_name(alias);
+    if (alias_name.empty() || alias_name.find('<') != string::npos) {
+      continue;
+    }
+
+    int score = 100;
+    if (alias_name.find("Native") == string::npos) {
+      score += 10;
+    }
+    if (alias_name.find('_') == string::npos) {
+      score += 2;
+    }
+    if (alias.has_scoped_name() || alias.has_name()) {
+      score += 1;
+    }
+
+    if (score > best_score ||
+        (score == best_score &&
+         (best_name.empty() || alias_name.size() < best_name.size() ||
+          (alias_name.size() == best_name.size() && alias_name < best_name)))) {
+      best_name = alias_name;
+      best_score = score;
+    }
+  }
+
+  return best_name;
+}
+
 string
 get_csharp_type_name(const InterrogateType &itype) {
   // For types nested inside another class, prefix the C# name with the outer
@@ -700,14 +973,14 @@ get_csharp_type_name(const InterrogateType &itype) {
     }
   }
 
-  if (itype.has_name()) {
-    return make_csharp_identifier(itype.get_name());
+  string typedef_name = get_direct_typedef_csharp_type_name(itype);
+  if (!typedef_name.empty()) {
+    return typedef_name;
   }
-  if (itype.has_scoped_name()) {
-    return make_csharp_identifier(InterrogateBuilder::descope(itype.get_scoped_name()));
-  }
-  if (itype._cpptype != nullptr) {
-    return make_csharp_identifier(itype._cpptype->get_local_name(&parser));
+
+  string local_name = get_local_csharp_type_name(itype);
+  if (!local_name.empty()) {
+    return local_name;
   }
 
   return "UnnamedType";
@@ -857,7 +1130,8 @@ static CollectionFacadeKind walk_for_vector_base(
 // std::vector but don't themselves expose size() / operator[].  Walks
 // only real C++ inheritance: methods reachable only via p()->foo() on a
 // DF_pointer_to edge aren't callable on the holder.
-static bool type_has_method(const InterrogateType &itype, const string &name) {
+static bool type_declares_method(const InterrogateType &itype, const string &name) {
+  // Non-recursive: only the type's own methods, not inherited ones.
   InterrogateDatabase *idb = InterrogateDatabase::get_ptr();
   for (int i = 0; i < itype.number_of_methods(); ++i) {
     FunctionIndex fi = itype.get_method(i);
@@ -867,6 +1141,14 @@ static bool type_has_method(const InterrogateType &itype, const string &name) {
       return true;
     }
   }
+  return false;
+}
+
+static bool type_has_method(const InterrogateType &itype, const string &name) {
+  if (type_declares_method(itype, name)) {
+    return true;
+  }
+  InterrogateDatabase *idb = InterrogateDatabase::get_ptr();
   for (int i = 0; i < itype.number_of_derivations(); ++i) {
     if (itype.derivation_is_pointer_to(i)) continue;
     TypeIndex base_index = itype.get_derivation(i);
@@ -1864,7 +2146,9 @@ get_supplemental_unref_destructor_name(const InterrogateType &itype) {
 InterfaceMakerCSharp::
 InterfaceMakerCSharp(InterrogateModuleDef *def) :
   InterfaceMaker(def),
-  _dll_name(csharp_dll_name)
+  _dll_name(csharp_dll_name),
+  _csharp_interface_cache_valid(false),
+  _csharp_interface_cache_type_count(0)
 {
   if (_dll_name.empty()) {
     _dll_name = library_name;
@@ -2663,7 +2947,7 @@ write_enum_files(const string &dir, const string &cs_namespace) {
         continue;
       }
 
-      string enum_name = get_class_name(itype);
+      string enum_name = get_simple_class_name(itype);
       if (!_written_enums.insert(enum_name).second) {
         continue;
       }
@@ -2674,7 +2958,9 @@ write_enum_files(const string &dir, const string &cs_namespace) {
       }
 
       out << "namespace " << cs_namespace << " {\n";
+      int wrappers = open_nesting_wrappers(out, itype);
       write_enum_type(out, itype);
+      close_nesting_wrappers(out, wrappers);
       out << "}\n";
     }
     return;
@@ -2689,7 +2975,7 @@ write_enum_files(const string &dir, const string &cs_namespace) {
       continue;
     }
 
-    string enum_name = get_class_name(itype);
+    string enum_name = get_simple_class_name(itype);
     if (!_written_enums.insert(enum_name).second) {
       continue;
     }
@@ -2705,7 +2991,9 @@ write_enum_files(const string &dir, const string &cs_namespace) {
     }
 
     out << "namespace " << cs_namespace << " {\n";
+    int wrappers = open_nesting_wrappers(out, itype);
     write_enum_type(out, itype);
+    close_nesting_wrappers(out, wrappers);
     out << "}\n";
   }
 }
@@ -2715,13 +3003,37 @@ write_enum_files(const string &dir, const string &cs_namespace) {
  */
 void InterfaceMakerCSharp::
 write_enum_type(ostream &out, const InterrogateType &itype) {
-  string enum_name = get_class_name(itype);
+  string enum_name = get_simple_class_name(itype);
 
   out << "  public enum " << enum_name << " : int {\n";
+
+  // The interrogate database records each enum value under multiple spellings
+  // (e.g. both LEFT_X and left_x).  Fold every spelling to one PascalCase
+  // member and de-duplicate: case-variants collapse to a single idiomatic
+  // C# identifier.  A repeated name that maps to a *different* numeric value
+  // (which case-variants never do) is disambiguated rather than dropped.
+  std::vector<std::pair<string, int> > members;
+  std::map<string, int> seen;
   for (int i = 0; i < itype.number_of_enum_values(); ++i) {
-    out << "    " << make_csharp_identifier(itype.get_enum_value_name(i))
-        << " = " << itype.get_enum_value(i);
-    if (i + 1 < itype.number_of_enum_values()) {
+    string ident = make_csharp_enum_member(itype.get_enum_value_name(i));
+    int value = itype.get_enum_value(i);
+    std::map<string, int>::iterator it = seen.find(ident);
+    if (it != seen.end()) {
+      if (it->second == value) {
+        continue;
+      }
+      ident += "_" + std::to_string(value);
+      if (seen.count(ident)) {
+        continue;
+      }
+    }
+    seen[ident] = value;
+    members.push_back(std::make_pair(ident, value));
+  }
+
+  for (size_t i = 0; i < members.size(); ++i) {
+    out << "    " << members[i].first << " = " << members[i].second;
+    if (i + 1 < members.size()) {
       out << ',';
     }
     out << "\n";
@@ -2798,9 +3110,15 @@ write_class_file(const string &dir, const string &cs_namespace, Object *object) 
     return;
   }
 
-  write_interface(out, object);
-  out << "\n";
+  // A type nested in a C++ class is emitted as a real nested C# type by
+  // reopening its enclosing class(es) as partial classes.
+  int wrappers = open_nesting_wrappers(out, object->_itype);
+  if (uses_csharp_interface(object->_itype)) {
+    write_interface(out, object);
+    out << "\n";
+  }
   write_proxy_class(out, cs_namespace, object);
+  close_nesting_wrappers(out, wrappers);
   out << "}\n";
 }
 
@@ -2809,7 +3127,7 @@ write_class_file(const string &dir, const string &cs_namespace, Object *object) 
  */
 void InterfaceMakerCSharp::
 write_interface(ostream &out, Object *object) {
-  string interface_name = get_interface_name(object->_itype);
+  string interface_name = get_simple_interface_name(object->_itype);
   bool is_collection_facade = is_collection_facade_type(object->_itype);
 
   InterrogateDatabase *idb = InterrogateDatabase::get_ptr();
@@ -2900,6 +3218,8 @@ write_interface(ostream &out, Object *object) {
       write_method(out, base_cast, object, 4, true, &method_signatures);
     }
   }
+
+  write_operator_aliases(out, object, 4, &method_signatures, true);
 
   std::set<string> emitted_prop_names;
   // Emit properties from secondary bases in the interface
@@ -3476,11 +3796,17 @@ write_collection_adapter_class(ostream &out, Object *object) {
 void InterfaceMakerCSharp::
 write_proxy_class(ostream &out, const string &, Object *object) {
   const InterrogateType &itype = object->_itype;
-  string class_name = get_class_name(itype);
+  // class_name is the C# type-identity name used for the class declaration and
+  // all self-references (constructor, __CreateFromNative, INativeType<>): for a
+  // nested type this is the simple name (AxisState), which resolves correctly
+  // inside the reopened outer class.  flat_name keeps the flattened form for
+  // the internal opaque helper class, whose name must stay globally unique.
+  string class_name = get_simple_class_name(itype);
+  string flat_name = get_class_name(itype);
   string base_class = get_base_class_clause(itype);
   string interface_list = get_interface_list(itype);
   string destructor_name = get_destructor_wrapper_name(object);
-  string opaque_class_name = "__Opaque_" + class_name;
+  string opaque_class_name = "__Opaque_" + flat_name;
   bool is_collection_facade = is_collection_facade_type(itype);
 
   MakeSeq *indexer_make_seq = nullptr;
@@ -3668,9 +3994,17 @@ write_proxy_class(ostream &out, const string &, Object *object) {
   if (is_abstract) {
     out << "abstract ";
   }
-  out << "partial class " << class_name << " : " << base_class
-      << ", " << get_interface_name(itype)
-      << ", INativeType<" << class_name << ">" << interface_list;
+  out << "partial class " << class_name << " : " << base_class;
+  if (uses_csharp_interface(itype)) {
+    out << ", " << get_simple_interface_name(itype);
+  }
+  out << ", INativeType<" << class_name << ">" << interface_list;
+  // The type that declares is_of_type (a runtime type system, e.g. dtool's TypedObject) implements
+  // IRuntimeTyped so that CastTo<T> can verify the dynamic type before downcasting. Derived types
+  // inherit the interface (and the is_of_type implementation), so it's only declared at the root.
+  if (type_declares_method(itype, "is_of_type")) {
+    out << ", Interrogate.IRuntimeTyped";
+  }
   if (is_collection_facade) {
     string collection_interface = get_collection_interface_type(itype, false);
     if (collection_interface.size() >= 2 && collection_interface.substr(collection_interface.size() - 2) == "?") {
@@ -3759,6 +4093,14 @@ write_proxy_class(ostream &out, const string &, Object *object) {
                  << ">.CreateFromNative(IntPtr ptr, NativeOwnership own) {\n";
   indent(out, 6) << "return __CreateFromNative(ptr, own);\n";
   indent(out, 4) << "}\n\n";
+
+  // Expose the registered runtime type handle so CastTo<T> can do a checked downcast. Only for types
+  // in a runtime type system (those exposing get_class_type/is_of_type); others keep TypeHandle == 0.
+  if (type_has_method(itype, "get_class_type") &&
+      type_has_method(itype, "is_of_type")) {
+    indent(out, 4) << "static int INativeType<" << class_name
+                   << ">.TypeHandle => GetClassType();\n\n";
+  }
 
   indent(out, 4) << "internal " << class_name
                  << "(IntPtr ptr, NativeOwnership ownership) : base(ptr, ownership) {\n";
@@ -3945,6 +4287,8 @@ write_proxy_class(ostream &out, const string &, Object *object) {
         write_method(out, base_cast, object, 4, false, &method_signatures);
       }
     }
+
+    write_operator_aliases(out, object, 4, &method_signatures, false);
   }
 
   std::set<string> emitted_proxy_props;
@@ -4094,7 +4438,8 @@ write_proxy_class(ostream &out, const string &, Object *object) {
  */
 void InterfaceMakerCSharp::
 write_constructor(ostream &out, Function *func, Object *object, int indent_level) {
-  string class_name = get_class_name(object->_itype);
+  // The C# constructor name must match the (possibly nested) simple class name.
+  string class_name = get_simple_class_name(object->_itype);
   std::set<string> emitted_signatures;
   std::vector<string> internal_ctor_param_types;
   internal_ctor_param_types.push_back("IntPtr");
@@ -4372,6 +4717,395 @@ write_constructor(ostream &out, Function *func, Object *object, int indent_level
   }
 }
 
+void InterfaceMakerCSharp::
+write_operator_aliases(ostream &out, Object *object, int indent_level,
+                       std::set<string> *emitted_signatures,
+                       bool is_interface) {
+  if (object == nullptr) {
+    return;
+  }
+
+  string class_name = get_simple_class_name(object->_itype);
+  string declaring_type_name = is_interface
+    ? get_simple_interface_name(object->_itype)
+    : class_name;
+  InterrogateDatabase *idb = InterrogateDatabase::get_ptr();
+  std::vector<CSharpOperatorCandidate> candidates;
+  std::set<string> candidate_keys;
+  auto is_native_object_type = [&](TypeIndex type_index) {
+    type_index = unwrap_type_aliases(type_index);
+    if (type_index == 0) {
+      return false;
+    }
+    const InterrogateType &itype = idb->get_type(type_index);
+    return itype.is_class() || itype.is_struct() || itype.is_union();
+  };
+  auto add_candidate = [&](CSharpOperatorCandidate &&candidate) {
+    size_t arity = candidate.parameters.size();
+    bool valid = false;
+    if (is_equality_csharp_operator(candidate.symbol)) {
+      valid = arity == 2 && candidate.return_type == "bool";
+    } else if (is_ordered_csharp_operator(candidate.symbol)) {
+      valid = arity == 2 && candidate.return_type == "bool";
+    } else if ((candidate.symbol == "+" || candidate.symbol == "-") && (arity == 1 || arity == 2)) {
+      valid = true;
+    } else if (is_unary_csharp_operator(candidate.symbol)) {
+      valid = arity == 1;
+    } else if (is_binary_csharp_operator(candidate.symbol)) {
+      valid = arity == 2;
+    }
+    if (!valid) {
+      return;
+    }
+
+    string key = operator_signature_key(candidate.symbol, candidate);
+    if (candidate_keys.insert(key).second) {
+      candidates.push_back(std::move(candidate));
+    }
+  };
+
+  for (Function *func : object->_methods) {
+    if (func == nullptr) {
+      continue;
+    }
+
+    string method_name = make_csharp_identifier(func->_ifunc.get_name());
+    string symbol = get_csharp_operator_symbol(method_name);
+    if (symbol.empty()) {
+      continue;
+    }
+
+    for (FunctionRemap *remap : func->_remaps) {
+      if (remap == nullptr ||
+          (remap->_flags & FunctionRemap::F_explicit_self) != 0 ||
+          remap->_type == FunctionRemap::T_constructor ||
+          remap->_type == FunctionRemap::T_destructor ||
+          remap->_void_return ||
+          !remap->_has_this ||
+          !is_remap_legal_csharp(remap)) {
+        continue;
+      }
+
+      TypeIndex return_type_index = get_return_type_for_remap(remap);
+      bool return_nullable = is_return_nullable(remap);
+      string return_type = return_type_index != 0
+        ? get_csharp_signature_type(return_type_index, return_nullable)
+        : get_csharp_signature_type_for_wrapper(remap->_return_type, return_nullable);
+      if (return_type.empty()) {
+        continue;
+      }
+
+      CSharpOperatorCandidate candidate;
+      candidate.method_name = method_name;
+      candidate.symbol = symbol;
+      candidate.return_type = return_type;
+      candidate.parameters.push_back({declaring_type_name, "left", true, true});
+
+      bool bad_param = false;
+      for (size_t i = 1; i < remap->_parameters.size(); ++i) {
+        TypeIndex param_type_index = get_parameter_type_for_remap(remap, i);
+        bool param_nullable = is_parameter_nullable(remap, i);
+        string param_type = param_type_index != 0
+          ? get_csharp_signature_type(param_type_index, param_nullable)
+          : get_csharp_signature_type_for_wrapper(remap->_parameters[i]._remap, param_nullable);
+
+        if (csharp_stream_token_for_type(param_type_index) != AT_not_atomic) {
+          bad_param = true;
+          break;
+        }
+        if (param_type.empty()) {
+          bad_param = true;
+          break;
+        }
+
+        string param_name = get_csharp_parameter_name(remap, i);
+        if (param_name == "left" || param_name == "value") {
+          param_name = "param" + std::to_string(i - 1);
+        }
+        bool native_object = is_native_object_type(param_type_index);
+        bool nullable_reference = native_object || !is_csharp_operator_value_type_name(param_type);
+        candidate.parameters.push_back({param_type, param_name, nullable_reference, native_object});
+      }
+      if (bad_param) {
+        continue;
+      }
+
+      add_candidate(std::move(candidate));
+    }
+
+    if (!func->_remaps.empty()) {
+      continue;
+    }
+
+    int num_wrappers = func->_ifunc.number_of_c_wrappers();
+    for (int wi = 0; wi < num_wrappers; ++wi) {
+      FunctionWrapperIndex wrapper_index = func->_ifunc.get_c_wrapper(wi);
+      if (wrapper_index == 0) {
+        continue;
+      }
+
+      const InterrogateFunctionWrapper &wrapper = idb->get_wrapper(wrapper_index);
+      if (wrapper.is_explicit_self() || func->_ifunc.is_constructor() ||
+          func->_ifunc.is_destructor() || !is_wrapper_legal_csharp(wrapper) ||
+          !wrapper.has_return_value()) {
+        continue;
+      }
+
+      bool has_this = wrapper.number_of_parameters() != 0 && wrapper.parameter_is_this(0);
+      if (!has_this) {
+        continue;
+      }
+
+      TypeIndex return_type_index = wrapper.get_return_type();
+      string return_type = get_csharp_signature_type(return_type_index, wrapper.is_return_nullable());
+      if (return_type.empty()) {
+        continue;
+      }
+
+      CSharpOperatorCandidate candidate;
+      candidate.method_name = method_name;
+      candidate.symbol = symbol;
+      candidate.return_type = return_type;
+      candidate.parameters.push_back({declaring_type_name, "left", true, true});
+
+      bool bad_param = false;
+      for (int i = 1; i < wrapper.number_of_parameters(); ++i) {
+        TypeIndex param_type_index = wrapper.parameter_get_type(i);
+        if (csharp_stream_token_for_type(param_type_index) != AT_not_atomic) {
+          bad_param = true;
+          break;
+        }
+
+        bool param_nullable = wrapper.parameter_is_nullable(i);
+        string param_type = get_csharp_signature_type(param_type_index, param_nullable);
+        if (param_type.empty()) {
+          bad_param = true;
+          break;
+        }
+
+        string param_name = wrapper.parameter_has_name(i)
+          ? make_csharp_identifier(wrapper.parameter_get_name(i))
+          : string("param") + std::to_string(i - 1);
+        if (param_name == "left" || param_name == "value") {
+          param_name = "param" + std::to_string(i - 1);
+        }
+        bool native_object = is_native_object_type(param_type_index);
+        bool nullable_reference = native_object || !is_csharp_operator_value_type_name(param_type);
+        candidate.parameters.push_back({param_type, param_name, nullable_reference, native_object});
+      }
+      if (bad_param) {
+        continue;
+      }
+
+      add_candidate(std::move(candidate));
+    }
+  }
+
+  if (candidates.empty()) {
+    return;
+  }
+
+  std::map<string, const CSharpOperatorCandidate *> by_key;
+  for (const CSharpOperatorCandidate &candidate : candidates) {
+    by_key[operator_signature_key(candidate.symbol, candidate)] = &candidate;
+  }
+
+  std::set<string> local_emitted;
+  std::set<string> &emitted =
+    emitted_signatures != nullptr ? *emitted_signatures : local_emitted;
+
+  auto emit_param_list = [&](const CSharpOperatorCandidate &candidate, bool equality) {
+    for (size_t i = 0; i < candidate.parameters.size(); ++i) {
+      if (i != 0) {
+        out << ", ";
+      }
+      const CSharpOperatorParam &param = candidate.parameters[i];
+      string type = param.type;
+      string name = param.name;
+      if (i == 0) {
+        name = candidate.parameters.size() == 1 ? "value" : "left";
+        if (equality) {
+          type += "?";
+        }
+      } else if (equality) {
+        type = make_nullable_operator_type(param);
+      }
+      out << type << " " << name;
+    }
+  };
+
+  auto emit_call_args = [&](const CSharpOperatorCandidate &candidate, bool suppress_nullable) {
+    for (size_t i = 1; i < candidate.parameters.size(); ++i) {
+      if (i != 1) {
+        out << ", ";
+      }
+      out << candidate.parameters[i].name;
+      if (suppress_nullable && candidate.parameters[i].nullable_reference) {
+        out << "!";
+      }
+    }
+  };
+
+  auto emit_regular = [&](const CSharpOperatorCandidate &candidate, const string &symbol) {
+    string key = "O:" + operator_signature_key(symbol, candidate);
+    if (!emitted.insert(key).second) {
+      return;
+    }
+
+    indent(out, indent_level) << "public static " << candidate.return_type
+                              << " operator " << symbol << "(";
+    emit_param_list(candidate, false);
+    out << ") => ";
+    string receiver = candidate.parameters.size() == 1 ? "value" : "left";
+    out << receiver << "." << candidate.method_name << "(";
+    emit_call_args(candidate, false);
+    out << ");\n\n";
+  };
+
+  auto right_null_expression = [](const CSharpOperatorParam &param, const string &native_var) -> string {
+    if (!param.nullable_reference) {
+      return "false";
+    }
+    if (!param.native_object) {
+      return param.name + " is null";
+    }
+    return "(" + param.name + " is null || " + param.name +
+      " is INativeObject " + native_var + " && " + native_var + ".NativeHandle == IntPtr.Zero)";
+  };
+
+  auto emit_equality_overrides = [&](const std::vector<const CSharpOperatorCandidate *> &equality_candidates) {
+    if (equality_candidates.empty() || !emitted.insert("O:EqualsOverride").second) {
+      return;
+    }
+
+    std::vector<const CSharpOperatorCandidate *> equals_checks;
+    std::set<string> equals_param_types;
+    for (const CSharpOperatorCandidate *candidate : equality_candidates) {
+      if (candidate == nullptr || candidate->parameters.size() != 2) {
+        continue;
+      }
+
+      string param_type = strip_nullable_operator_type(candidate->parameters[1].type);
+      if (param_type.empty()) {
+        continue;
+      }
+
+      if (candidate->symbol == "==" && equals_param_types.insert(param_type).second) {
+        equals_checks.push_back(candidate);
+      }
+    }
+    for (const CSharpOperatorCandidate *candidate : equality_candidates) {
+      if (candidate == nullptr || candidate->parameters.size() != 2) {
+        continue;
+      }
+
+      string param_type = strip_nullable_operator_type(candidate->parameters[1].type);
+      if (param_type.empty()) {
+        continue;
+      }
+
+      if (candidate->symbol == "!=" && equals_param_types.insert(param_type).second) {
+        equals_checks.push_back(candidate);
+      }
+    }
+
+    if (equals_checks.empty()) {
+      return;
+    }
+
+    indent(out, indent_level) << "public override bool Equals(object? obj) {\n";
+    indent(out, indent_level + 2) << "if (ReferenceEquals(this, obj)) {\n";
+    indent(out, indent_level + 4) << "return true;\n";
+    indent(out, indent_level + 2) << "}\n";
+    indent(out, indent_level + 2) << "if (NativeHandle == IntPtr.Zero) {\n";
+    indent(out, indent_level + 4) << "return obj is INativeObject __p3objNativeNull && __p3objNativeNull.NativeHandle == IntPtr.Zero;\n";
+    indent(out, indent_level + 2) << "}\n";
+    indent(out, indent_level + 2) << "if (obj is INativeObject __p3objNative && __p3objNative.NativeHandle == IntPtr.Zero) {\n";
+    indent(out, indent_level + 4) << "return false;\n";
+    indent(out, indent_level + 2) << "}\n";
+
+    for (size_t i = 0; i < equals_checks.size(); ++i) {
+      const CSharpOperatorCandidate &candidate = *equals_checks[i];
+      const CSharpOperatorParam &right = candidate.parameters[1];
+      string param_type = strip_nullable_operator_type(right.type);
+      string var_name = "__p3eqOther" + std::to_string(i);
+
+      indent(out, indent_level + 2) << "if (obj is " << param_type << " " << var_name << ") {\n";
+      indent(out, indent_level + 4) << "return ";
+      if (candidate.symbol == "!=") {
+        out << "!";
+      }
+      out << "this." << candidate.method_name << "(" << var_name << ");\n";
+      indent(out, indent_level + 2) << "}\n";
+    }
+
+    indent(out, indent_level + 2) << "return false;\n";
+    indent(out, indent_level) << "}\n";
+    indent(out, indent_level) << "public override int GetHashCode() => typeof("
+                              << class_name << ").GetHashCode();\n\n";
+  };
+
+  auto emit_equality_pair = [&](const CSharpOperatorCandidate &candidate) {
+    string eq_key = "O:" + operator_signature_key("==", candidate);
+    string ne_key = "O:" + operator_signature_key("!=", candidate);
+    if (!emitted.insert(eq_key).second) {
+      return;
+    }
+    emitted.insert(ne_key);
+
+    const CSharpOperatorParam &right = candidate.parameters[1];
+    string right_null_left_check = right_null_expression(right, "__p3rightNativeLeft");
+
+    indent(out, indent_level) << "public static bool operator ==(";
+    emit_param_list(candidate, true);
+    out << ") {\n";
+    indent(out, indent_level + 2) << "if (left is null || left.NativeHandle == IntPtr.Zero) {\n";
+    indent(out, indent_level + 4) << "return " << right_null_left_check << ";\n";
+    indent(out, indent_level + 2) << "}\n";
+    indent(out, indent_level + 2) << "return left.Equals(" << right.name << ");\n";
+    indent(out, indent_level) << "}\n";
+    indent(out, indent_level) << "public static bool operator !=(";
+    emit_param_list(candidate, true);
+    out << ") => !(left == " << right.name << ");\n\n";
+
+  };
+
+  std::vector<const CSharpOperatorCandidate *> equality_candidates;
+  for (const CSharpOperatorCandidate &candidate : candidates) {
+    if (is_equality_csharp_operator(candidate.symbol)) {
+      equality_candidates.push_back(&candidate);
+    }
+  }
+  if (!is_interface) {
+    emit_equality_overrides(equality_candidates);
+  }
+
+  for (const CSharpOperatorCandidate &candidate : candidates) {
+    if (is_equality_csharp_operator(candidate.symbol)) {
+      if (!is_interface) {
+        emit_equality_pair(candidate);
+      }
+      continue;
+    }
+
+    if (is_ordered_csharp_operator(candidate.symbol)) {
+      string opposite = opposite_ordered_operator(candidate.symbol);
+      string pair_key = operator_signature_key(opposite, candidate);
+      auto pair_it = by_key.find(pair_key);
+      if (pair_it == by_key.end()) {
+        continue;
+      }
+      if (candidate.symbol == "<" || candidate.symbol == "<=") {
+        emit_regular(candidate, candidate.symbol);
+        emit_regular(*pair_it->second, opposite);
+      }
+      continue;
+    }
+
+    emit_regular(candidate, candidate.symbol);
+  }
+}
+
 /**
  *
  */
@@ -4481,7 +5215,7 @@ write_method(ostream &out, Function *func, Object *object, int indent_level,
     }
 
     int inherited_kind = object != nullptr
-      ? inherited_method_signature_kind(object->_itype, method_name, param_types, is_static,
+      ? inherited_method_signature_kind(object->_itype, method_name, param_types, return_type, is_static,
                                         !is_interface)
       : 0;
 
@@ -4505,7 +5239,7 @@ write_method(ostream &out, Function *func, Object *object, int indent_level,
         out << "override ";
       } else if (inherited_kind == 1) {
         out << "new ";
-      } else if (func->_ifunc.is_virtual()) {
+      } else {
         out << "virtual ";
       }
     }
@@ -4521,7 +5255,7 @@ write_method(ostream &out, Function *func, Object *object, int indent_level,
     string alias_name = to_pascal_case(method_name);
     string alias_signature_key = build_signature_key(alias_name, param_types, is_static);
     int inherited_alias_kind = object != nullptr
-      ? inherited_method_signature_kind(object->_itype, alias_name, param_types, is_static,
+      ? inherited_method_signature_kind(object->_itype, alias_name, param_types, return_type, is_static,
                                         !is_interface)
       : 0;
 
@@ -4626,7 +5360,7 @@ write_method(ostream &out, Function *func, Object *object, int indent_level,
     if (is_static) {
       string type_prefix = "global::" + prettify_namespace(_current_module_name) + ".";
       if (object != nullptr) {
-        alias_call = type_prefix + get_class_name(object->_itype) + "." + method_name;
+        alias_call = type_prefix + get_nested_class_name(object->_itype) + "." + method_name;
       } else {
         alias_call = type_prefix + get_globals_class_name(_current_module_name) +
           "." + method_name;
@@ -4634,7 +5368,6 @@ write_method(ostream &out, Function *func, Object *object, int indent_level,
     }
     if (!is_interface && alias_name != method_name && alias_name != "Dispose" &&
         !is_blocked_pascal_alias(alias_name) &&
-        (is_static || inherited_alias_kind == 0) &&
         signature_set.find("N:" + alias_name) == signature_set.end() &&
         signature_set.find("R:" + alias_signature_key) == signature_set.end() &&
         signature_set.insert("A:" + alias_signature_key).second) {
@@ -4645,6 +5378,12 @@ write_method(ostream &out, Function *func, Object *object, int indent_level,
           out << "new ";
         }
         out << "static ";
+      } else if (inherited_alias_kind == 2) {
+        out << "override ";
+      } else if (inherited_alias_kind == 1) {
+        out << "new ";
+      } else {
+        out << "virtual ";
       }
       out << return_type << " " << alias_name << "(";
       for (size_t i = 0; i < param_decls.size(); ++i) {
@@ -4759,7 +5498,7 @@ write_method(ostream &out, Function *func, Object *object, int indent_level,
     }
 
     int inherited_kind = object != nullptr
-      ? inherited_method_signature_kind(object->_itype, method_name, param_types, is_static,
+      ? inherited_method_signature_kind(object->_itype, method_name, param_types, return_type, is_static,
                                         !is_interface)
       : 0;
 
@@ -4783,7 +5522,7 @@ write_method(ostream &out, Function *func, Object *object, int indent_level,
         out << "override ";
       } else if (inherited_kind == 1) {
         out << "new ";
-      } else if (func->_ifunc.is_virtual()) {
+      } else {
         out << "virtual ";
       }
     }
@@ -4799,7 +5538,7 @@ write_method(ostream &out, Function *func, Object *object, int indent_level,
     string alias_name = to_pascal_case(method_name);
     string alias_signature_key = build_signature_key(alias_name, param_types, is_static);
     int inherited_alias_kind = object != nullptr
-      ? inherited_method_signature_kind(object->_itype, alias_name, param_types, is_static,
+      ? inherited_method_signature_kind(object->_itype, alias_name, param_types, return_type, is_static,
                                         !is_interface)
       : 0;
 
@@ -4897,7 +5636,7 @@ write_method(ostream &out, Function *func, Object *object, int indent_level,
     if (is_static) {
       string type_prefix = "global::" + prettify_namespace(_current_module_name) + ".";
       if (object != nullptr) {
-        alias_call = type_prefix + get_class_name(object->_itype) + "." + method_name;
+        alias_call = type_prefix + get_nested_class_name(object->_itype) + "." + method_name;
       } else {
         alias_call = type_prefix + get_globals_class_name(_current_module_name) +
           "." + method_name;
@@ -4905,7 +5644,6 @@ write_method(ostream &out, Function *func, Object *object, int indent_level,
     }
     if (alias_name != method_name && alias_name != "Dispose" &&
         !is_blocked_pascal_alias(alias_name) &&
-        (is_static || inherited_alias_kind == 0) &&
         signature_set.find("N:" + alias_name) == signature_set.end() &&
         signature_set.find("R:" + alias_signature_key) == signature_set.end() &&
         signature_set.insert("A:" + alias_signature_key).second) {
@@ -4916,6 +5654,12 @@ write_method(ostream &out, Function *func, Object *object, int indent_level,
           out << "new ";
         }
         out << "static ";
+      } else if (inherited_alias_kind == 2) {
+        out << "override ";
+      } else if (inherited_alias_kind == 1) {
+        out << "new ";
+      } else {
+        out << "virtual ";
       }
       out << return_type << " " << alias_name << "(";
       for (size_t i = 0; i < param_decls.size(); ++i) {
@@ -5155,6 +5899,20 @@ write_property_from_wrapper(ostream &out, const InterrogateElement &ielement,
   const InterrogateFunctionWrapper *setter_w =
     ielement.has_setter() ? first_legal_wrapper(ielement.get_setter(), setter_func) : nullptr;
 
+  // Only simple accessors become properties: the getter takes just `this`, and the setter takes
+  // `this` + exactly one value. Indexed/sequence accessors (extra parameters) are handled by the
+  // indexer/MakeSeq machinery, not here.
+  if (getter_w != nullptr) {
+    int gp = getter_w->number_of_parameters();
+    int gfirst = (gp != 0 && getter_w->parameter_is_this(0)) ? 1 : 0;
+    if (gp - gfirst != 0) getter_w = nullptr;
+  }
+  if (setter_w != nullptr) {
+    int sp = setter_w->number_of_parameters();
+    int sfirst = (sp != 0 && setter_w->parameter_is_this(0)) ? 1 : 0;
+    if (sp - sfirst != 1) setter_w = nullptr;
+  }
+
   if (getter_w == nullptr && setter_w == nullptr) {
     return;
   }
@@ -5183,7 +5941,9 @@ write_property_from_wrapper(ostream &out, const InterrogateElement &ielement,
     } else {
       ret_idx = getter_w->get_return_type();
       ret_nullable = getter_w->is_return_nullable();
-      property_type = get_csharp_signature_type(ret_idx, ret_nullable);
+      // Concrete type (get_qualified_class_name) — this is what a native-object property's
+      // __CreateFromNative is a static member of; the interface (get_csharp_signature_type) has none.
+      property_type = get_csharp_type(ret_idx, true);
     }
   }
 
@@ -5192,7 +5952,7 @@ write_property_from_wrapper(ostream &out, const InterrogateElement &ielement,
     int vparam = (setter_w->number_of_parameters() != 0 && setter_w->parameter_is_this(0)) ? 1 : 0;
     if (vparam < setter_w->number_of_parameters()) {
       value_idx = setter_w->parameter_get_type(vparam);
-      string value_type = get_csharp_signature_type(value_idx, setter_w->parameter_is_nullable(vparam));
+      string value_type = get_csharp_type(value_idx, true);
       if (property_type.empty()) {
         property_type = value_type;
       } else if (value_type != property_type) {
@@ -5204,6 +5964,18 @@ write_property_from_wrapper(ostream &out, const InterrogateElement &ielement,
   }
 
   if (property_type.empty() || property_type == "void") {
+    return;
+  }
+
+  // Only value-typed members (primitive / bool / enum / string). Native-object,
+  // collection-facade and cross-module-abstract types need handling the plain
+  // wrapper fallback lacks, so skip them rather than emit an unresolvable type.
+  TypeIndex primary_idx = (getter_w != nullptr) ? ret_idx : value_idx;
+  bool is_value_type = is_csharp_enum_type(primary_idx)
+                    || is_csharp_primitive_type(property_type)
+                    || property_type == "bool"
+                    || property_type == "string" || property_type == "string?";
+  if (!is_value_type) {
     return;
   }
 
@@ -5244,20 +6016,22 @@ write_property_from_wrapper(ostream &out, const InterrogateElement &ielement,
 
     if (is_csharp_enum_type(ret_idx)) {
       indent(out, indent_level + 4) << "return (" << property_type << ")" << native_call << ";\n";
-    } else if (is_csharp_native_object_type(ret_idx, property_type)) {
-      indent(out, indent_level + 4) << "IntPtr result = " << native_call << ";\n";
-      indent(out, indent_level + 4) << "return " << property_type << ".__CreateFromNative(result, "
-                                    << get_native_ownership_name(*getter_w, false) << ")";
-      if (!ret_nullable) {
-        out << " ?? throw new InvalidOperationException(\"Native getter returned null.\")";
-      }
-      out << ";\n";
-    } else if (get_pinvoke_type(ret_idx, true) == "string") {
-      if (ret_nullable) {
-        indent(out, indent_level + 4) << "return " << native_call << ";\n";
+    } else if (property_type == "string" || property_type == "string?") {
+      // The P/Invoke may marshal the string itself (returns string) or return a raw IntPtr.
+      if (get_pinvoke_type(ret_idx, true) == "string") {
+        if (ret_nullable) {
+          indent(out, indent_level + 4) << "return " << native_call << ";\n";
+        } else {
+          indent(out, indent_level + 4) << "return " << native_call
+                                        << " ?? throw new InvalidOperationException(\"Native getter returned null.\");\n";
+        }
       } else {
-        indent(out, indent_level + 4) << "return " << native_call
-                                      << " ?? throw new InvalidOperationException(\"Native getter returned null.\");\n";
+        indent(out, indent_level + 4) << "IntPtr result = " << native_call << ";\n";
+        if (ret_nullable) {
+          indent(out, indent_level + 4) << "return result == IntPtr.Zero ? null : Marshal.PtrToStringUTF8(result);\n";
+        } else {
+          indent(out, indent_level + 4) << "return result == IntPtr.Zero ? throw new InvalidOperationException(\"Native getter returned null.\") : Marshal.PtrToStringUTF8(result)!;\n";
+        }
       }
     } else {
       indent(out, indent_level + 4) << "return " << native_call << ";\n";
@@ -5268,7 +6042,7 @@ write_property_from_wrapper(ostream &out, const InterrogateElement &ielement,
   if (setter_w != nullptr) {
     indent(out, indent_level + 2) << "set {\n";
     string this_arg = has_this ? get_native_this_argument(object->_itype, setter_func->_ifunc) : "";
-    string value_type = get_csharp_signature_type(value_idx, false);
+    string value_type = get_csharp_type(value_idx, false);
     string native_call = get_pinvoke_call_name(setter_func->_ifunc, *setter_w) + "(";
     if (has_this) {
       native_call += this_arg + ", ";
@@ -6006,6 +6780,9 @@ get_secondary_base_types(const InterrogateType &itype,
         if (should_skip_csharp_type(*base_type)) {
           continue;
         }
+        if (!uses_csharp_interface(*base_type)) {
+          continue;
+        }
 
         if (!has_members(*base_type) && ensure_database_loaded(*base_type)) {
           base_type = &idb->get_type(base_index);
@@ -6085,6 +6862,7 @@ request_external_database(const Filename &database_file) const {
   InterrogateDatabase *idb = InterrogateDatabase::get_ptr();
   idb->request_module(&_external_database_requests.back());
   (void)idb->get_num_all_types();
+  _csharp_interface_cache_valid = false;
 }
 
 
@@ -6365,7 +7143,7 @@ get_csharp_type(TypeIndex type_index, bool for_return) const {
         if (is_collection_facade_type(inner_type)) {
           return get_qualified_class_name(inner_type) + (for_return ? "?" : "");
         }
-        return get_qualified_interface_name(inner_type) + (for_return ? "?" : "");
+        return get_public_native_object_type_name(inner_type, for_return);
       }
     }
     return "IntPtr";
@@ -6374,7 +7152,7 @@ get_csharp_type(TypeIndex type_index, bool for_return) const {
     return get_qualified_class_name(itype);
   }
   if (itype.is_class() || itype.is_struct()) {
-    return get_qualified_interface_name(itype) + (for_return ? "?" : "");
+    return get_public_native_object_type_name(itype, for_return);
   }
   if (itype.is_wrapped()) {
     return get_csharp_type(itype.get_wrapped_type(), for_return);
@@ -6453,7 +7231,7 @@ get_csharp_signature_type(CPPType *type, bool for_return) const {
       if (should_skip_csharp_type(*itype)) {
         return "";
       }
-      return get_qualified_interface_name(*itype) + (for_return ? "?" : "");
+      return get_public_native_object_type_name(*itype, for_return);
     }
   }
 
@@ -6472,7 +7250,7 @@ get_csharp_signature_type(CPPType *type, bool for_return) const {
     if (should_skip_csharp_type(*named_type)) {
       return "";
     }
-    return get_qualified_interface_name(*named_type);
+    return get_public_native_object_type_name(*named_type, for_return);
   }
 
   return type_name;
@@ -6534,7 +7312,7 @@ get_csharp_signature_type(TypeIndex type_index, bool for_return) const {
     if (should_skip_csharp_type(itype)) {
       return "";
     }
-    return get_qualified_interface_name(itype) + (for_return ? "?" : "");
+    return get_public_native_object_type_name(itype, for_return);
   }
   if (itype.is_pointer()) {
     TypeIndex inner = unwrap_type_aliases(itype.get_wrapped_type());
@@ -6544,7 +7322,7 @@ get_csharp_signature_type(TypeIndex type_index, bool for_return) const {
         if (should_skip_csharp_type(inner_type)) {
           return "";
         }
-        return get_qualified_interface_name(inner_type) + (for_return ? "?" : "");
+        return get_public_native_object_type_name(inner_type, for_return);
       }
     }
   }
@@ -6702,6 +7480,192 @@ get_class_name(const InterrogateType &itype) const {
 }
 
 /**
+ * True if this type is nested inside another C++ class that we can emit as a
+ * (partial) C# class, so it should be generated as a real nested C# type.
+ */
+bool InterfaceMakerCSharp::
+should_nest_type(const InterrogateType &itype) const {
+  TypeIndex outer_idx = itype.get_outer_class();
+  if (outer_idx == 0) {
+    return false;
+  }
+  // Only nest genuine classes/structs.  Enums are deliberately NOT nested:
+  // Panda pairs almost every nested enum with a same-named accessor (enum Format
+  // + get_format() -> property Format), and some share the outer type's own name
+  // (ShaderAttrib::ShaderAttrib).  C# forbids a nested type and a member (or the
+  // enclosing type) sharing a name (CS0102/CS0542), so nested enums stay
+  // top-level (e.g. Texture_Format) and only carry the PascalCase value cleanup.
+  if (!(itype.is_class() || itype.is_struct())) {
+    return false;
+  }
+  InterrogateDatabase *idb = InterrogateDatabase::get_ptr();
+  const InterrogateType &outer = idb->get_type(outer_idx);
+  if (!(outer.is_class() || outer.is_struct())) {
+    return false;
+  }
+  if (should_skip_csharp_type(outer) ||
+      is_collection_facade_type(outer) ||
+      is_empty_pointer_facade_type(outer)) {
+    return false;
+  }
+  // A nested type may not share the simple name of its enclosing type (CS0542).
+  // Compare raw local names directly to avoid recursing back into this helper.
+  auto local_name = [](const InterrogateType &t) -> string {
+    if (t.has_name()) {
+      return make_csharp_identifier(t.get_name());
+    }
+    if (t.has_scoped_name()) {
+      return make_csharp_identifier(InterrogateBuilder::descope(t.get_scoped_name()));
+    }
+    return string();
+  };
+  string self_name = local_name(itype);
+  if (!self_name.empty() && self_name == local_name(outer)) {
+    return false;
+  }
+  return true;
+}
+
+/**
+ * Fills `out` with the enclosing classes of a nested type, outermost first
+ * (empty for a top-level type).  Stops climbing as soon as an enclosing class
+ * is not itself nestable, so every entry is safe to emit as a partial class.
+ */
+void InterfaceMakerCSharp::
+get_outer_class_chain(const InterrogateType &itype,
+                      std::vector<const InterrogateType *> &out) const {
+  InterrogateDatabase *idb = InterrogateDatabase::get_ptr();
+  std::vector<const InterrogateType *> inner_first;
+  const InterrogateType *cur = &itype;
+  while (should_nest_type(*cur)) {
+    const InterrogateType &outer = idb->get_type(cur->get_outer_class());
+    inner_first.push_back(&outer);
+    cur = &outer;
+  }
+  out.assign(inner_first.rbegin(), inner_first.rend());
+}
+
+/**
+ * Underscore-free flattened name for a type that has an enclosing class but is
+ * NOT emitted as a nested C# type (i.e. enums): AsyncTask::DoneStatus ->
+ * AsyncTaskDoneStatus, A::B::C -> ABC.  Top-level types return their plain name.
+ */
+string InterfaceMakerCSharp::
+get_flat_display_name(const InterrogateType &itype) const {
+  string simple;
+  if (itype.has_name()) {
+    simple = make_csharp_identifier(itype.get_name());
+  } else if (itype.has_scoped_name()) {
+    simple = make_csharp_identifier(InterrogateBuilder::descope(itype.get_scoped_name()));
+  } else {
+    return get_class_name(itype);
+  }
+  TypeIndex outer_idx = itype.get_outer_class();
+  if (outer_idx == 0) {
+    return simple;
+  }
+  InterrogateDatabase *idb = InterrogateDatabase::get_ptr();
+  const InterrogateType &outer = idb->get_type(outer_idx);
+  return get_flat_display_name(outer) + simple;
+}
+
+/**
+ * The innermost simple identifier for a nested type's C# declaration
+ * (e.g. "AxisState" for InputDevice::AxisState).  A non-nested type that still
+ * has an enclosing class (an enum) uses the underscore-free flattened name
+ * (AsyncTaskDoneStatus); a genuine top-level type uses its plain class name.
+ */
+string InterfaceMakerCSharp::
+get_simple_class_name(const InterrogateType &itype) const {
+  if (!should_nest_type(itype)) {
+    if (itype.get_outer_class() != 0) {
+      return get_flat_display_name(itype);
+    }
+    return get_class_name(itype);
+  }
+  if (itype.has_name()) {
+    return make_csharp_identifier(itype.get_name());
+  }
+  if (itype.has_scoped_name()) {
+    return make_csharp_identifier(InterrogateBuilder::descope(itype.get_scoped_name()));
+  }
+  return get_class_name(itype);
+}
+
+/**
+ * The dotted C# reference path for a type (e.g. "InputDevice.AxisState").
+ * Enums (non-nested but enclosed) resolve to the underscore-free flattened name;
+ * a genuine top-level type resolves to its plain class name.
+ */
+string InterfaceMakerCSharp::
+get_nested_class_name(const InterrogateType &itype) const {
+  if (!should_nest_type(itype)) {
+    if (itype.get_outer_class() != 0) {
+      return get_flat_display_name(itype);
+    }
+    return get_class_name(itype);
+  }
+  InterrogateDatabase *idb = InterrogateDatabase::get_ptr();
+  const InterrogateType &outer = idb->get_type(itype.get_outer_class());
+  return get_nested_class_name(outer) + "." + get_simple_class_name(itype);
+}
+
+/**
+ * The simple interface identifier for a nested type ("IAxisState"); the full
+ * collision-aware interface name for a top-level type.
+ */
+string InterfaceMakerCSharp::
+get_simple_interface_name(const InterrogateType &itype) const {
+  if (!should_nest_type(itype)) {
+    return get_interface_name(itype);
+  }
+  return "I" + get_simple_class_name(itype);
+}
+
+/**
+ * The dotted C# reference path for a type's interface
+ * (e.g. "InputDevice.IAxisState").  The nested interface lives inside the
+ * enclosing *class*, so the outer path uses the class name.
+ */
+string InterfaceMakerCSharp::
+get_nested_interface_name(const InterrogateType &itype) const {
+  if (!should_nest_type(itype)) {
+    return get_interface_name(itype);
+  }
+  InterrogateDatabase *idb = InterrogateDatabase::get_ptr();
+  const InterrogateType &outer = idb->get_type(itype.get_outer_class());
+  return get_nested_class_name(outer) + "." + get_simple_interface_name(itype);
+}
+
+/**
+ * Opens a `public partial class Outer {` wrapper for each enclosing class
+ * (outermost first) so a nested type can be written as a real C# nested type.
+ * Returns the number of wrappers opened; pass it to close_nesting_wrappers.
+ */
+int InterfaceMakerCSharp::
+open_nesting_wrappers(ostream &out, const InterrogateType &itype) const {
+  std::vector<const InterrogateType *> chain;
+  get_outer_class_chain(itype, chain);
+  int level = 1;
+  for (const InterrogateType *outer : chain) {
+    indent(out, level * 2)
+      << "public partial class " << get_simple_class_name(*outer) << " {\n";
+    ++level;
+  }
+  return (int)chain.size();
+}
+
+/**
+ * Closes the `count` partial-class wrappers opened by open_nesting_wrappers.
+ */
+void InterfaceMakerCSharp::
+close_nesting_wrappers(ostream &out, int count) const {
+  for (int i = count; i >= 1; --i) {
+    indent(out, i * 2) << "}\n";
+  }
+}
+
+/**
  *
  */
 string InterfaceMakerCSharp::
@@ -6796,7 +7760,7 @@ get_type_module_name(const InterrogateType &itype) const {
 
 string InterfaceMakerCSharp::
 get_qualified_class_name(const InterrogateType &itype) const {
-  string name = get_class_name(itype);
+  string name = get_nested_class_name(itype);
   string type_module = get_type_module_name(itype);
 
   if (!_current_module_name.empty() && !type_module.empty() &&
@@ -6812,7 +7776,7 @@ get_qualified_interface_name(const InterrogateType &itype) const {
   if (is_collection_facade_type(itype)) {
     return get_qualified_class_name(itype);
   }
-  string name = get_interface_name(itype);
+  string name = get_nested_interface_name(itype);
   string type_module = get_type_module_name(itype);
 
   if (!_current_module_name.empty() && !type_module.empty() &&
@@ -6821,6 +7785,114 @@ get_qualified_interface_name(const InterrogateType &itype) const {
   }
 
   return name;
+}
+
+bool InterfaceMakerCSharp::
+uses_csharp_interface(const InterrogateType &itype) const {
+  InterrogateDatabase *idb = InterrogateDatabase::get_ptr();
+  int type_count = idb->get_num_all_types();
+  if (!_csharp_interface_cache_valid ||
+      _csharp_interface_cache_type_count != type_count) {
+    rebuild_csharp_interface_cache();
+  }
+
+  TypeIndex type_index = get_type_index_for_interrogate_type(itype);
+  return type_index != 0 &&
+         _csharp_interface_type_indices.find(type_index) != _csharp_interface_type_indices.end();
+}
+
+bool InterfaceMakerCSharp::
+mark_csharp_interface_base_chain(TypeIndex type_index,
+                                 std::set<TypeIndex> &visited) const {
+  type_index = unwrap_type_aliases(type_index);
+  if (type_index == 0 || !visited.insert(type_index).second) {
+    return false;
+  }
+
+  InterrogateDatabase *idb = InterrogateDatabase::get_ptr();
+  const InterrogateType &itype = idb->get_type(type_index);
+  if (!(itype.is_class() || itype.is_struct())) {
+    return false;
+  }
+
+  _csharp_interface_type_indices.insert(type_index);
+
+  int num_derivations = itype.number_of_derivations();
+  for (int di = 0; di < num_derivations; ++di) {
+    if (itype.derivation_is_pointer_to(di)) {
+      continue;
+    }
+    TypeIndex base_index = itype.get_derivation(di);
+    if (base_index != 0 && is_wrapped_type(base_index)) {
+      mark_csharp_interface_base_chain(base_index, visited);
+    }
+  }
+
+  return true;
+}
+
+void InterfaceMakerCSharp::
+rebuild_csharp_interface_cache() const {
+  InterrogateDatabase *idb = InterrogateDatabase::get_ptr();
+  _csharp_interface_type_indices.clear();
+
+  int type_count = idb->get_num_all_types();
+  for (int i = 0; i < type_count; ++i) {
+    TypeIndex type_index = idb->get_all_type(i);
+    if (type_index == 0) {
+      continue;
+    }
+
+    const InterrogateType &itype = idb->get_type(type_index);
+    if (!(itype.is_class() || itype.is_struct())) {
+      continue;
+    }
+
+    if (itype.has_forced_complex_inheritance()) {
+      _csharp_interface_type_indices.insert(type_index);
+    }
+
+    int real_derivations = 0;
+    int num_derivations = itype.number_of_derivations();
+    for (int di = 0; di < num_derivations; ++di) {
+      if (itype.derivation_is_pointer_to(di)) {
+        continue;
+      }
+      TypeIndex base_index = itype.get_derivation(di);
+      if (base_index != 0 && is_wrapped_type(base_index)) {
+        ++real_derivations;
+      }
+    }
+
+    if (real_derivations > 1) {
+      _csharp_interface_type_indices.insert(type_index);
+      std::set<TypeIndex> visited;
+      for (int di = 0; di < num_derivations; ++di) {
+        if (itype.derivation_is_pointer_to(di)) {
+          continue;
+        }
+        TypeIndex base_index = itype.get_derivation(di);
+        if (base_index != 0 && is_wrapped_type(base_index)) {
+          mark_csharp_interface_base_chain(base_index, visited);
+        }
+      }
+    }
+  }
+
+  _csharp_interface_cache_type_count = type_count;
+  _csharp_interface_cache_valid = true;
+}
+
+string InterfaceMakerCSharp::
+get_public_native_object_type_name(const InterrogateType &itype,
+                                   bool for_return) const {
+  string result = uses_csharp_interface(itype)
+    ? get_qualified_interface_name(itype)
+    : get_qualified_class_name(itype);
+  if (for_return) {
+    result += "?";
+  }
+  return result;
 }
 
 /**
@@ -6884,7 +7956,8 @@ get_interface_list(const InterrogateType &itype) const {
   collect(itype);
 
   for (const InterrogateType *base_type : all_secondary_bases) {
-    if (is_collection_facade_type(*base_type)) {
+    if (is_collection_facade_type(*base_type) ||
+        !uses_csharp_interface(*base_type)) {
       continue;
     }
 
@@ -6922,6 +7995,9 @@ get_interface_base_list(const InterrogateType &itype) const {
 
     const InterrogateType &base_type = idb->get_type(base_index);
     if (is_collection_facade_type(base_type)) {
+      continue;
+    }
+    if (!uses_csharp_interface(base_type)) {
       continue;
     }
 
@@ -7038,7 +8114,10 @@ get_collection_element_type_from_cpp_name(const string &cpp_name, bool for_signa
     type_index = unwrap_type_aliases(type_index);
     if (type_index != 0) {
       const InterrogateType &itype = idb->get_type(type_index);
-      return for_signature ? get_interface_name(itype) : get_class_name(itype);
+      if (for_signature && uses_csharp_interface(itype)) {
+        return get_interface_name(itype);
+      }
+      return get_class_name(itype);
     }
   }
 
@@ -7105,20 +8184,83 @@ get_collection_helper_name(const InterrogateType &itype, const string &op) const
 }
 
 /**
- * Returns 0 if no inherited member with the same signature exists, 1 if a
- * non-virtual inherited member exists, and 2 if a virtual inherited member
- * exists.  When primary_chain_only is true, only the primary C# class chain is
+ * Returns 0 if no inherited member with the same signature exists, 1 if an
+ * inherited member exists but cannot be overridden due to managed return-type
+ * incompatibility, and 2 if the inherited member is override-compatible.
+ * Generated C# instance methods are all virtual, but C# still requires matching
+ * return types for overrides; incompatible hiders are emitted with `new`.
+ * When primary_chain_only is true, only the primary C# class chain is
  * considered; otherwise, the full wrapped interface-base closure is checked.
  */
 int InterfaceMakerCSharp::
 inherited_method_signature_kind(const InterrogateType &itype,
                                 const string &method_name,
                                 const std::vector<string> &param_types,
+                                const string &return_type,
                                 bool is_static,
                                 bool primary_chain_only) {
   InterrogateDatabase *idb = InterrogateDatabase::get_ptr();
   std::set<TypeIndex> seen;
   string target_sig = build_signature_key(method_name, param_types, is_static);
+
+  auto make_remap_parameter_types = [&](FunctionRemap *remap) {
+    std::vector<string> result;
+    size_t first_param = remap->_has_this ? 1 : 0;
+    for (size_t i = first_param; i < remap->_parameters.size(); ++i) {
+      ParameterRemap *param_remap = remap->_parameters[i]._remap;
+      TypeIndex param_type_index = get_parameter_type_for_remap(remap, i);
+      bool param_nullable = is_parameter_nullable(remap, i);
+      string param_type = (param_type_index != 0)
+        ? get_csharp_signature_type(param_type_index, param_nullable)
+        : get_csharp_signature_type_for_wrapper(param_remap, param_nullable);
+
+      AtomicToken stream_tok = csharp_stream_token_for_type(param_type_index);
+      if (stream_tok != AT_not_atomic) {
+        param_type = "global::System.IO.Stream";
+      }
+
+      result.push_back(param_type);
+    }
+    return result;
+  };
+
+  auto make_wrapper_parameter_types = [&](const InterrogateFunctionWrapper &wrapper,
+                                         bool wrapper_static) {
+    std::vector<string> result;
+    int first_param = wrapper_static ? 0 : 1;
+    for (int i = first_param; i < wrapper.number_of_parameters(); ++i) {
+      TypeIndex param_type_index = wrapper.parameter_get_type(i);
+      string param_type = get_csharp_signature_type(param_type_index,
+                                                    wrapper.parameter_is_nullable(i));
+
+      AtomicToken stream_tok = csharp_stream_token_for_type(param_type_index);
+      if (stream_tok != AT_not_atomic) {
+        param_type = "global::System.IO.Stream";
+      }
+
+      result.push_back(param_type);
+    }
+    return result;
+  };
+
+  auto make_remap_return_type = [&](FunctionRemap *remap) {
+    TypeIndex return_type_index = get_return_type_for_remap(remap);
+    bool return_nullable = is_return_nullable(remap);
+    return remap->_void_return ? string("void") :
+      ((return_type_index != 0)
+         ? get_csharp_signature_type(return_type_index, return_nullable)
+         : get_csharp_signature_type_for_wrapper(remap->_return_type, return_nullable));
+  };
+
+  auto make_wrapper_return_type = [&](const InterrogateFunctionWrapper &wrapper) {
+    return wrapper.has_return_value()
+      ? get_csharp_signature_type(wrapper.get_return_type(), wrapper.is_return_nullable())
+      : string("void");
+  };
+
+  auto inherited_kind_for_return = [&](const string &inherited_return_type) {
+    return inherited_return_type == return_type ? 2 : 1;
+  };
 
   std::function<int(const InterrogateType &)> visit = [&](const InterrogateType &current) {
     int num_derivations = current.number_of_derivations();
@@ -7159,15 +8301,9 @@ inherited_method_signature_kind(const InterrogateType &itype,
               continue;
             }
 
-            std::vector<string> inherited_param_types;
-              size_t first_param = remap->_has_this ? 1 : 0;
-              for (size_t i = first_param; i < remap->_parameters.size(); ++i) {
-                inherited_param_types.push_back(
-                get_csharp_signature_type_for_wrapper(remap->_parameters[i]._remap,
-                                                      is_parameter_nullable(remap, i)));
-              }
+            std::vector<string> inherited_param_types = make_remap_parameter_types(remap);
             if (build_signature_key(method_name, inherited_param_types, remap_static) == target_sig) {
-              return method->_ifunc.is_virtual() ? 2 : 1;
+              return inherited_kind_for_return(make_remap_return_type(remap));
             }
           }
 
@@ -7188,14 +8324,10 @@ inherited_method_signature_kind(const InterrogateType &itype,
                 continue;
               }
 
-              std::vector<string> inherited_param_types;
-              int first_param = wrapper_static ? 0 : 1;
-              for (int i = first_param; i < wrapper.number_of_parameters(); ++i) {
-                inherited_param_types.push_back(
-                  get_csharp_signature_type(wrapper.parameter_get_type(i), wrapper.parameter_is_nullable(i)));
-              }
+              std::vector<string> inherited_param_types =
+                make_wrapper_parameter_types(wrapper, wrapper_static);
               if (build_signature_key(method_name, inherited_param_types, wrapper_static) == target_sig) {
-                return method->_ifunc.is_virtual() ? 2 : 1;
+                return inherited_kind_for_return(make_wrapper_return_type(wrapper));
               }
             }
           }
