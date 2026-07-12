@@ -1,0 +1,3 @@
+forcecomplexinheritance Animal
+forcecomplexinheritance NumberBox
+forcecomplexinheritance ForcedInterfaceBox

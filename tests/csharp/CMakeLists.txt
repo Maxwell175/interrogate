@@ -40,6 +40,7 @@ function(csharp_test name)
   set(hdr "${CSHARP_TEST_DIR}/${name}.h")
   set(cxx "${CSHARP_TEST_DIR}/${name}.cxx")
   set(driver_cs "${CSHARP_TEST_DIR}/${name}.cs")
+  set(command_file "${CSHARP_TEST_DIR}/${name}.N")
 
   foreach(f "${hdr}" "${cxx}" "${driver_cs}")
     if(NOT EXISTS "${f}")
@@ -61,6 +62,11 @@ function(csharp_test name)
   set(cs_out "${work_dir}/cs")
 
   separate_arguments(extra_args UNIX_COMMAND "${flags}")
+  set(pass1_deps interrogate "${hdr}")
+  if(EXISTS "${command_file}")
+    list(APPEND pass1_deps "${command_file}")
+  endif()
+
   add_custom_command(
     OUTPUT "${gen_cxx}" "${gen_in}"
     COMMAND ${CMAKE_COMMAND} -E make_directory "${cs_out}"
@@ -73,7 +79,7 @@ function(csharp_test name)
       ${extra_args} -D__cplusplus
       "-S${PROJECT_SOURCE_DIR}/parser-inc"
       "${hdr}"
-    DEPENDS interrogate "${hdr}"
+    DEPENDS ${pass1_deps}
     COMMENT "interrogate (pass 1) ${name}"
     VERBATIM)
 

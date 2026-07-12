@@ -18,6 +18,7 @@ internal static class Driver {
         TestDeepChainToBaseC();
         TestDeepChainToBaseD();
         TestDiamondInheritance();
+        TestSmartInterfaceDefaults();
 
         Console.WriteLine();
         if (_failed == 0) {
@@ -135,5 +136,38 @@ internal static class Driver {
         // Passing as DiamondRight* (secondary base, non-zero offset) - this is the real test
         tester.test_right(obj);
         Check(tester.get_last_right() == 77, $"DiamondRight via secondary base (got: {tester.get_last_right()}, expected: 77)");
+    }
+
+    private static void TestSmartInterfaceDefaults() {
+        Console.WriteLine("TestSmartInterfaceDefaults: only multiple-inheritance participants get interfaces");
+        Check(HasInterface(typeof(DerivedTextNode), "IDerivedTextNode"),
+              "multiple-inheritance class implements own interface");
+        Check(HasGeneratedType("Secondary.Base.Methods.IDerivedTextNode"),
+              "multiple-inheritance class interface type is emitted");
+        Check(HasInterface(typeof(TextLike), "ITextLike"),
+              "secondary base implements interface");
+        Check(HasGeneratedType("Secondary.Base.Methods.ITextLike"),
+              "secondary base interface type is emitted");
+        Check(HasInterface(typeof(BaseA), "IBaseA"),
+              "secondary base ancestor implements interface");
+        Check(HasInterface(typeof(Level4), "ILevel4"),
+              "deep multiple-inheritance class implements own interface");
+        Check(!HasInterface(typeof(Container), "IContainer"),
+              "unrelated simple class does not implement own interface");
+        Check(!HasGeneratedType("Secondary.Base.Methods.IContainer"),
+              "unrelated simple class interface type is not emitted");
+    }
+
+    private static bool HasInterface(Type type, string name) {
+        foreach (Type iface in type.GetInterfaces()) {
+            if (iface.Name == name) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static bool HasGeneratedType(string fullName) {
+        return typeof(DerivedTextNode).Assembly.GetType(fullName, false) != null;
     }
 }
