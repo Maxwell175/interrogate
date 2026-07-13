@@ -20,6 +20,7 @@
 #include "typeManager.h"
 
 #include "interrogateDatabase.h"
+#include "skipReport.h"
 #include "interrogateElement.h"
 #include "interrogateFunction.h"
 #include "interrogateFunctionWrapper.h"
@@ -1982,6 +1983,29 @@ is_csharp_type_legal(TypeIndex type_index) {
   }
 
   return false;
+}
+
+/**
+ * The C++ name of a type, for a skip-report line.  Prefers the true name (what
+ * a person would recognise, e.g. "pvector< unsigned char >") over the mangled
+ * database name.
+ */
+string
+report_type_name(TypeIndex type_index) {
+  if (type_index == 0) {
+    return "<unknown>";
+  }
+  const InterrogateType &itype = InterrogateDatabase::get_ptr()->get_type(type_index);
+  if (itype.has_true_name()) {
+    return itype.get_true_name();
+  }
+  if (itype.has_scoped_name()) {
+    return itype.get_scoped_name();
+  }
+  if (itype.has_name()) {
+    return itype.get_name();
+  }
+  return "<unnamed>";
 }
 
 bool
@@ -5479,13 +5503,28 @@ write_method(ostream &out, Function *func, Object *object, int indent_level,
       }
     }
 
+    // An empty signature type means the C# maker has no mapping for the C++
+    // type (see should_skip_csharp_type), so the overload cannot be written.
+    // Say which type and why -- a method that vanishes without a word is how
+    // whole APIs go missing unnoticed.
     if (return_type.empty()) {
+      record_skipped("method", func->_ifunc.get_scoped_name(),
+                     "no C# mapping for return type '" +
+                     report_type_name(return_type_index) + "'");
       continue;
     }
     {
       bool has_skipped_param = false;
-      for (const string &pt : param_types) {
-        if (pt.empty()) { has_skipped_param = true; break; }
+      for (size_t pi = 0; pi < param_types.size(); ++pi) {
+        if (param_types[pi].empty()) {
+          record_skipped("method", func->_ifunc.get_scoped_name(),
+                         "no C# mapping for parameter '" + param_names[pi] +
+                         "' of type '" +
+                         report_type_name(wrapper.parameter_get_type((int)pi + first_param)) +
+                         "'");
+          has_skipped_param = true;
+          break;
+        }
       }
       if (has_skipped_param) {
         continue;

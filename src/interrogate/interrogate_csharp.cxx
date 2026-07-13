@@ -18,6 +18,8 @@
 #include "panda_getopt_long.h"
 #include "preprocess_argv.h"
 
+#include "skipReport.h"
+
 #include <cstring>
 #include <fstream>
 #include <iostream>
@@ -54,6 +56,7 @@ CPPVisibility min_vis = V_published;
 string library_name;
 std::vector<std::string> library_names;
 string module_name;
+string skip_report_filename;
 Filename csharp_output_dir;
 Filename csharp_output_code_filename;
 string csharp_dll_name;
@@ -74,6 +77,7 @@ enum CommandOptions {
   CO_module_map,
 
   CO_include_header,
+  CO_skip_report,
   CO_help,
 };
 
@@ -87,6 +91,7 @@ static struct option long_options[] = {
   { "module-map", required_argument, nullptr, CO_module_map },
 
   { "include-header", required_argument, nullptr, CO_include_header },
+  { "skip-report", required_argument, nullptr, CO_skip_report },
   { "help", no_argument, nullptr, CO_help },
   { nullptr }
 };
@@ -116,6 +121,10 @@ main(int argc, char *argv[]) {
   flag = getopt_long_only(argc, argv, short_options, long_options, nullptr);
   while (flag != EOF) {
     switch (flag) {
+    case CO_skip_report:
+      skip_report_filename = optarg;
+      break;
+
     case CO_ocs:
       csharp_output_dir = Filename::from_os_specific(optarg);
       csharp_output_dir.make_absolute();
@@ -336,6 +345,11 @@ main(int argc, char *argv[]) {
     nout << "Error reading interrogate data.\n";
     return 1;
   }
+
+  // Report what the C# mapping could not express.  These are declarations that
+  // survived pass 1 -- they have callable wrappers in the database -- but have
+  // no C# signature, so they are absent from the generated bindings.
+  report_skipped("interrogate_csharp", skip_report_filename);
 
   return 0;
 }

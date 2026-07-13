@@ -18,6 +18,7 @@
 #include "cppGlobals.h"
 #include "pnotify.h"
 #include "panda_getopt_long.h"
+#include "skipReport.h"
 #include "preprocess_argv.h"
 #include <time.h>
 
@@ -57,6 +58,7 @@ CPPVisibility min_vis = V_published;
 string library_name;
 string module_name;
 std::vector<Filename> database_search_dirs;
+Filename skip_report_filename;
 Filename csharp_output_dir;
 string csharp_dll_name;
 bool csharp_database_only_pass = false;
@@ -95,6 +97,7 @@ enum CommandOptions {
   CO_spam,
   CO_noangles,
   CO_nomangle,
+  CO_skip_report,
   CO_help,
 };
 
@@ -102,6 +105,7 @@ static struct option long_options[] = {
   { "oc", required_argument, nullptr, CO_oc },
   { "od", required_argument, nullptr, CO_od },
   { "oh", required_argument, nullptr, CO_oh },
+  { "skip-report", required_argument, nullptr, CO_skip_report },
   { "srcdir", required_argument, nullptr, CO_srcdir },
   { "module", required_argument, nullptr, CO_module },
   { "library", required_argument, nullptr, CO_library },
@@ -385,6 +389,11 @@ main(int argc, char **argv) {
     case CO_oh:
       output_text_filename = Filename::from_os_specific(optarg);
       output_text_filename.make_absolute();
+      break;
+
+    case CO_skip_report:
+      skip_report_filename = Filename::from_os_specific(optarg);
+      skip_report_filename.make_absolute();
       break;
 
     case CO_srcdir:
@@ -725,6 +734,11 @@ main(int argc, char **argv) {
       InterrogateDatabase::get_ptr()->write_text(output_text);
     }
   }
+
+  // Say what we could not wrap.  A declaration that interrogate scanned but
+  // dropped is invisible on the far side, so silence here reads as success.
+  report_skipped("interrogate", skip_report_filename.empty()
+                 ? string() : skip_report_filename.to_os_specific());
 
   return status;
 }

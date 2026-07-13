@@ -23,6 +23,7 @@ set(INTERROGATE_HEADERS
   parameterRemapToString.h
   parameterRemapHandleToInt.h
   parameterRemapUnchanged.h
+  skipReport.h
   typeManager.h
 )
 
@@ -50,6 +51,7 @@ set(INTERROGATE_SOURCES
   parameterRemapToString.cxx
   parameterRemapHandleToInt.cxx
   parameterRemapUnchanged.cxx
+  skipReport.cxx
   typeManager.cxx
 )
 

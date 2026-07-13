@@ -20,6 +20,7 @@
 #include "parameterRemapUnchanged.h"
 #include "interfaceMaker.h"
 #include "interrogateBuilder.h"
+#include "skipReport.h"
 
 #include "interrogateDatabase.h"
 #include "cppExpression.h"
@@ -736,7 +737,17 @@ setup_properties(const InterrogateFunction &ifunc, InterfaceMaker *interface_mak
         param._remap = new ParameterRemapUnchanged(type);
       }
       else {
-        //nout << "Can't handle parameter " << i << " of method " << *_cppfunc << "\n";
+        // No ParameterRemap for this type, so the function cannot be called
+        // and will get no wrapper.  Record it: dropping a declared method
+        // without saying so is how bindings vanish unnoticed.
+        std::ostringstream func_name;
+        func_name << *_cppfunc;
+
+        std::ostringstream reason;
+        reason << "no marshalling for parameter " << i << " ('" << param._name
+               << "') of type '" << type->get_local_name(&parser) << "'";
+
+        record_skipped("function", func_name.str(), reason.str());
         return false;
       }
     } else {
