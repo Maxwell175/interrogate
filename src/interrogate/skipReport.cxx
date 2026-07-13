@@ -78,7 +78,13 @@ write_skip_report(std::ostream &out) {
 void
 report_skipped(const string &tool, const string &report_filename) {
   const std::set<SkipEntry> &entries = get_entries();
+
   if (entries.empty()) {
+    // Truncate any previous report: a stale file left behind after the last drop
+    // was fixed reads exactly like a drop that is still there.
+    if (!report_filename.empty()) {
+      std::ofstream report(report_filename.c_str(), std::ios::out | std::ios::trunc);
+    }
     return;
   }
 

@@ -1260,6 +1260,30 @@ static bool is_const_qualified_type(const InterrogateType &itype) {
   return false;
 }
 
+// A PointerTo<T> / ConstPointerTo<T> element is a refcounted *handle*, not a value:
+// AsyncFuture::Futures is pvector<PT(AsyncFuture)>.  Returns T's C++ name, or "".
+//
+// It matters because the synthesized element accessor heap-copies a value element
+// (`new e_cpp_type((*self)[i])`), and doing that to a smart pointer allocates a
+// PointerTo object -- which is not what the managed side unwraps.  A handle has to
+// cross as the pointer it already is.
+static string collection_element_pointee(const string &element_cpp_name) {
+  string::size_type lt = element_cpp_name.find('<');
+  if (lt == string::npos) {
+    return string();
+  }
+  string head = element_cpp_name.substr(0, lt);
+  while (!head.empty() && head.back() == ' ') {
+    head.pop_back();
+  }
+  string::size_type colon = head.rfind("::");
+  string simple = (colon == string::npos) ? head : head.substr(colon + 2);
+  if (simple != "PointerTo" && simple != "ConstPointerTo") {
+    return string();
+  }
+  return extract_first_template_argument(element_cpp_name);
+}
+
 // Can C# name this element type at all?
 //
 // get_collection_element_type_from_cpp_name falls back to mangling the C++ name
@@ -1279,6 +1303,12 @@ static bool collection_element_is_expressible(const string &element_cpp_name) {
   }
   if (clean.empty()) {
     return false;
+  }
+
+  // A PT(T) element is expressible exactly when T is.
+  string pointee = collection_element_pointee(clean);
+  if (!pointee.empty()) {
+    return collection_element_is_expressible(pointee);
   }
 
   // Must mirror get_collection_element_type_from_cpp_name's primitive table.
@@ -2498,11 +2528,22 @@ write_functions(ostream &out) {
       out << "EXPORT_FUNC void *" << helper_prefix << "empty_constructor() { return new " << base_cpp_type << "(); }\n";
     }
     out << "EXPORT_FUNC int " << helper_prefix << "size(" << cpp_type << " *self) { return self->size(); }\n";
+    // A PointerTo<T> element is a refcounted handle: hand the pointer across as it
+    // is (ref'd, so the managed side owns a reference), instead of heap-copying the
+    // smart pointer itself.
+    string element_true_name;
+    detect_collection_facade_kind(itype, element_true_name);
+    string element_pointee = collection_element_pointee(element_true_name);
+    bool is_handle = !element_pointee.empty();
+
     out << "EXPORT_FUNC ";
     if (is_string) {
       out << "const char *" << helper_prefix << "get_element(" << cpp_type << " *self, int index) { return (*self)[index].c_str(); }\n";
     } else if (is_primitive) {
       out << e_cpp_type << " " << helper_prefix << "get_element(" << cpp_type << " *self, int index) { return (*self)[index]; }\n";
+    } else if (is_handle) {
+      out << "void *" << helper_prefix << "get_element(" << cpp_type << " *self, int index) { "
+          << element_pointee << " *__p = (*self)[index].p(); if (__p != nullptr) { __p->ref(); } return (void *)__p; }\n";
     } else {
       out << "void *" << helper_prefix << "get_element(" << cpp_type << " *self, int index) { return new " << e_cpp_type << "((*self)[index]); }\n";
     }
@@ -2513,12 +2554,16 @@ write_functions(ostream &out) {
         out << "const char *val) { (*self)[index] = val; }\n";
       } else if (is_primitive) {
         out << e_cpp_type << " val) { (*self)[index] = val; }\n";
+      } else if (is_handle) {
+        out << "void *val) { (*self)[index] = (" << element_pointee << " *)val; }\n";
       } else {
         out << e_cpp_type << " *val) { (*self)[index] = *val; }\n";
       }
       out << "EXPORT_FUNC void " << helper_prefix << "push_back(" << cpp_type << " *self, ";
       if (is_string) {
         out << "const char *val) { self->push_back(val); }\n";
+      } else if (is_handle) {
+        out << "void *val) { self->push_back((" << element_pointee << " *)val); }\n";
       } else if (is_primitive) {
         out << e_cpp_type << " val) { self->push_back(val); }\n";
       } else {
@@ -3817,8 +3862,16 @@ write_collection_adapter_class(ostream &out, Object *object) {
     } else if (is_csharp_primitive_type(element_type_value)) {
       indent(out, 6) << "return " << native_call << ";\n";
     } else {
+      // A PT(T) element arrives ref'd by the helper, so the managed wrapper owns a
+      // reference to it; a value element arrives freshly heap-copied, and the
+      // wrapper owns the allocation outright.
+      string element_true_name;
+      detect_collection_facade_kind(itype, element_true_name);
+      bool handle_element = !collection_element_pointee(element_true_name).empty();
+
       indent(out, 6) << "IntPtr result = " << native_call << ";\n";
-      indent(out, 6) << "return " << element_value_type << ".__CreateFromNative(result, NativeOwnership.Owned)"
+      indent(out, 6) << "return " << element_value_type << ".__CreateFromNative(result, "
+                     << (handle_element ? "NativeOwnership.RefCounted" : "NativeOwnership.Owned") << ")"
                      << " ?? throw new InvalidOperationException(\"Native method returned null.\");\n";
     }
     indent(out, 4) << "}\n\n";
@@ -8725,6 +8778,14 @@ get_collection_element_type_from_cpp_name(const string &cpp_name, bool for_signa
   if (clean == "bool") return "bool";
   if (clean == "std::string" || clean == "string" ||
       clean == "std::wstring" || clean == "wstring") return "string";
+
+  // A PT(T) element surfaces as T.
+  {
+    string pointee = collection_element_pointee(clean);
+    if (!pointee.empty()) {
+      return get_collection_element_type_from_cpp_name(pointee, for_signature);
+    }
+  }
 
   // Fall back to a database lookup for user-defined types.
   InterrogateDatabase *idb = InterrogateDatabase::get_ptr();
