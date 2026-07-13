@@ -133,10 +133,16 @@ private:
   std::string get_csharp_type_for_wrapper(ParameterRemap *remap,
                                           bool for_return = false) const;
   const InterrogateType *find_csharp_object_type(const std::string &type_name) const;
+  std::string globalize_class_name(const InterrogateType &itype) const;
   std::string get_csharp_signature_type(CPPType *type,
                                         bool for_return = false) const;
+  // `is_parameter` marks the type as appearing in an incoming parameter rather
+  // than a return.  (`for_return` is a misnomer: every call site passes the
+  // type's NULLABILITY through it, not its position.)  Const collection facades
+  // need the distinction -- see get_csharp_signature_type.
   std::string get_csharp_signature_type(TypeIndex type,
-                                        bool for_return = false) const;
+                                        bool for_return = false,
+                                        bool is_parameter = false) const;
   std::string get_csharp_signature_type_for_wrapper(ParameterRemap *remap,
                                                     bool for_return = false) const;
   std::string get_csharp_native_object_class_name(CPPType *type) const;

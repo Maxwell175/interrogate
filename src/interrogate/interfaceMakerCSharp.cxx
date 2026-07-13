@@ -1318,8 +1318,6 @@ static bool collection_element_is_expressible(const string &element_cpp_name) {
 static CollectionFacadeKind detect_collection_facade_kind(
     const InterrogateType &itype,
     string &element_true_name_out) {
-  InterrogateDatabase *idb = InterrogateDatabase::get_ptr();
-  constexpr size_t N = sizeof(kCollectionTemplates) / sizeof(kCollectionTemplates[0]);
   constexpr size_t NP = sizeof(kPointerHolderTemplates) / sizeof(kPointerHolderTemplates[0]);
 
   // Reject the smart-pointer holders themselves — their DF_pointer_to
@@ -4656,7 +4654,7 @@ write_constructor(ostream &out, Function *func, Object *object, int indent_level
       TypeIndex param_type_index = get_parameter_type_for_remap(remap, i);
       bool param_nullable = is_parameter_nullable(remap, i);
       string param_type = (param_type_index != 0)
-        ? get_csharp_signature_type(param_type_index, param_nullable)
+        ? get_csharp_signature_type(param_type_index, param_nullable, /*is_parameter=*/true)
         : get_csharp_signature_type_for_wrapper(param_remap, param_nullable);
 
       AtomicToken stream_tok = csharp_stream_token_for_type(param_type_index);
@@ -4795,7 +4793,7 @@ write_constructor(ostream &out, Function *func, Object *object, int indent_level
 
     for (int i = 0; i < wrapper.number_of_parameters(); ++i) {
       TypeIndex param_type_index = wrapper.parameter_get_type(i);
-      string param_type = get_csharp_signature_type(param_type_index, wrapper.parameter_is_nullable(i));
+      string param_type = get_csharp_signature_type(param_type_index, wrapper.parameter_is_nullable(i), /*is_parameter=*/true);
 
       AtomicToken stream_tok = csharp_stream_token_for_type(param_type_index);
       if (stream_tok != AT_not_atomic) {
@@ -4992,7 +4990,7 @@ write_operator_aliases(ostream &out, Object *object, int indent_level,
         TypeIndex param_type_index = get_parameter_type_for_remap(remap, i);
         bool param_nullable = is_parameter_nullable(remap, i);
         string param_type = param_type_index != 0
-          ? get_csharp_signature_type(param_type_index, param_nullable)
+          ? get_csharp_signature_type(param_type_index, param_nullable, /*is_parameter=*/true)
           : get_csharp_signature_type_for_wrapper(remap->_parameters[i]._remap, param_nullable);
 
         if (csharp_stream_token_for_type(param_type_index) != AT_not_atomic) {
@@ -5063,7 +5061,7 @@ write_operator_aliases(ostream &out, Object *object, int indent_level,
         }
 
         bool param_nullable = wrapper.parameter_is_nullable(i);
-        string param_type = get_csharp_signature_type(param_type_index, param_nullable);
+        string param_type = get_csharp_signature_type(param_type_index, param_nullable, /*is_parameter=*/true);
         if (param_type.empty()) {
           bad_param = true;
           break;
@@ -5352,7 +5350,7 @@ write_method(ostream &out, Function *func, Object *object, int indent_level,
       TypeIndex param_type_index = get_parameter_type_for_remap(remap, i);
       bool param_nullable = is_parameter_nullable(remap, i);
       string param_type = (param_type_index != 0)
-        ? get_csharp_signature_type(param_type_index, param_nullable)
+        ? get_csharp_signature_type(param_type_index, param_nullable, /*is_parameter=*/true)
         : get_csharp_signature_type_for_wrapper(param_remap, param_nullable);
 
       // Stream parameters: override the default IntPtr mapping with
@@ -5641,7 +5639,7 @@ write_method(ostream &out, Function *func, Object *object, int indent_level,
     for (int i = first_param; i < wrapper.number_of_parameters(); ++i) {
       TypeIndex param_type_index = wrapper.parameter_get_type(i);
       bool param_nullable = wrapper.parameter_is_nullable(i);
-      string param_type = get_csharp_signature_type(param_type_index, param_nullable);
+      string param_type = get_csharp_signature_type(param_type_index, param_nullable, /*is_parameter=*/true);
 
       AtomicToken stream_tok = csharp_stream_token_for_type(param_type_index);
       if (stream_tok != AT_not_atomic) {
@@ -6095,10 +6093,30 @@ write_property_from_wrapper(ostream &out, const InterrogateElement &ielement,
 
   Function *getter_func = nullptr;
   Function *setter_func = nullptr;
+  Function *has_func = nullptr;
   const InterrogateFunctionWrapper *getter_w =
     ielement.has_getter() ? first_legal_wrapper(ielement.get_getter(), getter_func) : nullptr;
   const InterrogateFunctionWrapper *setter_w =
     ielement.has_setter() ? first_legal_wrapper(ielement.get_setter(), setter_func) : nullptr;
+
+  // MAKE_PROPERTY2 pairs the getter with a has_xxx() predicate, and the getter is
+  // only meaningful when it returns true (InputDevice::get_tracker is guarded by
+  // has_tracker).  Model that as a nullable property -- null meaning "not present"
+  // -- instead of calling the getter unconditionally and hoping.
+  const InterrogateFunctionWrapper *has_w =
+    ielement.has_has_function() ? first_legal_wrapper(ielement.get_has_function(), has_func) : nullptr;
+  if (has_w != nullptr) {
+    int hp = has_w->number_of_parameters();
+    int hfirst = (hp != 0 && has_w->parameter_is_this(0)) ? 1 : 0;
+    // It must take only `this` AND actually return bool.  Some elements record a
+    // has-function that is really the getter again (PGScrollFrame's slider
+    // properties do), and calling `if (!ptr)` on that does not compile.
+    if (hp - hfirst != 0 ||
+        !has_w->has_return_value() ||
+        get_pinvoke_type(has_w->get_return_type(), true) != "bool") {
+      has_w = nullptr;
+    }
+  }
 
   // Only simple accessors become properties: the getter takes just `this`, and the setter takes
   // `this` + exactly one value. Indexed/sequence accessors (extra parameters) are handled by the
@@ -6168,21 +6186,75 @@ write_property_from_wrapper(ostream &out, const InterrogateElement &ielement,
     return;
   }
 
-  // Only value-typed members (primitive / bool / enum / string). Native-object,
-  // collection-facade and cross-module-abstract types need handling the plain
-  // wrapper fallback lacks, so skip them rather than emit an unresolvable type.
   TypeIndex primary_idx = (getter_w != nullptr) ? ret_idx : value_idx;
   bool is_value_type = is_csharp_enum_type(primary_idx)
                     || is_csharp_primitive_type(property_type)
                     || property_type == "bool"
                     || property_type == "string" || property_type == "string?";
-  if (!is_value_type) {
+
+  // A native-object property is marshalled exactly as a native-object return is
+  // (__CreateFromNative with the wrapper's ownership) -- there is nothing special
+  // about it, and refusing it dropped the property silently.  That refusal is why
+  // only 98 of panda3d's ~1477 MAKE_PROPERTY declarations reached C#, and why the
+  // whole gamepad surface (InputDevice.Tracker / .Battery) was missing: their
+  // accessors are not PUBLISHED, so the property was the only way in.
+  string concrete_type = get_csharp_native_object_class_name(primary_idx);
+
+  if (!is_value_type && concrete_type.empty()) {
+    record_skipped("property", ielement.get_scoped_name(),
+                   "no C# mapping for property type '" +
+                   report_type_name(primary_idx) + "'");
     return;
+  }
+
+  // Naming a class is not the same as that class existing: Event::get_receiver
+  // returns EventReceiver, which is never emitted.  Use the same test the method
+  // writer uses -- an empty signature type means "no C# mapping".
+  if (!concrete_type.empty() &&
+      get_csharp_signature_type(primary_idx, true).empty()) {
+    record_skipped("property", ielement.get_scoped_name(),
+                   "no C# mapping for property type '" +
+                   report_type_name(primary_idx) + "'");
+    return;
+  }
+
+  // Honour the has_xxx() guard only for object-typed properties, whose C# type is
+  // already nullable.  Doing it for a value type would have to change the declared
+  // type (bool -> bool?), and that breaks interface conformance where a derived
+  // class publishes the same property unguarded: ITextProperties.SmallCaps is
+  // bool, TextNode.SmallCaps would become bool?.  Value-typed MAKE_PROPERTY2 keeps
+  // its existing unguarded behaviour.
+  if (concrete_type.empty()) {
+    has_w = nullptr;
   }
 
   string property_name = to_pascal_case(make_csharp_identifier(ielement.get_name()));
   if (property_name.empty() || property_name == "void") {
     return;
+  }
+  if (is_blocked_pascal_alias(property_name)) {
+    return;
+  }
+
+  // C# forbids a member and a nested type sharing a name (CS0102).  InputDevice
+  // has a nested BatteryData *and* a battery_data property; emitting both does not
+  // compile.  The nested type is the one callers name in signatures, so it wins.
+  if (object != nullptr) {
+    const InterrogateType &owner = object->_itype;
+    for (int i = 0; i < owner.number_of_nested_types(); ++i) {
+      TypeIndex nested_index = owner.get_nested_type(i);
+      if (nested_index == 0) {
+        continue;
+      }
+      const InterrogateType &nested = idb->get_type(nested_index);
+      if (should_nest_type(nested) &&
+          get_simple_class_name(nested) == property_name) {
+        record_skipped("property", ielement.get_scoped_name(),
+                       "name collides with nested type '" + property_name +
+                       "' (CS0102)");
+        return;
+      }
+    }
   }
 
   bool is_static = !has_this;
@@ -6215,7 +6287,21 @@ write_property_from_wrapper(ostream &out, const InterrogateElement &ielement,
     string this_arg = has_this ? get_native_this_argument(object->_itype, getter_func->_ifunc) : "";
     string native_call = get_pinvoke_call_name(getter_func->_ifunc, *getter_w) + "(" + this_arg + ")";
 
-    if (is_csharp_enum_type(ret_idx)) {
+    if (has_w != nullptr) {
+      string has_this_arg = has_this
+        ? get_native_this_argument(object->_itype, has_func->_ifunc) : "";
+      indent(out, indent_level + 4)
+        << "if (!" << get_pinvoke_call_name(has_func->_ifunc, *has_w)
+        << "(" << has_this_arg << ")) return null;\n";
+    }
+
+    if (!concrete_type.empty()) {
+      indent(out, indent_level + 4) << "IntPtr result = " << native_call << ";\n";
+      indent(out, indent_level + 4) << "return " << concrete_type
+                                    << ".__CreateFromNative(result, "
+                                    << get_native_ownership_name(*getter_w, false)
+                                    << ");\n";
+    } else if (is_csharp_enum_type(ret_idx)) {
       indent(out, indent_level + 4) << "return (" << property_type << ")" << native_call << ";\n";
     } else if (property_type == "string" || property_type == "string?") {
       // The P/Invoke may marshal the string itself (returns string) or return a raw IntPtr.
@@ -7461,7 +7547,8 @@ get_csharp_signature_type(CPPType *type, bool for_return) const {
  *
  */
 string InterfaceMakerCSharp::
-get_csharp_signature_type(TypeIndex type_index, bool for_return) const {
+get_csharp_signature_type(TypeIndex type_index, bool for_return,
+                          bool is_parameter) const {
   TypeIndex original_type_index = type_index;
   type_index = unwrap_type_aliases(type_index);
   if (type_index == 0 && original_type_index == 0) {
@@ -7475,7 +7562,29 @@ get_csharp_signature_type(TypeIndex type_index, bool for_return) const {
       if (should_skip_csharp_type(original_type)) {
         return "";
       }
-      return get_qualified_interface_name(original_type) + (for_return ? "?" : "");
+      // A const facade is the right type to RETURN -- the pointer really does
+      // point into const storage -- but the wrong one to ACCEPT.  A `const T &`
+      // parameter is remapped to `T const *`, and handing C++ a mutable T where
+      // it wants a const T is always legal; demanding the read-only facade here
+      // instead makes the method uncallable, because that class has no way to be
+      // built.  Every other const-ref parameter already drops its const:
+      // NodePath::set_pos takes LVecBase3f, not LVecBase3f_const.  Facades were
+      // the sole exception, only because this check runs before the unwrap below.
+      string facade_name = get_qualified_interface_name(original_type);
+
+      if (is_parameter && is_const_qualified_type(original_type) &&
+          facade_name.size() > 6 &&
+          facade_name.compare(facade_name.size() - 6, 6, "_const") == 0) {
+        // Drop the const by dropping the suffix, rather than by resolving to the
+        // non-const TypeIndex.  Both class names come from the same C++ name --
+        // "vector_uchar const" gives vector_uchar_const, "vector_uchar" gives
+        // vector_uchar -- so removing "_const" always lands on the class that was
+        // in fact generated.  Walking the type graph does not: a nested facade
+        // like PolylightEffect::LightGroup has several database records, and the
+        // non-const one there names a class that is never written.
+        return facade_name.substr(0, facade_name.size() - 6);
+      }
+      return facade_name + (for_return ? "?" : "");
     }
     if (is_empty_pointer_facade_type(original_type)) {
       TypeIndex inner_index = get_type_index_for_cpp_type(get_pointer_facade_pointee_cpp_type(original_type));
@@ -7615,19 +7724,43 @@ get_csharp_native_object_class_name(TypeIndex type_index) const {
     return get_pointer_facade_target_name(itype);
   }
   if (itype.is_class() || itype.is_struct()) {
-    return get_qualified_class_name(itype);
+    return globalize_class_name(itype);
   }
   if (itype.is_pointer()) {
     TypeIndex inner = unwrap_type_aliases(itype.get_wrapped_type());
     if (inner != 0) {
       const InterrogateType &inner_type = idb->get_type(inner);
       if (inner_type.is_class() || inner_type.is_struct()) {
-        return get_qualified_class_name(inner_type);
+        return globalize_class_name(inner_type);
       }
     }
   }
 
   return string();
+}
+
+/**
+ * The class name, always fully qualified.  This function's result is only ever
+ * used as the receiver of `.__CreateFromNative(...)`, and a bare name there can
+ * be shadowed by a member of the same name -- C#'s "Color Color" rule.  Once
+ * DisplayRegion gained a CullTraverser property, `CullTraverser.__CreateFromNative`
+ * inside its own methods started resolving to the property (an ICullTraverser)
+ * instead of the class.  A global:: qualified name cannot be shadowed.
+ */
+string InterfaceMakerCSharp::
+globalize_class_name(const InterrogateType &itype) const {
+  string name = get_qualified_class_name(itype);
+  if (name.compare(0, 8, "global::") == 0) {
+    return name;
+  }
+  string type_module = get_type_module_name(itype);
+  if (type_module.empty()) {
+    type_module = _current_module_name;
+  }
+  if (type_module.empty()) {
+    return name;
+  }
+  return "global::" + prettify_namespace(type_module) + "." + name;
 }
 
 /**
@@ -8425,7 +8558,7 @@ inherited_method_signature_kind(const InterrogateType &itype,
       TypeIndex param_type_index = get_parameter_type_for_remap(remap, i);
       bool param_nullable = is_parameter_nullable(remap, i);
       string param_type = (param_type_index != 0)
-        ? get_csharp_signature_type(param_type_index, param_nullable)
+        ? get_csharp_signature_type(param_type_index, param_nullable, /*is_parameter=*/true)
         : get_csharp_signature_type_for_wrapper(param_remap, param_nullable);
 
       AtomicToken stream_tok = csharp_stream_token_for_type(param_type_index);
@@ -8445,7 +8578,8 @@ inherited_method_signature_kind(const InterrogateType &itype,
     for (int i = first_param; i < wrapper.number_of_parameters(); ++i) {
       TypeIndex param_type_index = wrapper.parameter_get_type(i);
       string param_type = get_csharp_signature_type(param_type_index,
-                                                    wrapper.parameter_is_nullable(i));
+                                                    wrapper.parameter_is_nullable(i),
+                                                    /*is_parameter=*/true);
 
       AtomicToken stream_tok = csharp_stream_token_for_type(param_type_index);
       if (stream_tok != AT_not_atomic) {
