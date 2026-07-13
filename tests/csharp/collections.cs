@@ -171,7 +171,10 @@ internal static class Driver {
     // and onward to std::vector.
     private static void TestSmartPointerBackedArray() {
         Console.WriteLine("TestSmartPointerBackedArray: PointerToBase-derived class");
-        using var arr = new FancyArray_int();
+        // Named for the typedef (`typedef FancyArray<int> fancy_array_int`), not
+        // the template instantiation -- the same convention that makes panda3d's
+        // PointerToArray<unsigned char> surface as PTA_uchar.
+        using var arr = new fancy_array_int();
         arr.Add(10);
         arr.Add(20);
         arr.Add(30);

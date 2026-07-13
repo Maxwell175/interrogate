@@ -344,6 +344,19 @@ is_unpublished() const {
 }
 
 /**
+ * Returns true if the C++ type can be default-constructed (`new T()` compiles).
+ * Recorded in pass 1, where the parser knows; pass 2 only has the database, and
+ * cannot tell an implicit default constructor from a suppressed one -- a class
+ * whose only constructors take arguments records none at all when they are not
+ * PUBLISHED, and looks identical to std::vector, which has one implicitly.
+ * Guessing wrong emits `new T()` for a type that has no such constructor.
+ */
+INLINE bool InterrogateType::
+is_default_constructible() const {
+  return (_flags & F_default_constructible) != 0;
+}
+
+/**
  *
  */
 INLINE int InterrogateType::

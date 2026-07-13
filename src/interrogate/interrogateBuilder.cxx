@@ -2443,6 +2443,17 @@ get_type(CPPType *type, bool global) {
     itype._flags |= InterrogateType::F_deprecated;
   }
 
+  // Record default-constructibility while the parser is still around to answer.
+  // Pass 2 has only the database, and there it is undecidable: a class whose
+  // constructors all take arguments records none at all when they aren't
+  // PUBLISHED (panda3d's ReferenceCountedVector<T> is one), which looks exactly
+  // like std::vector, whose default constructor is implicit and equally absent.
+  // Anything downstream that wants to emit `new T()` needs to be told, not to
+  // guess.
+  if (type->is_default_constructible()) {
+    itype._flags |= InterrogateType::F_default_constructible;
+  }
+
   if (forced || !in_ignoretype(true_name)) {
     itype._flags |= InterrogateType::F_fully_defined;
 

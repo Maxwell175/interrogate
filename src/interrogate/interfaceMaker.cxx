@@ -391,8 +391,17 @@ remap_parameter(CPPType *struct_type, CPPType *param_type) {
         }
       }
     }
-    if (struct_type == nullptr ||
-        !TypeManager::is_vector_unsigned_char(struct_type)) {
+    // Pass vector_uchar through untouched -- but only for Python.  Python's
+    // generated wrapper is C++ compiled into the same module, so it can take and
+    // return the vector by value and do the bytes<->vector conversion itself.
+    // C# crosses a C ABI, where a by-value std::vector is meaningless: the
+    // wrapper would return the object itself where the managed side reads a
+    // pointer.  (That is exactly what happened -- DatagramIterator::get_blob
+    // segfaulted.)  For C#, fall through to the ordinary struct handling below,
+    // which heap-copies and returns a pointer, just as it does for LPoint3.
+    if (!build_csharp &&
+        (struct_type == nullptr ||
+         !TypeManager::is_vector_unsigned_char(struct_type))) {
       if (TypeManager::is_vector_unsigned_char(param_type)) {
         if (TypeManager::is_reference(param_type)) {
           return new ParameterRemapReferenceToConcrete(param_type);

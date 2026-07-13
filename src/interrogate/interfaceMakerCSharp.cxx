@@ -1083,9 +1083,17 @@ static TypeIndex unwrap_type_aliases(TypeIndex type_index);
 // name to element_true_name_out and returns CF_mutable_array; the
 // caller refines mutable-vs-readonly via collection_facade_is_readonly.
 // Uses only serialized fields so pass 1 and pass 2 agree.
+// crossed_pointer_to_out reports whether the winning path traversed a
+// DF_pointer_to edge.  That is the difference between "this type IS-A vector"
+// (typedefs and plain public inheritance — std::vector's members come with it,
+// whether or not the db recorded any) and "this type merely HOLDS a vector"
+// (a smart-pointer holder, which only behaves like one if it forwards the
+// methods itself).  The two need different trust rules; see
+// detect_collection_facade_kind and collection_facade_is_readonly.
 static CollectionFacadeKind walk_for_vector_base(
     const InterrogateType &itype,
-    string &element_true_name_out) {
+    string &element_true_name_out,
+    bool &crossed_pointer_to_out) {
   InterrogateDatabase *idb = InterrogateDatabase::get_ptr();
   constexpr size_t N = sizeof(kCollectionTemplates) / sizeof(kCollectionTemplates[0]);
 
@@ -1097,7 +1105,11 @@ static CollectionFacadeKind walk_for_vector_base(
     if (matches_collection_template(cur->_true_name,
                                     kCollectionTemplates, N)) {
       element_true_name_out = extract_first_template_argument(cur->_true_name);
-      return element_true_name_out.empty() ? CF_none : CF_mutable_array;
+      if (element_true_name_out.empty()) {
+        return CF_none;
+      }
+      crossed_pointer_to_out = false;
+      return CF_mutable_array;
     }
     if ((cur->is_typedef() || cur->is_wrapped() || cur->is_pointer()) &&
         cur->_wrapped_type != 0) {
@@ -1118,8 +1130,13 @@ static CollectionFacadeKind walk_for_vector_base(
     TypeIndex base_index = cur->get_derivation(i);
     if (base_index == 0) continue;
     const InterrogateType &base = idb->get_type(base_index);
-    CollectionFacadeKind kind = walk_for_vector_base(base, element_true_name_out);
+
+    string element;
+    bool crossed = false;
+    CollectionFacadeKind kind = walk_for_vector_base(base, element, crossed);
     if (kind != CF_none) {
+      element_true_name_out = element;
+      crossed_pointer_to_out = crossed || cur->derivation_is_pointer_to(i);
       return kind;
     }
   }
@@ -1190,19 +1207,112 @@ static bool has_pointer_to_const_edge(const InterrogateType &itype) {
 // -promiscuous).
 //
 // Fallback: infer from the method set — a readonly wrapper won't
-// expose push_back / set_element.  Only trusted when std::vector was
-// reached through inheritance; a direct typedef to external std::vector
-// carries no methods in the db and would falsely look read-only.
+// expose push_back / set_element.  Only trusted for a type that merely *holds*
+// a vector (reached across a DF_pointer_to edge), which has to forward the
+// methods to behave like one.  A type that IS-A vector inherits them, and its
+// db record may list none at all — an external std::vector typedef and
+// panda3d's empty-bodied pvector<T> both do — so the absence of push_back
+// there says nothing, and trusting it would falsely mark them read-only.
 static bool collection_facade_is_readonly(const InterrogateType &itype,
-                                          bool via_typedef_only) {
+                                          bool is_a_vector) {
   if (has_pointer_to_const_edge(itype)) {
     return true;
   }
-  if (via_typedef_only) {
+  if (is_a_vector) {
     return false;
   }
   return !type_has_method(itype, "push_back") &&
          !type_has_method(itype, "set_element");
+}
+
+bool should_skip_csharp_type(const InterrogateType &itype);
+
+// Is this type const-qualified?  The native helper writer decides this from the
+// C++ type name having a trailing "const" (it has the CPPType; pass 2 does not),
+// and the two must agree: if it says const it emits no push_back/resize helpers,
+// so anything here that calls the type mutable would generate a NativeList<T>
+// bound to entry points that were never written.  Mirror its test exactly.
+static bool is_const_qualified_type(const InterrogateType &itype) {
+  // Look through pointer / reference layers to the pointee: a facade object is
+  // usually reached as `T const *` (that is what `const vector_uchar &` becomes
+  // once the reference is remapped to a pointer).  The pointer itself is not
+  // const -- the thing it points at is -- so testing only the outer type finds
+  // nothing, while the native writer, which names the pointee, sees the const
+  // and drops the mutating helpers.  Walk the raw _wrapped_type chain, NOT
+  // unwrap_type_aliases: that strips const, which is the very thing we're after.
+  InterrogateDatabase *idb = InterrogateDatabase::get_ptr();
+  const InterrogateType *cur = &itype;
+
+  for (int guard = 0; guard < 32; ++guard) {
+    if (cur->is_const()) {
+      return true;
+    }
+    const string &name = cur->_true_name;
+    if (name.size() >= 5 && name.compare(name.size() - 5, 5, "const") == 0) {
+      return true;
+    }
+    if ((cur->is_pointer() || cur->is_wrapped()) && cur->_wrapped_type != 0) {
+      cur = &idb->get_type(cur->_wrapped_type);
+    } else {
+      break;
+    }
+  }
+  return false;
+}
+
+// Can C# name this element type at all?
+//
+// get_collection_element_type_from_cpp_name falls back to mangling the C++ name
+// when it recognises nothing, so an element the generator never emits still
+// yields a plausible-looking identifier — InputDevice::ButtonState becomes
+// `InputDevice_ButtonState`, a class that is written nowhere.  The facade then
+// references a type that does not exist and the bindings do not compile.  A
+// container we cannot express is better left unexposed (and the skip report now
+// says so) than turned into a class that breaks the build.
+static bool collection_element_is_expressible(const string &element_cpp_name) {
+  string clean = element_cpp_name;
+  while (!clean.empty() && (clean.front() == ' ' || clean.front() == '\t')) {
+    clean.erase(clean.begin());
+  }
+  while (!clean.empty() && (clean.back() == ' ' || clean.back() == '\t')) {
+    clean.pop_back();
+  }
+  if (clean.empty()) {
+    return false;
+  }
+
+  // Must mirror get_collection_element_type_from_cpp_name's primitive table.
+  static const char *const primitives[] = {
+    "unsigned char", "signed char", "char",
+    "unsigned short", "unsigned short int", "short", "short int",
+    "unsigned int", "unsigned", "int", "long", "long int",
+    "unsigned long", "unsigned long int",
+    "long long", "long long int", "unsigned long long", "unsigned long long int",
+    "float", "double", "bool",
+    "std::string", "string", "std::wstring", "wstring",
+  };
+  for (const char *prim : primitives) {
+    if (clean == prim) {
+      return true;
+    }
+  }
+
+  InterrogateDatabase *idb = InterrogateDatabase::get_ptr();
+  TypeIndex ti = idb->lookup_type_by_true_name(clean);
+  if (ti == 0) {
+    ti = idb->lookup_type_by_scoped_name(clean);
+  }
+  if (ti == 0) {
+    ti = idb->lookup_type_by_name(clean);
+  }
+  if (ti == 0) {
+    return false;
+  }
+  ti = unwrap_type_aliases(ti);
+  if (ti == 0) {
+    return false;
+  }
+  return !should_skip_csharp_type(idb->get_type(ti));
 }
 
 static CollectionFacadeKind detect_collection_facade_kind(
@@ -1220,40 +1330,43 @@ static CollectionFacadeKind detect_collection_facade_kind(
     return CF_none;
   }
 
-  CollectionFacadeKind kind = walk_for_vector_base(itype, element_true_name_out);
+
+  bool crossed_pointer_to = false;
+  CollectionFacadeKind kind =
+    walk_for_vector_base(itype, element_true_name_out, crossed_pointer_to);
   if (kind == CF_none) {
     return CF_none;
   }
 
-  // If a plain typedef/wrapping peel lands on std::vector (e.g.
-  // `typedef std::vector<int> vector_int`), the type IS a vector
-  // instantiation — no method check needed.  Otherwise we got here via
-  // inheritance, where an abstract intermediate like PointerToArrayBase<T>
-  // can reach std::vector without itself exposing size() / operator[];
-  // require a size() method so the generated helpers compile.
-  const InterrogateType *cur = &itype;
-  int guard = 32;
-  bool reaches_vector_via_typedef_only = false;
-  while (guard-- > 0) {
-    if (matches_collection_template(cur->_true_name,
-                                    kCollectionTemplates, N)) {
-      reaches_vector_via_typedef_only = true;
-      break;
-    }
-    if ((cur->is_typedef() || cur->is_wrapped() || cur->is_pointer()) &&
-        cur->_wrapped_type != 0) {
-      TypeIndex inner = unwrap_type_aliases(cur->_wrapped_type);
-      if (inner == 0) break;
-      cur = &idb->get_type(inner);
-    } else {
-      break;
-    }
-  }
-  if (!reaches_vector_via_typedef_only && !type_has_method(itype, "size")) {
+  if (!collection_element_is_expressible(element_true_name_out)) {
     return CF_none;
   }
 
-  if (collection_facade_is_readonly(itype, reaches_vector_via_typedef_only)) {
+  // Reaching std::vector through typedefs and plain public inheritance means
+  // the type IS-A vector: size() / operator[] / push_back come with the base,
+  // whether or not the database happens to record them.  Demanding a recorded
+  // size() here is wrong, and it is what dropped every vector_uchar method --
+  // panda3d gives pvector<T> an empty body under CPPPARSER ("simplified
+  // definition to speed up Interrogate parsing"), so `pvector<T> : std::vector<T>`
+  // carries no methods at all in the db.
+  //
+  // Crossing a DF_pointer_to edge is the case that needs the check: a
+  // smart-pointer holder only behaves like a vector if it forwards the methods,
+  // and abstract intermediates like PointerToArrayBase<T> reach std::vector
+  // without exposing anything.
+  const bool is_a_vector = !crossed_pointer_to;
+
+  if (!is_a_vector && !type_has_method(itype, "size")) {
+    return CF_none;
+  }
+
+  // A const-qualified vector is read-only, and must be classified so here: the
+  // native helper writer already refuses to emit the mutating helpers for it
+  // (you cannot call push_back / resize on a const T).  Calling it mutable would
+  // emit a NativeList<T> whose resize() entry point was never generated -- an
+  // EntryPointNotFoundException on first use.
+  if (is_const_qualified_type(itype) ||
+      collection_facade_is_readonly(itype, is_a_vector)) {
     return CF_readonly_array;
   }
 
@@ -1484,6 +1597,17 @@ bool
 should_skip_csharp_type(const InterrogateType &itype) {
   if (is_empty_pointer_facade_type(itype)) {
     return true;
+  }
+
+  // A collection facade's C# form is synthesized from its element type
+  // (NativeList<T> / NativeReadOnlyList<T>), so it needs no members of its own
+  // to be expressible -- and must not be judged by the test below.  panda3d's
+  // pvector<T> is deliberately an empty body under CPPPARSER, making it neither
+  // global nor fully defined; skipping it here is what silently dropped every
+  // vector_uchar and vector_string method (Datagram blobs, BAM encode/decode,
+  // Multifile::read_subfile, vertex-buffer bytes, ...).
+  if (is_collection_facade_type(itype)) {
+    return false;
   }
 
   // Skip C++ internal types that are not exported.;
@@ -2366,9 +2490,15 @@ write_functions(ostream &out) {
       is_mutable = false;
     }
 
+    // Only if the type really can be default-constructed.  panda3d's
+    // ReferenceCountedVector<T> is a vector but every constructor takes a
+    // TypeHandle, so `new T()` does not compile; the db records the answer
+    // (F_default_constructible) because pass 2 cannot work it out.
     // Use base_cpp_type (no const) for allocation: "new const T()" returns
     // const T* which cannot convert to void*.
-    out << "EXPORT_FUNC void *" << helper_prefix << "empty_constructor() { return new " << base_cpp_type << "(); }\n";
+    if (itype.is_default_constructible()) {
+      out << "EXPORT_FUNC void *" << helper_prefix << "empty_constructor() { return new " << base_cpp_type << "(); }\n";
+    }
     out << "EXPORT_FUNC int " << helper_prefix << "size(" << cpp_type << " *self) { return self->size(); }\n";
     out << "EXPORT_FUNC ";
     if (is_string) {
@@ -2861,8 +2991,12 @@ write_native_methods_file(const string &dir, const string &cs_namespace) {
     string cs_ret_type = is_string ? "IntPtr" : (is_primitive ? element_type_value : "IntPtr");
     string cs_param_type = is_string ? "string" : (is_primitive ? element_type_value : "IntPtr");
 
-    out << "    [LibraryImport(\"" << quote_csharp_string(_dll_name) << "\", EntryPoint = \"" << helper_prefix << "empty_constructor\")]\n";
-    out << "    internal static partial IntPtr " << helper_prefix << "empty_constructor();\n\n";
+    // Declared only when the native side emits it — see the matching guard on
+    // the helper itself.
+    if (itype.is_default_constructible()) {
+      out << "    [LibraryImport(\"" << quote_csharp_string(_dll_name) << "\", EntryPoint = \"" << helper_prefix << "empty_constructor\")]\n";
+      out << "    internal static partial IntPtr " << helper_prefix << "empty_constructor();\n\n";
+    }
 
     out << "    [LibraryImport(\"" << quote_csharp_string(_dll_name) << "\", EntryPoint = \"" << helper_prefix << "size\")]\n";
     out << "    internal static partial int " << helper_prefix << "size(IntPtr self);\n\n";
@@ -3528,7 +3662,8 @@ write_collection_adapter_class(ostream &out, Object *object) {
   // C++ constructors that write_constructor() will emit below, and
   // emitting our own Collection_*_empty_constructor version on top would
   // collide with the real default ctor.
-  if (use_collection_helpers && object->_constructors.empty()) {
+  if (use_collection_helpers && object->_constructors.empty() &&
+      itype.is_default_constructible()) {
     indent(out, 4) << "public " << class_name << "() : base(NativeMethods."
                    << get_collection_helper_name(itype, "empty_constructor") << "(), NativeOwnership.Owned) {}\n\n";
   }
@@ -3546,7 +3681,34 @@ write_collection_adapter_class(ostream &out, Object *object) {
   }
   bool is_blittable_element = is_csharp_blittable_type(element_value_type);
 
-  if (is_mutable && use_collection_helpers) {
+  // The convenience constructors below chain `: this()`, so only emit them when
+  // a parameterless constructor actually exists.  Two ways it can: the facade
+  // emitted its own (above), or the C++ type published a real default ctor
+  // (PTA_uchar does).  ReferenceCountedVector<T> has neither -- every one of its
+  // constructors takes a TypeHandle -- and chaining to a ctor that isn't there
+  // is a C# compile error.
+  bool has_parameterless_ctor =
+    use_collection_helpers && object->_constructors.empty() &&
+    itype.is_default_constructible();
+
+  if (!has_parameterless_ctor) {
+    InterrogateDatabase *idb_ctors = InterrogateDatabase::get_ptr();
+    for (Function *ctor : object->_constructors) {
+      const InterrogateFunction &ifunc = ctor->_ifunc;
+      for (int wi = 0; wi < ifunc.number_of_c_wrappers() && !has_parameterless_ctor; ++wi) {
+        const InterrogateFunctionWrapper &w =
+          idb_ctors->get_wrapper(ifunc.get_c_wrapper(wi));
+        if (w.number_of_parameters() == 0) {
+          has_parameterless_ctor = true;
+        }
+      }
+      if (has_parameterless_ctor) {
+        break;
+      }
+    }
+  }
+
+  if (is_mutable && use_collection_helpers && has_parameterless_ctor) {
     if (is_blittable_element) {
       // Bulk ReadOnlySpan<T> constructor - single memcpy via native resize + pointer
       indent(out, 4) << "public " << class_name << "(ReadOnlySpan<" << element_type << "> source) : this() {\n";
@@ -7948,6 +8110,15 @@ get_base_class_clause(const InterrogateType &itype) const {
     if (current->number_of_derivations() == 0) {
       break;
     }
+    // A DF_pointer_to derivation means "holds a T", not "is a T" — it is the
+    // synthesized edge from a smart-pointer holder (PointerToBase<T>) to its
+    // pointee, not inheritance.  Turning it into a C# base class was always
+    // wrong; it merely happened to compile while the pointee was an ordinary
+    // class.  It stops compiling the moment the pointee is a collection facade,
+    // because those are sealed.
+    if (current->derivation_is_pointer_to(0)) {
+      break;
+    }
     TypeIndex base_index = current->get_derivation(0);
     if (!is_wrapped_type(base_index)) {
       break;
@@ -8156,7 +8327,11 @@ get_collection_element_type_from_cpp_name(const string &cpp_name, bool for_signa
       if (for_signature && uses_csharp_interface(itype)) {
         return get_interface_name(itype);
       }
-      return get_class_name(itype);
+      // Qualified, not the bare class name: a nested type is emitted as a nested
+      // C# class, so InputDevice::ButtonState is `InputDevice.ButtonState`.  The
+      // flat form (`InputDevice_ButtonState`) names only the *file*, and emitting
+      // it here produced a NativeList<> over a type that does not exist.
+      return get_qualified_class_name(itype);
     }
   }
 

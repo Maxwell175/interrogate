@@ -82,6 +82,7 @@ public:
 
   INLINE bool is_fully_defined() const;
   INLINE bool is_unpublished() const;
+  INLINE bool is_default_constructible() const;
   INLINE int number_of_constructors() const;
   INLINE FunctionIndex get_constructor(int n) const;
   INLINE bool has_destructor() const;
@@ -152,6 +153,7 @@ private:
     F_deprecated           =0x2000000,
     F_abstract             =0x4000000,
     F_forced_complex_inheritance =0x8000000,
+    F_default_constructible     =0x10000000,
   };
 
 public:
