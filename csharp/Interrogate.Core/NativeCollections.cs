@@ -107,4 +107,70 @@ namespace Interrogate {
 
         public abstract void RemoveAt(int index);
     }
+
+    /// <summary>
+    /// A live view over a native sequence that is exposed as a length function plus
+    /// an element accessor -- interrogate's MAKE_SEQ_PROPERTY
+    /// (<c>MAKE_SEQ_PROPERTY(axes, get_num_axes, get_axis)</c>).
+    /// </summary>
+    /// <remarks>
+    /// Unlike <see cref="NativeReadOnlyList{T}"/>, there is no native container object
+    /// to wrap: the pair of accessors *is* the sequence.  So this holds the accessors
+    /// and reads through to the owner on every call -- it tracks the owner rather than
+    /// snapshotting it, which is what the C++ (and Python) semantics are.  A sequence
+    /// with no setter throws on assignment rather than pretending to be mutable.
+    /// </remarks>
+    /// <typeparam name="T">Managed element type.</typeparam>
+    public sealed class NativeSeq<T> : IReadOnlyList<T> {
+        private readonly Func<int> _count;
+        private readonly Func<int, T> _get;
+        private readonly Action<int, T>? _set;
+
+        public NativeSeq(Func<int> count, Func<int, T> get, Action<int, T>? set = null) {
+            _count = count ?? throw new ArgumentNullException(nameof(count));
+            _get = get ?? throw new ArgumentNullException(nameof(get));
+            _set = set;
+        }
+
+        public int Count => _count();
+
+        /// <summary>True when the underlying property exposed no setter.</summary>
+        public bool IsReadOnly => _set is null;
+
+        public T this[int index] {
+            get {
+                if ((uint)index >= (uint)_count()) {
+                    throw new ArgumentOutOfRangeException(nameof(index));
+                }
+                return _get(index);
+            }
+            set {
+                if (_set is null) {
+                    throw new NotSupportedException("This native sequence is read-only.");
+                }
+                if ((uint)index >= (uint)_count()) {
+                    throw new ArgumentOutOfRangeException(nameof(index));
+                }
+                _set(index, value);
+            }
+        }
+
+        public T[] ToArray() {
+            int n = _count();
+            var result = new T[n];
+            for (int i = 0; i < n; ++i) {
+                result[i] = _get(i);
+            }
+            return result;
+        }
+
+        public IEnumerator<T> GetEnumerator() {
+            int n = _count();
+            for (int i = 0; i < n; ++i) {
+                yield return _get(i);
+            }
+        }
+
+        IEnumerator IEnumerable.GetEnumerator() => GetEnumerator();
+    }
 }

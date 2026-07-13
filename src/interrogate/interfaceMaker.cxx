@@ -788,6 +788,22 @@ record_object(TypeIndex type_index) {
       FunctionIndex func_index = ielement.get_setter();
       record_function(itype, func_index);
     }
+
+    // C# reaches a property's supporting accessors by calling them, so they need a
+    // P/Invoke -- and only the getter and setter were ever recorded.  A
+    // MAKE_SEQ_PROPERTY's length function is usually not PUBLISHED in its own right
+    // (InputDevice::get_num_axes is not), so there was nothing to call, while
+    // get_axis -- the element getter -- did get one.  Same for MAKE_PROPERTY2's
+    // has_xxx().  Scoped to C#: Python drives these through its own property
+    // machinery, and recording them here would surface them as plain methods there.
+    if (build_csharp) {
+      if (ielement.get_length_function() != 0) {
+        record_function(itype, ielement.get_length_function());
+      }
+      if (ielement.has_has_function()) {
+        record_function(itype, ielement.get_has_function());
+      }
+    }
   }
 
   object->check_protocols();

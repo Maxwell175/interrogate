@@ -2816,6 +2816,17 @@ record_secondary_base_members() {
         if (ielement.has_setter()) {
           record_function(*base_type, ielement.get_setter());
         }
+        // A property's supporting accessors need P/Invokes too, and only the getter
+        // and setter were ever registered.  MAKE_SEQ_PROPERTY's length function is
+        // not PUBLISHED in its own right (InputDevice::get_num_axes is not), so it
+        // had no declaration to call -- while get_axis, being the element getter,
+        // did.  Same for MAKE_PROPERTY2's has_xxx().
+        if (ielement.get_length_function() != 0) {
+          record_function(*base_type, ielement.get_length_function());
+        }
+        if (ielement.has_has_function()) {
+          record_function(*base_type, ielement.get_has_function());
+        }
       }
     }
   }
@@ -6073,6 +6084,19 @@ write_property_from_wrapper(ostream &out, const InterrogateElement &ielement,
                             Object *object, int indent_level, bool is_interface) {
   InterrogateDatabase *idb = InterrogateDatabase::get_ptr();
 
+  // MAKE_SEQ_PROPERTY: the getter takes an index, so the simple-accessor path below
+  // would discard it (and did -- silently, for all 107 of them).
+  if (ielement.is_sequence()) {
+    write_sequence_property_from_wrapper(out, ielement, object, indent_level,
+                                         is_interface);
+    return;
+  }
+  if (ielement.is_mapping()) {
+    record_skipped("map-property", ielement.get_scoped_name(),
+                   "MAKE_MAP_PROPERTY is not implemented for C#");
+    return;
+  }
+
   auto first_legal_wrapper = [&](FunctionIndex func_index, Function *&out_func)
       -> const InterrogateFunctionWrapper * {
     out_func = nullptr;
@@ -6341,6 +6365,201 @@ write_property_from_wrapper(ostream &out, const InterrogateElement &ielement,
 
   indent(out, indent_level) << "}\n\n";
 }
+
+/**
+ * Emits a MAKE_SEQ_PROPERTY as an Interrogate.NativeSeq<T> -- a live IReadOnlyList<T>
+ * over the (length, element) accessor pair.
+ *
+ * There is no native container to wrap here: the two accessors ARE the sequence, and
+ * they are often the only way in at all.  InputDevice's get_num_axes / get_axis are not
+ * PUBLISHED -- MAKE_SEQ_PROPERTY(axes, ...) is -- so with this unimplemented the whole
+ * axis and button surface was unreachable from C#, and silently so.
+ */
+void InterfaceMakerCSharp::
+write_sequence_property_from_wrapper(ostream &out, const InterrogateElement &ielement,
+                                     Object *object, int indent_level, bool is_interface) {
+  InterrogateDatabase *idb = InterrogateDatabase::get_ptr();
+
+  if (object == nullptr) {
+    return;
+  }
+
+  // Find the wrapper with exactly `want_arity` parameters after `this`.  Taking the
+  // first legal one is wrong: interrogate emits one wrapper per default-argument
+  // count, and the first is the widest.  NodePath::get_node(int, Thread * = ...)
+  // has wrappers of arity 2 and 1 -- only the second is the element accessor.
+  auto find_wrapper = [&](FunctionIndex func_index, int want_arity, Function *&out_func)
+      -> const InterrogateFunctionWrapper * {
+    out_func = nullptr;
+    if (func_index == 0) return nullptr;
+    FunctionsByIndex::const_iterator it = _functions.find(func_index);
+    if (it == _functions.end()) return nullptr;
+    Function *func = it->second;
+    int n = func->_ifunc.number_of_c_wrappers();
+    for (int wi = 0; wi < n; ++wi) {
+      FunctionWrapperIndex widx = func->_ifunc.get_c_wrapper(wi);
+      if (widx == 0) continue;
+      const InterrogateFunctionWrapper &w = idb->get_wrapper(widx);
+      if (w.is_explicit_self() || !is_wrapper_legal_csharp(w)) continue;
+      int np = w.number_of_parameters();
+      bool has_this = np != 0 && w.parameter_is_this(0);
+      if (np - (has_this ? 1 : 0) != want_arity) continue;
+      out_func = func;
+      return &w;
+    }
+    return nullptr;
+  };
+
+  auto is_static_wrapper = [](const InterrogateFunctionWrapper &w) {
+    return w.number_of_parameters() == 0 || !w.parameter_is_this(0);
+  };
+
+  Function *length_func = nullptr;
+  Function *getter_func = nullptr;
+  Function *setter_func = nullptr;
+  const InterrogateFunctionWrapper *length_w =
+    find_wrapper(ielement.get_length_function(), 0, length_func);
+  const InterrogateFunctionWrapper *getter_w =
+    ielement.has_getter() ? find_wrapper(ielement.get_getter(), 1, getter_func) : nullptr;
+  const InterrogateFunctionWrapper *setter_w =
+    ielement.has_setter() ? find_wrapper(ielement.get_setter(), 2, setter_func) : nullptr;
+
+  if (length_w == nullptr || getter_w == nullptr || !getter_w->has_return_value()) {
+    record_skipped("seq-property", ielement.get_scoped_name(),
+                   "no accessor pair of the shape (length) / (index)");
+    return;
+  }
+
+  // The two need not agree on staticness: LMatrix declares
+  // MAKE_SEQ_PROPERTY(rows, size, get_row) where size() is static and get_row() is
+  // not.  The element accessor decides what the property is -- a static getter has
+  // no instance to read through -- and a static length is simply called without one.
+  bool getter_is_static = is_static_wrapper(*getter_w);
+  bool length_is_static = is_static_wrapper(*length_w);
+  if (getter_is_static && !length_is_static) {
+    record_skipped("seq-property", ielement.get_scoped_name(),
+                   "static element accessor with an instance length accessor");
+    return;
+  }
+  if (setter_w != nullptr && is_static_wrapper(*setter_w) != getter_is_static) {
+    setter_w = nullptr;
+  }
+  if (is_interface && getter_is_static) {
+    return;
+  }
+
+  TypeIndex element_index = getter_w->get_return_type();
+  string element_type = get_csharp_signature_type(element_index, false);
+  if (element_type.empty()) {
+    record_skipped("seq-property", ielement.get_scoped_name(),
+                   "no C# mapping for element type '" +
+                   report_type_name(element_index) + "'");
+    return;
+  }
+  string concrete_type = get_csharp_native_object_class_name(element_index);
+
+  string property_name = to_pascal_case(make_csharp_identifier(ielement.get_name()));
+  if (property_name.empty() || property_name == "void" ||
+      is_blocked_pascal_alias(property_name)) {
+    return;
+  }
+
+  // A member may not share a name with a nested type (CS0102).
+  {
+    const InterrogateType &owner = object->_itype;
+    for (int i = 0; i < owner.number_of_nested_types(); ++i) {
+      TypeIndex nested_index = owner.get_nested_type(i);
+      if (nested_index == 0) continue;
+      const InterrogateType &nested = idb->get_type(nested_index);
+      if (should_nest_type(nested) &&
+          get_simple_class_name(nested) == property_name) {
+        record_skipped("seq-property", ielement.get_scoped_name(),
+                       "name collides with nested type '" + property_name + "' (CS0102)");
+        return;
+      }
+    }
+  }
+
+  string seq_type = "global::Interrogate.NativeSeq<" + element_type + ">";
+
+  if (ielement.has_comment()) {
+    emit_xml_doc_comment(out, ielement.get_comment(), indent_level);
+  }
+
+  indent(out, indent_level);
+  if (!is_interface) {
+    out << "public ";
+    if (getter_is_static) {
+      out << "static ";
+    }
+  }
+  out << seq_type << " " << property_name;
+
+  if (is_interface) {
+    out << " { get; }\n";
+    return;
+  }
+
+  out << " {\n";
+  indent(out, indent_level + 2) << "get {\n";
+
+  string length_this = length_is_static
+    ? string() : get_native_this_argument(object->_itype, length_func->_ifunc);
+  string getter_this = getter_is_static
+    ? string() : get_native_this_argument(object->_itype, getter_func->_ifunc);
+  string getter_this_arg = getter_this.empty() ? string() : getter_this + ", ";
+
+  // The index parameter is size_t in C++ far more often than int, so cast rather
+  // than assume the P/Invoke takes an int.
+  string index_cast =
+    get_pinvoke_type(getter_w->parameter_get_type(getter_is_static ? 0 : 1), false);
+  string index_arg = "(" + index_cast + ")__index";
+
+  string element_call =
+    get_pinvoke_call_name(getter_func->_ifunc, *getter_w) +
+    "(" + getter_this_arg + index_arg + ")";
+
+  string element_expr;
+  if (!concrete_type.empty()) {
+    element_expr = concrete_type + ".__CreateFromNative(" + element_call + ", " +
+                   get_native_ownership_name(*getter_w, false) + ")!";
+  } else if (is_csharp_enum_type(element_index)) {
+    element_expr = "(" + element_type + ")" + element_call;
+  } else if ((element_type == "string" || element_type == "string?") &&
+             get_pinvoke_type(element_index, true) != "string") {
+    element_expr = "Marshal.PtrToStringUTF8(" + element_call + ") ?? string.Empty";
+  } else {
+    element_expr = element_call;
+  }
+
+  indent(out, indent_level + 4) << "return new " << seq_type << "(\n";
+  indent(out, indent_level + 6) << "() => (int)"
+                                << get_pinvoke_call_name(length_func->_ifunc, *length_w)
+                                << "(" << length_this << "),\n";
+  indent(out, indent_level + 6) << "__index => " << element_expr;
+
+  if (setter_w != nullptr) {
+    TypeIndex value_index = setter_w->parameter_get_type(getter_is_static ? 1 : 2);
+    string value_type = get_csharp_type(value_index, false);
+    string setter_this = getter_is_static
+      ? string() : get_native_this_argument(object->_itype, setter_func->_ifunc);
+    string setter_this_arg = setter_this.empty() ? string() : setter_this + ", ";
+    string setter_index_cast = get_pinvoke_type(setter_w->parameter_get_type(setter_this.empty() ? 0 : 1), false);
+
+    out << ",\n";
+    indent(out, indent_level + 6) << "(__index, __value) => "
+                                  << get_pinvoke_call_name(setter_func->_ifunc, *setter_w)
+                                  << "(" << setter_this_arg << "("
+                                  << setter_index_cast << ")__index, "
+                                  << marshal_managed_argument(value_index, value_type, "__value")
+                                  << ")";
+  }
+  out << ");\n";
+
+  indent(out, indent_level + 2) << "}\n";
+  indent(out, indent_level) << "}\n\n";
+}
+
 
 /**
  *
