@@ -138,6 +138,7 @@ private:
                                           bool for_return = false) const;
   const InterrogateType *find_csharp_object_type(const std::string &type_name) const;
   std::string globalize_class_name(const InterrogateType &itype) const;
+  std::string csharp_out_parameter_type(TypeIndex type_index) const;
   std::string get_csharp_signature_type(CPPType *type,
                                         bool for_return = false) const;
   // `is_parameter` marks the type as appearing in an incoming parameter rather

@@ -5592,6 +5592,10 @@ write_method(ostream &out, Function *func, Object *object, int indent_level,
         if (i != 0) {
           out << ", ";
         }
+        // An out-parameter has to be forwarded as one.
+        if (i < param_types.size() && param_types[i].compare(0, 4, "out ") == 0) {
+          out << "out ";
+        }
         out << param_names[i];
       }
       out << ");\n";
@@ -5657,6 +5661,14 @@ write_method(ostream &out, Function *func, Object *object, int indent_level,
         param_type = "global::System.IO.Stream";
       }
 
+      // C++'s out-parameter idiom (a non-const reference to a number) marshals
+      // straight through as `out T` -- no pinning, no unsafe.
+      string out_type = (stream_tok == AT_not_atomic)
+        ? csharp_out_parameter_type(param_type_index) : string();
+      if (!out_type.empty()) {
+        param_type = "out " + out_type;
+      }
+
       string param_name = wrapper.parameter_has_name(i)
         ? make_csharp_identifier(wrapper.parameter_get_name(i))
         : string("param") + std::to_string(i - first_param);
@@ -5664,7 +5676,9 @@ write_method(ostream &out, Function *func, Object *object, int indent_level,
       param_decls.push_back(param_type + " " + param_name);
       param_names.push_back(param_name);
 
-      if (stream_tok != AT_not_atomic) {
+      if (!out_type.empty()) {
+        native_args.push_back("out " + param_name);
+      } else if (stream_tok != AT_not_atomic) {
         string bridge_var = "__p3stream" + std::to_string(stream_bridges.size());
         stream_bridges.push_back({bridge_var, csharp_stream_bridge_factory(stream_tok),
                                   param_name, param_nullable});
@@ -5882,6 +5896,10 @@ write_method(ostream &out, Function *func, Object *object, int indent_level,
       for (size_t i = 0; i < param_names.size(); ++i) {
         if (i != 0) {
           out << ", ";
+        }
+        // An out-parameter has to be forwarded as one.
+        if (i < param_types.size() && param_types[i].compare(0, 4, "out ") == 0) {
+          out << "out ";
         }
         out << param_names[i];
       }
@@ -6898,6 +6916,12 @@ write_dllimport(ostream &out, const InterrogateFunction &ifunc,
     string pinvoke_type = wrapper.parameter_is_this(i) ? "IntPtr" : get_pinvoke_type(type, false);
     if (pinvoke_type == "string" && wrapper.parameter_is_nullable(i)) {
       pinvoke_type += "?";
+    }
+    if (!wrapper.parameter_is_this(i)) {
+      string out_type = csharp_out_parameter_type(type);
+      if (!out_type.empty()) {
+        pinvoke_type = "out " + out_type;
+      }
     }
     out << pinvoke_type << " " << param_name;
   }
@@ -7966,6 +7990,45 @@ get_csharp_native_object_class_name(TypeIndex type_index) const {
  * inside its own methods started resolving to the property (an ICullTraverser)
  * instead of the class.  A global:: qualified name cannot be shadowed.
  */
+/**
+ * If this parameter is an out-parameter, returns its C# element type; otherwise "".
+ *
+ * A parameter arrives here as a pointer-to-numeric only if it started life as a
+ * non-const reference to one: raw `T *` parameters get no remap at all (they are
+ * dropped, and reported), so nothing else can produce this shape.  That makes the
+ * inference safe -- `PN_stdfloat &min_depth` becomes `out float min_depth`.
+ */
+string InterfaceMakerCSharp::
+csharp_out_parameter_type(TypeIndex type_index) const {
+  InterrogateDatabase *idb = InterrogateDatabase::get_ptr();
+  TypeIndex resolved = unwrap_type_aliases(type_index);
+  if (resolved == 0) {
+    return string();
+  }
+  const InterrogateType &itype = idb->get_type(resolved);
+  if (!itype.is_pointer()) {
+    return string();
+  }
+  TypeIndex inner = unwrap_type_aliases(itype.get_wrapped_type());
+  if (inner == 0) {
+    return string();
+  }
+
+  // Numeric only.  bool is not blittable, and an enum would need its underlying
+  // type; neither shows up as an out-parameter in practice.
+  string element = get_pinvoke_type(inner, false);
+  static const char *const numeric[] = {
+    "byte", "sbyte", "short", "ushort", "int", "uint",
+    "long", "ulong", "float", "double",
+  };
+  for (const char *candidate : numeric) {
+    if (element == candidate) {
+      return element;
+    }
+  }
+  return string();
+}
+
 string InterfaceMakerCSharp::
 globalize_class_name(const InterrogateType &itype) const {
   string name = get_qualified_class_name(itype);
