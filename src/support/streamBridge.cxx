@@ -233,4 +233,89 @@ igStreamBridge_LiveCount() {
   return g_live_bridges.load(std::memory_order_relaxed);
 }
 
+// ---------------------------------------------------------------------------
+// The reverse direction: a C++ stream the native side owns, driven from managed
+// code.  None of these free the stream -- that stays with whoever produced it.
+
+int64_t
+igStream_Read(void *istream, void *buf, int64_t len) {
+  if (istream == nullptr || buf == nullptr || len < 0) {
+    return -1;
+  }
+  std::istream *in = static_cast<std::istream *>(istream);
+  in->read(static_cast<char *>(buf), (std::streamsize)len);
+  std::streamsize count = in->gcount();
+
+  // eof with a partial (or empty) read is a normal end, not a failure: clear the
+  // flags so the stream stays usable for tell/seek afterwards.
+  if (in->fail() && in->eof()) {
+    in->clear(in->rdstate() & ~(std::ios::failbit | std::ios::eofbit));
+    return (int64_t)count;
+  }
+  if (in->bad()) {
+    return -1;
+  }
+  return (int64_t)count;
+}
+
+int64_t
+igStream_Write(void *ostream, const void *buf, int64_t len) {
+  if (ostream == nullptr || buf == nullptr || len < 0) {
+    return -1;
+  }
+  std::ostream *out = static_cast<std::ostream *>(ostream);
+  out->write(static_cast<const char *>(buf), (std::streamsize)len);
+  return out->fail() ? -1 : len;
+}
+
+int64_t
+igStream_Seek(void *stream, int64_t offset, int origin, int is_input) {
+  if (stream == nullptr) {
+    return -1;
+  }
+  std::ios_base::seekdir dir = (origin == 1) ? std::ios_base::cur
+                             : (origin == 2) ? std::ios_base::end
+                                             : std::ios_base::beg;
+  // A failed seek must leave the stream usable: a decompressing stream (a compressed
+  // multifile subfile) refuses to seek, and if that left failbit set every later read
+  // would silently do nothing.  Clear it and report the failure through the return
+  // value instead.
+  if (is_input) {
+    std::istream *in = static_cast<std::istream *>(stream);
+    in->clear();
+    in->seekg((std::streamoff)offset, dir);
+    if (in->fail()) {
+      in->clear();
+      return -1;
+    }
+    return (int64_t)in->tellg();
+  }
+  std::ostream *out = static_cast<std::ostream *>(stream);
+  out->clear();
+  out->seekp((std::streamoff)offset, dir);
+  if (out->fail()) {
+    out->clear();
+    return -1;
+  }
+  return (int64_t)out->tellp();
+}
+
+int64_t
+igStream_Tell(void *stream, int is_input) {
+  if (stream == nullptr) {
+    return -1;
+  }
+  if (is_input) {
+    return (int64_t)static_cast<std::istream *>(stream)->tellg();
+  }
+  return (int64_t)static_cast<std::ostream *>(stream)->tellp();
+}
+
+void
+igStream_Flush(void *ostream) {
+  if (ostream != nullptr) {
+    static_cast<std::ostream *>(ostream)->flush();
+  }
+}
+
 }  // extern "C"

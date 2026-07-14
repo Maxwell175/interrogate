@@ -57,6 +57,42 @@ igStreamBridge_CreateIostream(ig_stream_read_fn read_cb,
                               ig_stream_seek_fn seek_cb,
                               void *cookie);
 
+// ---------------------------------------------------------------------------
+// The reverse direction: operating on a C++ stream that the *native* side owns.
+//
+// The bridge above only goes one way -- it wraps a managed Stream so C++ can read
+// or write it.  A C++ function that hands back an std::istream * (VirtualFile::
+// open_read_file, Multifile::open_read_subfile, ...) had nowhere to go: interrogate
+// mapped the return to an opaque IntPtr, and the bound istream exposed only get(),
+// one byte per P/Invoke.  So the managed side could open a file and then do nothing
+// with it -- and worse, the close_read_file(istream *) overload took the *parameter*
+// path, which bridges a brand-new native stream from a managed one, so it destroyed
+// a stream C++ had never given out while the bridge destroyed it again.
+//
+// These let Interrogate.Core's NativeStream wrap such a pointer as a real
+// System.IO.Stream.  They do not own the stream: freeing it stays with whoever
+// produced it (the C++ close_* method), exactly as the C++ contract says.
+
+// Reads up to len bytes.  Returns the number read (0 at end of stream), or -1.
+IG_SUPPORT_EXPORT int64_t
+igStream_Read(void *istream, void *buf, int64_t len);
+
+// Writes len bytes.  Returns len on success, or -1.
+IG_SUPPORT_EXPORT int64_t
+igStream_Write(void *ostream, const void *buf, int64_t len);
+
+// origin: 0 = begin, 1 = current, 2 = end.  is_input selects the get or put
+// pointer.  Returns the new absolute position, or -1.
+IG_SUPPORT_EXPORT int64_t
+igStream_Seek(void *stream, int64_t offset, int origin, int is_input);
+
+// Returns the current position, or -1.
+IG_SUPPORT_EXPORT int64_t
+igStream_Tell(void *stream, int is_input);
+
+IG_SUPPORT_EXPORT void
+igStream_Flush(void *ostream);
+
 // Destroy a stream previously created by the matching factory.  The three
 // variants exist because the C# side knows which direction it asked for; we
 // need that information to downcast back to the concrete subclass whose

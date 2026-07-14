@@ -37,3 +37,12 @@ int StreamUser::bytes_read() const {
 void StreamUser::set_id(int id) {
   _id = id;
 }
+
+std::istream *StreamUser::open_stream() {
+  // Owned by C++ until close_stream() takes it back.
+  return new std::istringstream("native-stream-contents");
+}
+
+void StreamUser::close_stream(std::istream *stream) {
+  delete stream;
+}

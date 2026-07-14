@@ -19,6 +19,7 @@ internal static class Driver {
         TestWriteHello();
         TestReadAll();
         TestEchoIostream();
+        TestReturnedStream();
 
         Console.WriteLine();
         if (_failed == 0) {
@@ -78,5 +79,33 @@ internal static class Driver {
         using var reader = new StreamReader(mem);
         string got = reader.ReadToEnd();
         Check(got.Contains("echo:world"), $"echo produced '...echo:world...' (got: '{got}')");
+    }
+
+    // A stream C++ owns, handed back and then taken back to free.  Before reverse
+    // bridging this was untestable: open_stream() returned an opaque IntPtr, and
+    // close_stream() took the *parameter* path, which bridges a brand-new native
+    // stream around a managed one -- so C++ deleted a stream it had never handed out
+    // while the bridge deleted it again.  Both directions are exercised here.
+    private static void TestReturnedStream() {
+        Console.WriteLine("TestReturnedStream: C++ hands back a stream, then frees it");
+        long before = Interrogate.StreamBridge.LiveCount;
+
+        var user = new StreamUser();
+        Stream? stream = user.open_stream();
+        Check(stream != null, "open_stream() returned a System.IO.Stream");
+        Check(stream is Interrogate.NativeStream, "it is a NativeStream over the C++ istream");
+        Check(stream!.CanRead && !stream.CanWrite, "readable, not writable");
+
+        using (var reader = new StreamReader(stream, leaveOpen: true)) {
+            string got = reader.ReadToEnd();
+            Check(got == "native-stream-contents", $"read the contents (got: '{got}')");
+        }
+
+        // Must close the stream C++ actually gave us -- not a bridged impostor.
+        user.close_stream(stream);
+        Check(true, "close_stream() did not double free");
+
+        Check(Interrogate.StreamBridge.LiveCount == before,
+              $"no bridge was created for a NativeStream ({before} -> {Interrogate.StreamBridge.LiveCount})");
     }
 }

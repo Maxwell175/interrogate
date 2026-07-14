@@ -29,11 +29,27 @@ namespace Interrogate {
         private GCHandle _cookie;
         private IntPtr _handle;
         private readonly Direction _direction;
+        private readonly bool _owns;
 
         private StreamBridge(Stream? stream, Direction direction) {
             _direction = direction;
+            _owns = true;
+
             if (stream == null) {
                 _handle = IntPtr.Zero;
+                return;
+            }
+
+            // Already a native stream?  Hand its pointer straight back.  Bridging it
+            // would build a *second* native stream around the managed wrapper of the
+            // first -- which is how VirtualFile::close_read_file(istream *) came to
+            // destroy a stream C++ had never handed out, while this bridge destroyed
+            // it again on dispose.  A double free, from calling the only close method
+            // the bindings offered.  Passing the handle through means close_read_file
+            // closes exactly the stream that open_read_file returned.
+            if (stream is NativeStream native) {
+                _handle = native.Handle;
+                _owns = false;
                 return;
             }
 
@@ -120,6 +136,11 @@ namespace Interrogate {
         }
 
         private void ReleaseNative() {
+            if (!_owns) {
+                // The native side owns this stream; we only borrowed its pointer.
+                _handle = IntPtr.Zero;
+                return;
+            }
             if (_handle != IntPtr.Zero) {
                 switch (_direction) {
                     case Direction.Input:       NativeMethods.DestroyIstream(_handle); break;

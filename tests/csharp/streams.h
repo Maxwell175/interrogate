@@ -27,6 +27,15 @@ public:
   // Setter for write_hello's id (so the test can verify marshalled content).
   void set_id(int id);
 
+  // Hands back a stream that C++ owns, and takes it back to free.  This is the
+  // open_read_file / close_read_file shape -- the one that was never tested, and
+  // was therefore broken in two ways at once: the return came back as an opaque
+  // IntPtr, and passing it to the close method bridged a *brand-new* native stream
+  // which both sides then deleted.  A double free, reachable from the only close
+  // method the bindings offered.
+  std::istream *open_stream();
+  void close_stream(std::istream *stream);
+
 private:
   int _id;
   int _bytes_read;

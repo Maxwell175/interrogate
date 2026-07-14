@@ -1550,6 +1550,16 @@ csharp_stream_token_for_type(TypeIndex param_type_index) {
   return AT_not_atomic;
 }
 
+// Name of the Interrogate.NativeStreamKind for a returned C++ stream.
+static const char *csharp_native_stream_kind(AtomicToken token) {
+  switch (token) {
+  case AT_istream:  return "global::Interrogate.NativeStreamKind.Input";
+  case AT_ostream:  return "global::Interrogate.NativeStreamKind.Output";
+  case AT_iostream: return "global::Interrogate.NativeStreamKind.InputOutput";
+  default:          return nullptr;
+  }
+}
+
 // Name of the Interrogate.StreamBridge factory for a given direction.
 const char *
 csharp_stream_bridge_factory(AtomicToken tok) {
@@ -5690,6 +5700,17 @@ write_method(ostream &out, Function *func, Object *object, int indent_level,
     string return_type = wrapper.has_return_value()
       ? get_csharp_signature_type(return_type_index, return_nullable) : "void";
 
+    // A returned C++ stream is a real System.IO.Stream now (Interrogate.NativeStream
+    // drives it in place).  It used to come back as an opaque IntPtr -- so
+    // VirtualFile::open_read_file handed you something you could do nothing with,
+    // and the only close method took the *parameter* path, bridging a brand-new
+    // native stream and then double-freeing it.
+    AtomicToken return_stream_tok = wrapper.has_return_value()
+      ? csharp_stream_token_for_type(return_type_index) : AT_not_atomic;
+    if (return_stream_tok != AT_not_atomic) {
+      return_type = "global::System.IO.Stream?";
+    }
+
 
     std::vector<string> param_types;
     std::vector<string> param_decls;
@@ -5864,6 +5885,11 @@ write_method(ostream &out, Function *func, Object *object, int indent_level,
 
     if (!wrapper.has_return_value()) {
       indent(out, indent_level + 2) << native_call << ";\n";
+
+    } else if (return_stream_tok != AT_not_atomic) {
+      indent(out, indent_level + 2) << "IntPtr result = " << native_call << ";\n";
+      indent(out, indent_level + 2) << "return global::Interrogate.NativeStream.Wrap(result, "
+                                    << csharp_native_stream_kind(return_stream_tok) << ");\n";
 
     } else if (managed_return_type == "string" || managed_return_type == "string?") {
       if (pinvoke_return_type == "string") {
