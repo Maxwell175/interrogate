@@ -2882,6 +2882,12 @@ record_secondary_base_members() {
         if (ielement.has_has_function()) {
           record_function(*base_type, ielement.get_has_function());
         }
+        if (ielement.has_getkey_function()) {
+          record_function(*base_type, ielement.get_getkey_function());
+        }
+        if (ielement.has_clear_function()) {
+          record_function(*base_type, ielement.get_clear_function());
+        }
       }
     }
   }
@@ -6189,8 +6195,7 @@ write_property_from_wrapper(ostream &out, const InterrogateElement &ielement,
     return;
   }
   if (ielement.is_mapping()) {
-    record_skipped("map-property", ielement.get_scoped_name(),
-                   "MAKE_MAP_PROPERTY is not implemented for C#");
+    write_map_property_from_wrapper(out, ielement, object, indent_level, is_interface);
     return;
   }
 
@@ -6656,6 +6661,238 @@ write_sequence_property_from_wrapper(ostream &out, const InterrogateElement &iel
   indent(out, indent_level + 2) << "}\n";
   indent(out, indent_level) << "}\n\n";
 }
+
+/**
+ * Emits a MAKE_MAP_PROPERTY as an Interrogate.NativeLookup<TKey, TValue>, or as a
+ * NativeMap<TKey, TValue> (a real IReadOnlyDictionary) when the class also declared
+ * a MAKE_MAP_KEYS_SEQ and the keys are therefore reachable.
+ *
+ * Not every map property is enumerable: RenderState::attribs declares only
+ * has_attrib and get_attrib, and there is simply no way to ask it for its keys.
+ * PandaNode::tags pairs MAKE_MAP_PROPERTY with MAKE_MAP_KEYS_SEQ(tags, get_num_tags,
+ * get_tag_key) and so is.  Offering a Count that cannot be computed would be worse
+ * than not offering one.
+ */
+void InterfaceMakerCSharp::
+write_map_property_from_wrapper(ostream &out, const InterrogateElement &ielement,
+                                Object *object, int indent_level, bool is_interface) {
+  InterrogateDatabase *idb = InterrogateDatabase::get_ptr();
+
+  if (object == nullptr) {
+    return;
+  }
+
+  auto find_wrapper = [&](FunctionIndex func_index, int want_arity, Function *&out_func)
+      -> const InterrogateFunctionWrapper * {
+    out_func = nullptr;
+    if (func_index == 0) return nullptr;
+    FunctionsByIndex::const_iterator it = _functions.find(func_index);
+    if (it == _functions.end()) return nullptr;
+    Function *func = it->second;
+    int n = func->_ifunc.number_of_c_wrappers();
+    for (int wi = 0; wi < n; ++wi) {
+      FunctionWrapperIndex widx = func->_ifunc.get_c_wrapper(wi);
+      if (widx == 0) continue;
+      const InterrogateFunctionWrapper &w = idb->get_wrapper(widx);
+      if (w.is_explicit_self() || !is_wrapper_legal_csharp(w)) continue;
+      int np = w.number_of_parameters();
+      if (np == 0 || !w.parameter_is_this(0)) continue;   // instance accessors only
+      if (np - 1 != want_arity) continue;
+      out_func = func;
+      return &w;
+    }
+    return nullptr;
+  };
+
+  Function *has_func = nullptr;
+  Function *get_func = nullptr;
+  Function *set_func = nullptr;
+  Function *del_func = nullptr;
+  Function *len_func = nullptr;
+  Function *key_func = nullptr;
+
+  const InterrogateFunctionWrapper *has_w =
+    ielement.has_has_function() ? find_wrapper(ielement.get_has_function(), 1, has_func) : nullptr;
+  const InterrogateFunctionWrapper *get_w =
+    ielement.has_getter() ? find_wrapper(ielement.get_getter(), 1, get_func) : nullptr;
+  const InterrogateFunctionWrapper *set_w =
+    ielement.has_setter() ? find_wrapper(ielement.get_setter(), 2, set_func) : nullptr;
+  // Per-key removal is the del function (MAKE_MAP_PROPERTY's 5th argument, clear_tag);
+  // the clear function is the separate clear-everything.  They are different slots.
+  Function *clear_func = nullptr;
+  const InterrogateFunctionWrapper *del_w =
+    ielement.has_del_function() ? find_wrapper(ielement.get_del_function(), 1, del_func) : nullptr;
+  const InterrogateFunctionWrapper *clear_w =
+    ielement.has_clear_function() ? find_wrapper(ielement.get_clear_function(), 0, clear_func) : nullptr;
+  const InterrogateFunctionWrapper *len_w =
+    find_wrapper(ielement.get_length_function(), 0, len_func);
+  const InterrogateFunctionWrapper *key_w =
+    ielement.has_getkey_function() ? find_wrapper(ielement.get_getkey_function(), 1, key_func) : nullptr;
+
+  if (has_w == nullptr || get_w == nullptr || !get_w->has_return_value()) {
+    record_skipped("map-property", ielement.get_scoped_name(),
+                   "no (this, key) has/get accessor pair");
+    return;
+  }
+  // The predicate must be one.  Camera::aux_scene_data reuses its getter as the
+  // has-function, and `if (!ptr)` is not a bool.
+  if (!has_w->has_return_value() ||
+      get_pinvoke_type(has_w->get_return_type(), true) != "bool") {
+    record_skipped("map-property", ielement.get_scoped_name(),
+                   "has-function is not a bool predicate");
+    return;
+  }
+
+  TypeIndex key_index = get_w->parameter_get_type(1);
+  TypeIndex value_index = get_w->get_return_type();
+
+  string key_type = get_csharp_signature_type(key_index, false, /*is_parameter=*/true);
+  string value_type = get_csharp_signature_type(value_index, false);
+  if (key_type.empty() || value_type.empty()) {
+    record_skipped("map-property", ielement.get_scoped_name(),
+                   "no C# mapping for key '" + report_type_name(key_index) +
+                   "' or value '" + report_type_name(value_index) + "'");
+    return;
+  }
+
+  string property_name = to_pascal_case(make_csharp_identifier(ielement.get_name()));
+  if (property_name.empty() || property_name == "void" ||
+      is_blocked_pascal_alias(property_name)) {
+    return;
+  }
+  {
+    const InterrogateType &owner = object->_itype;
+    for (int i = 0; i < owner.number_of_nested_types(); ++i) {
+      TypeIndex nested_index = owner.get_nested_type(i);
+      if (nested_index == 0) continue;
+      const InterrogateType &nested = idb->get_type(nested_index);
+      if (should_nest_type(nested) &&
+          get_simple_class_name(nested) == property_name) {
+        record_skipped("map-property", ielement.get_scoped_name(),
+                       "name collides with nested type '" + property_name + "' (CS0102)");
+        return;
+      }
+    }
+  }
+
+  // Keys are reachable only with a MAKE_MAP_KEYS_SEQ.
+  bool enumerable = (len_w != nullptr && key_w != nullptr && key_w->has_return_value());
+  string map_type = string("global::Interrogate.")
+    + (enumerable ? "NativeMap<" : "NativeLookup<") + key_type + ", " + value_type + ">";
+
+  if (ielement.has_comment()) {
+    emit_xml_doc_comment(out, ielement.get_comment(), indent_level);
+  }
+
+  indent(out, indent_level);
+  if (!is_interface) {
+    out << "public ";
+  }
+  out << map_type << " " << property_name;
+
+  if (is_interface) {
+    out << " { get; }\n";
+    return;
+  }
+
+  out << " {\n";
+  indent(out, indent_level + 2) << "get {\n";
+
+  // Converts a native return into the managed value/key it stands for.
+  auto managed_expr = [&](TypeIndex type_index, const string &managed_type,
+                          const InterrogateFunctionWrapper &w,
+                          const string &call) -> string {
+    string concrete = get_csharp_native_object_class_name(type_index);
+    if (!concrete.empty()) {
+      return concrete + ".__CreateFromNative(" + call + ", " +
+             get_native_ownership_name(w, false) + ")!";
+    }
+    if (is_csharp_enum_type(type_index)) {
+      return "(" + managed_type + ")" + call;
+    }
+    if ((managed_type == "string" || managed_type == "string?") &&
+        get_pinvoke_type(type_index, true) != "string") {
+      return "Marshal.PtrToStringUTF8(" + call + ") ?? string.Empty";
+    }
+    return call;
+  };
+
+  string has_this = get_native_this_argument(object->_itype, has_func->_ifunc);
+  string get_this = get_native_this_argument(object->_itype, get_func->_ifunc);
+  string key_arg = marshal_managed_argument(key_index, key_type, "__key");
+
+  string has_call = get_pinvoke_call_name(has_func->_ifunc, *has_w) +
+    "(" + has_this + ", " + marshal_managed_argument(has_w->parameter_get_type(1), key_type, "__key") + ")";
+  string get_call = get_pinvoke_call_name(get_func->_ifunc, *get_w) +
+    "(" + get_this + ", " + key_arg + ")";
+
+  indent(out, indent_level + 4) << "return new " << map_type << "(\n";
+  indent(out, indent_level + 6) << "__key => " << has_call << ",\n";
+  indent(out, indent_level + 6) << "__key => "
+                                << managed_expr(value_index, value_type, *get_w, get_call);
+
+  if (enumerable) {
+    string len_this = get_native_this_argument(object->_itype, len_func->_ifunc);
+    string key_this = get_native_this_argument(object->_itype, key_func->_ifunc);
+    TypeIndex key_return = key_w->get_return_type();
+    string index_cast = get_pinvoke_type(key_w->parameter_get_type(1), false);
+    string key_call = get_pinvoke_call_name(key_func->_ifunc, *key_w) +
+      "(" + key_this + ", (" + index_cast + ")__index)";
+
+    out << ",\n";
+    indent(out, indent_level + 6) << "() => (int)"
+                                  << get_pinvoke_call_name(len_func->_ifunc, *len_w)
+                                  << "(" << len_this << "),\n";
+    indent(out, indent_level + 6) << "__index => "
+                                  << managed_expr(key_return, key_type, *key_w, key_call);
+  }
+
+  if (set_w != nullptr) {
+    TypeIndex set_value_index = set_w->parameter_get_type(2);
+    string set_value_type = get_csharp_type(set_value_index, false);
+    string set_this = get_native_this_argument(object->_itype, set_func->_ifunc);
+    out << ",\n";
+    indent(out, indent_level + 6) << "(__key, __value) => "
+                                  << get_pinvoke_call_name(set_func->_ifunc, *set_w)
+                                  << "(" << set_this << ", "
+                                  << marshal_managed_argument(set_w->parameter_get_type(1), key_type, "__key")
+                                  << ", "
+                                  << marshal_managed_argument(set_value_index, set_value_type, "__value")
+                                  << ")";
+  } else if (del_w != nullptr) {
+    // The NativeMap constructor takes set before remove, so a remove-only map still
+    // has to say "no setter" explicitly.
+    out << ",\n";
+    indent(out, indent_level + 6) << "null";
+  }
+
+  if (del_w != nullptr) {
+    string del_this = get_native_this_argument(object->_itype, del_func->_ifunc);
+    out << ",\n";
+    indent(out, indent_level + 6) << "__key => "
+                                  << get_pinvoke_call_name(del_func->_ifunc, *del_w)
+                                  << "(" << del_this << ", "
+                                  << marshal_managed_argument(del_w->parameter_get_type(1), key_type, "__key")
+                                  << ")";
+  } else if (enumerable && clear_w != nullptr) {
+    out << ",\n";
+    indent(out, indent_level + 6) << "null";
+  }
+
+  // Clear-all is only on NativeMap; NativeLookup has no notion of "everything".
+  if (enumerable && clear_w != nullptr) {
+    string clear_this = get_native_this_argument(object->_itype, clear_func->_ifunc);
+    out << ",\n";
+    indent(out, indent_level + 6) << "() => "
+                                  << get_pinvoke_call_name(clear_func->_ifunc, *clear_w)
+                                  << "(" << clear_this << ")";
+  }
+
+  out << ");\n";
+  indent(out, indent_level + 2) << "}\n";
+  indent(out, indent_level) << "}\n\n";
+}
+
 
 
 /**

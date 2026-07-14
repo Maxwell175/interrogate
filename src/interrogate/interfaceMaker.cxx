@@ -865,6 +865,12 @@ record_object(TypeIndex type_index) {
       if (ielement.has_has_function()) {
         record_function(itype, ielement.get_has_function());
       }
+      if (ielement.has_getkey_function()) {
+        record_function(itype, ielement.get_getkey_function());
+      }
+      if (ielement.has_clear_function()) {
+        record_function(itype, ielement.get_clear_function());
+      }
     }
   }
 

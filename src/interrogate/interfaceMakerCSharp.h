@@ -94,6 +94,10 @@ private:
                                             const InterrogateElement &ielement,
                                             Object *object, int indent_level,
                                             bool is_interface);
+  void write_map_property_from_wrapper(std::ostream &out,
+                                       const InterrogateElement &ielement,
+                                       Object *object, int indent_level,
+                                       bool is_interface);
   void write_dispose_pattern(std::ostream &out, Object *object,
                              int indent_level);
 
