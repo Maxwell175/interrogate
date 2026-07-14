@@ -6775,10 +6775,18 @@ write_map_property_from_wrapper(ostream &out, const InterrogateElement &ielement
     }
   }
 
-  // Keys are reachable only with a MAKE_MAP_KEYS_SEQ.
+  // Four shapes, and the type says which one you have rather than throwing when you
+  // find out.  Keys are reachable only with a MAKE_MAP_KEYS_SEQ (RenderState::attribs
+  // has none), and the property is writable only if it declared a setter
+  // (GeomVertexFormat::columns declares none).
   bool enumerable = (len_w != nullptr && key_w != nullptr && key_w->has_return_value());
-  string map_type = string("global::Interrogate.")
-    + (enumerable ? "NativeMap<" : "NativeLookup<") + key_type + ", " + value_type + ">";
+  bool writable = (set_w != nullptr);
+
+  const char *map_class = enumerable
+    ? (writable ? "NativeMap<" : "NativeReadOnlyMap<")
+    : (writable ? "NativeMutableLookup<" : "NativeLookup<");
+  string map_type = string("global::Interrogate.") + map_class +
+                    key_type + ", " + value_type + ">";
 
   if (ielement.has_comment()) {
     emit_xml_doc_comment(out, ielement.get_comment(), indent_level);
@@ -6847,7 +6855,9 @@ write_map_property_from_wrapper(ostream &out, const InterrogateElement &ielement
                                   << managed_expr(key_return, key_type, *key_w, key_call);
   }
 
-  if (set_w != nullptr) {
+  // The mutators only exist on the writable types, so nothing here can emit a lambda
+  // the constructor has no slot for.
+  if (writable) {
     TypeIndex set_value_index = set_w->parameter_get_type(2);
     string set_value_type = get_csharp_type(set_value_index, false);
     string set_this = get_native_this_argument(object->_itype, set_func->_ifunc);
@@ -6859,33 +6869,28 @@ write_map_property_from_wrapper(ostream &out, const InterrogateElement &ielement
                                   << ", "
                                   << marshal_managed_argument(set_value_index, set_value_type, "__value")
                                   << ")";
-  } else if (del_w != nullptr) {
-    // The NativeMap constructor takes set before remove, so a remove-only map still
-    // has to say "no setter" explicitly.
-    out << ",\n";
-    indent(out, indent_level + 6) << "null";
-  }
 
-  if (del_w != nullptr) {
-    string del_this = get_native_this_argument(object->_itype, del_func->_ifunc);
-    out << ",\n";
-    indent(out, indent_level + 6) << "__key => "
-                                  << get_pinvoke_call_name(del_func->_ifunc, *del_w)
-                                  << "(" << del_this << ", "
-                                  << marshal_managed_argument(del_w->parameter_get_type(1), key_type, "__key")
-                                  << ")";
-  } else if (enumerable && clear_w != nullptr) {
-    out << ",\n";
-    indent(out, indent_level + 6) << "null";
-  }
+    if (del_w != nullptr) {
+      string del_this = get_native_this_argument(object->_itype, del_func->_ifunc);
+      out << ",\n";
+      indent(out, indent_level + 6) << "__key => "
+                                    << get_pinvoke_call_name(del_func->_ifunc, *del_w)
+                                    << "(" << del_this << ", "
+                                    << marshal_managed_argument(del_w->parameter_get_type(1), key_type, "__key")
+                                    << ")";
+    } else if (enumerable && clear_w != nullptr) {
+      out << ",\n";
+      indent(out, indent_level + 6) << "null";
+    }
 
-  // Clear-all is only on NativeMap; NativeLookup has no notion of "everything".
-  if (enumerable && clear_w != nullptr) {
-    string clear_this = get_native_this_argument(object->_itype, clear_func->_ifunc);
-    out << ",\n";
-    indent(out, indent_level + 6) << "() => "
-                                  << get_pinvoke_call_name(clear_func->_ifunc, *clear_w)
-                                  << "(" << clear_this << ")";
+    // Clear-all is a NativeMap notion; a lookup has no "everything".
+    if (enumerable && clear_w != nullptr) {
+      string clear_this = get_native_this_argument(object->_itype, clear_func->_ifunc);
+      out << ",\n";
+      indent(out, indent_level + 6) << "() => "
+                                    << get_pinvoke_call_name(clear_func->_ifunc, *clear_w)
+                                    << "(" << clear_this << ")";
+    }
   }
 
   out << ");\n";

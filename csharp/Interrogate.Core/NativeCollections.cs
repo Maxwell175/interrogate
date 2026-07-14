@@ -176,44 +176,42 @@ namespace Interrogate {
     }
 
     /// <summary>
-    /// A keyed view over a native property exposed as a has/get accessor pair --
-    /// interrogate's MAKE_MAP_PROPERTY (<c>MAKE_MAP_PROPERTY(attribs, has_attrib,
-    /// get_attrib)</c>).
+    /// Shared machinery for the keyed views over a native map property -- interrogate's
+    /// MAKE_MAP_PROPERTY.
     /// </summary>
     /// <remarks>
-    /// Lookup only, deliberately.  A C++ map property does not have to be
-    /// enumerable: RenderState::attribs declares only has_attrib and get_attrib, and
-    /// there is no way to ask it for its keys.  Only when the class also declares a
-    /// MAKE_MAP_KEYS_SEQ do the keys become reachable, and then the generator emits a
-    /// <see cref="NativeMap{TKey, TValue}"/> instead -- which is a real
-    /// IReadOnlyDictionary.  Reporting a Count that cannot be computed, or an empty
-    /// key list, would be worse than not offering them.
+    /// There are four of these rather than one, because C++ offers four shapes and the
+    /// type should say which one you have rather than throw when you find out.
+    /// A map property need not be enumerable -- RenderState::attribs declares only
+    /// has_attrib and get_attrib, and there is no way to ask it for its keys; only a
+    /// MAKE_MAP_KEYS_SEQ makes them reachable.  And it need not be writable --
+    /// GeomVertexFormat::columns has no setter at all.  So:
+    ///
+    ///   <list type="table">
+    ///     <item><term>NativeLookup</term>        <description>read-only, not enumerable</description></item>
+    ///     <item><term>NativeMutableLookup</term> <description>writable, not enumerable (Camera::tag_states)</description></item>
+    ///     <item><term>NativeReadOnlyMap</term>   <description>IReadOnlyDictionary (GeomVertexFormat::columns)</description></item>
+    ///     <item><term>NativeMap</term>           <description>IDictionary (PandaNode::tags)</description></item>
+    ///   </list>
+    ///
+    /// All of them read through to the owner on every call; none snapshot it.
     /// </remarks>
-    public class NativeLookup<TKey, TValue> where TKey : notnull {
+    public abstract class NativeLookupBase<TKey, TValue> where TKey : notnull {
         private protected readonly Func<TKey, bool> _has;
         private protected readonly Func<TKey, TValue> _get;
-        private protected readonly Action<TKey, TValue>? _set;
-        private protected readonly Action<TKey>? _remove;
 
-        public NativeLookup(Func<TKey, bool> has, Func<TKey, TValue> get,
-                            Action<TKey, TValue>? set = null,
-                            Action<TKey>? remove = null) {
+        private protected NativeLookupBase(Func<TKey, bool> has, Func<TKey, TValue> get) {
             _has = has ?? throw new ArgumentNullException(nameof(has));
             _get = get ?? throw new ArgumentNullException(nameof(get));
-            _set = set;
-            _remove = remove;
         }
 
-        /// <summary>True when the underlying property exposed no setter.</summary>
-        public bool IsReadOnly => _set is null;
-
         public bool ContainsKey(TKey key) {
-            if (key is null) throw new ArgumentNullException(nameof(key));
+            ArgumentNullException.ThrowIfNull(key);
             return _has(key);
         }
 
         public bool TryGetValue(TKey key, out TValue value) {
-            if (key is null) throw new ArgumentNullException(nameof(key));
+            ArgumentNullException.ThrowIfNull(key);
             if (!_has(key)) {
                 value = default!;
                 return false;
@@ -222,28 +220,53 @@ namespace Interrogate {
             return true;
         }
 
-        public TValue this[TKey key] {
-            get {
-                if (key is null) throw new ArgumentNullException(nameof(key));
-                if (!_has(key)) {
-                    throw new KeyNotFoundException($"No such key: {key}");
-                }
-                return _get(key);
+        private protected TValue Fetch(TKey key) {
+            ArgumentNullException.ThrowIfNull(key);
+            if (!_has(key)) {
+                throw new KeyNotFoundException($"No such key: {key}");
             }
+            return _get(key);
+        }
+    }
+
+    /// <summary>A read-only keyed lookup whose keys cannot be enumerated.</summary>
+    public sealed class NativeLookup<TKey, TValue> :
+        NativeLookupBase<TKey, TValue> where TKey : notnull {
+
+        public NativeLookup(Func<TKey, bool> has, Func<TKey, TValue> get) : base(has, get) {}
+
+        public TValue this[TKey key] => Fetch(key);
+    }
+
+    /// <summary>A writable keyed lookup whose keys cannot be enumerated.</summary>
+    public sealed class NativeMutableLookup<TKey, TValue> :
+        NativeLookupBase<TKey, TValue> where TKey : notnull {
+
+        private readonly Action<TKey, TValue> _set;
+        private readonly Action<TKey>? _remove;
+
+        public NativeMutableLookup(Func<TKey, bool> has, Func<TKey, TValue> get,
+                                   Action<TKey, TValue> set, Action<TKey>? remove = null)
+            : base(has, get) {
+            _set = set ?? throw new ArgumentNullException(nameof(set));
+            _remove = remove;
+        }
+
+        public TValue this[TKey key] {
+            get => Fetch(key);
             set {
-                if (key is null) throw new ArgumentNullException(nameof(key));
-                if (_set is null) {
-                    throw new NotSupportedException("This native map is read-only.");
-                }
+                ArgumentNullException.ThrowIfNull(key);
                 _set(key, value);
             }
         }
 
-        /// <summary>Removes a key. Throws if the property declared no clear function.</summary>
+        /// <summary>Removes a key. Only offered when the C++ property declared a deleter.</summary>
+        public bool CanRemove => _remove is not null;
+
         public bool Remove(TKey key) {
-            if (key is null) throw new ArgumentNullException(nameof(key));
+            ArgumentNullException.ThrowIfNull(key);
             if (_remove is null) {
-                throw new NotSupportedException("This native map cannot remove keys.");
+                throw new NotSupportedException("This native map declared no deleter.");
             }
             if (!_has(key)) {
                 return false;
@@ -253,74 +276,163 @@ namespace Interrogate {
         }
     }
 
-    /// <summary>
-    /// A live, editable dictionary over a native map property whose keys are also
-    /// reachable, because the C++ class declared a MAKE_MAP_KEYS_SEQ alongside it
-    /// (<c>MAKE_MAP_PROPERTY(tags, has_tag, get_tag, set_tag, clear_tag)</c> +
-    /// <c>MAKE_MAP_KEYS_SEQ(tags, get_num_tags, get_tag_key)</c>).
-    /// </summary>
-    /// <remarks>
-    /// <para>
-    /// It is a real <see cref="IDictionary{TKey, TValue}"/>, not a read-only view:
-    /// PandaNode's tags have a setter and a per-key deleter, so
-    /// <c>node.Tags["team"] = "red"</c> and <c>node.Tags.Remove("team")</c> do exactly
-    /// what set_tag and clear_tag do.  A property that declared no setter reports
-    /// <see cref="IsReadOnly"/> and throws from the mutators -- which is how .NET has
-    /// always modelled a read-only collection, and is why ICollection has IsReadOnly
-    /// at all.
-    /// </para>
-    /// <para>
-    /// Everything reads through to the owner on every call: Keys, Values and
-    /// enumeration track the object rather than snapshotting it.
-    /// </para>
-    /// </remarks>
-    public sealed class NativeMap<TKey, TValue> :
-        NativeLookup<TKey, TValue>,
-        IDictionary<TKey, TValue>,
-        IReadOnlyDictionary<TKey, TValue> where TKey : notnull {
+    /// <summary>Shared enumeration for the two map types.</summary>
+    public abstract class NativeMapBase<TKey, TValue> :
+        NativeLookupBase<TKey, TValue> where TKey : notnull {
 
         private readonly Func<int> _count;
         private readonly Func<int, TKey> _key;
-        private readonly Action? _clear;
 
-        public NativeMap(Func<TKey, bool> has, Func<TKey, TValue> get,
-                         Func<int> count, Func<int, TKey> key,
-                         Action<TKey, TValue>? set = null,
-                         Action<TKey>? remove = null,
-                         Action? clear = null)
-            : base(has, get, set, remove) {
+        private protected NativeMapBase(Func<TKey, bool> has, Func<TKey, TValue> get,
+                                        Func<int> count, Func<int, TKey> key)
+            : base(has, get) {
             _count = count ?? throw new ArgumentNullException(nameof(count));
             _key = key ?? throw new ArgumentNullException(nameof(key));
-            _clear = clear;
         }
 
         public int Count => _count();
 
-        /// <summary>Live view of the keys; reads through on every enumeration.</summary>
-        public ICollection<TKey> Keys => new KeyView(this);
-
-        /// <summary>Live view of the values; reads through on every enumeration.</summary>
-        public ICollection<TValue> Values => new ValueView(this);
-
-        IEnumerable<TKey> IReadOnlyDictionary<TKey, TValue>.Keys => Keys;
-        IEnumerable<TValue> IReadOnlyDictionary<TKey, TValue>.Values => Values;
-
-        private IEnumerable<TKey> EnumerateKeys() {
+        private protected IEnumerable<TKey> EnumerateKeys() {
             int n = _count();
             for (int i = 0; i < n; ++i) {
                 yield return _key(i);
             }
         }
 
-        public void Add(TKey key, TValue value) {
-            if (key is null) throw new ArgumentNullException(nameof(key));
-            if (_set is null) {
-                throw new NotSupportedException("This native map is read-only.");
+        private protected IEnumerable<TValue> EnumerateValues() {
+            foreach (TKey key in EnumerateKeys()) {
+                yield return _get(key);
             }
+        }
+
+        public IEnumerator<KeyValuePair<TKey, TValue>> GetEnumerator() {
+            foreach (TKey key in EnumerateKeys()) {
+                yield return new KeyValuePair<TKey, TValue>(key, _get(key));
+            }
+        }
+
+        private protected sealed class KeyView : ICollection<TKey> {
+            private readonly NativeMapBase<TKey, TValue> _map;
+            internal KeyView(NativeMapBase<TKey, TValue> map) { _map = map; }
+
+            public int Count => _map.Count;
+            public bool IsReadOnly => true;
+            public bool Contains(TKey item) => _map.ContainsKey(item);
+            public IEnumerator<TKey> GetEnumerator() => _map.EnumerateKeys().GetEnumerator();
+            IEnumerator IEnumerable.GetEnumerator() => GetEnumerator();
+            public void CopyTo(TKey[] array, int arrayIndex) {
+                ArgumentNullException.ThrowIfNull(array);
+                foreach (TKey key in this) array[arrayIndex++] = key;
+            }
+            public void Add(TKey item) => throw new NotSupportedException();
+            public void Clear() => throw new NotSupportedException();
+            public bool Remove(TKey item) => throw new NotSupportedException();
+        }
+
+        private protected sealed class ValueView : ICollection<TValue> {
+            private readonly NativeMapBase<TKey, TValue> _map;
+            internal ValueView(NativeMapBase<TKey, TValue> map) { _map = map; }
+
+            public int Count => _map.Count;
+            public bool IsReadOnly => true;
+            public bool Contains(TValue item) {
+                var comparer = EqualityComparer<TValue>.Default;
+                foreach (TValue value in this) {
+                    if (comparer.Equals(value, item)) return true;
+                }
+                return false;
+            }
+            public IEnumerator<TValue> GetEnumerator() => _map.EnumerateValues().GetEnumerator();
+            IEnumerator IEnumerable.GetEnumerator() => GetEnumerator();
+            public void CopyTo(TValue[] array, int arrayIndex) {
+                ArgumentNullException.ThrowIfNull(array);
+                foreach (TValue value in this) array[arrayIndex++] = value;
+            }
+            public void Add(TValue item) => throw new NotSupportedException();
+            public void Clear() => throw new NotSupportedException();
+            public bool Remove(TValue item) => throw new NotSupportedException();
+        }
+    }
+
+    /// <summary>
+    /// A live <see cref="IReadOnlyDictionary{TKey, TValue}"/> over a map property that
+    /// declared no setter -- GeomVertexFormat::columns, TextureAttrib::textures.
+    /// </summary>
+    public sealed class NativeReadOnlyMap<TKey, TValue> :
+        NativeMapBase<TKey, TValue>,
+        IReadOnlyDictionary<TKey, TValue>, IEnumerable where TKey : notnull {
+
+        public NativeReadOnlyMap(Func<TKey, bool> has, Func<TKey, TValue> get,
+                                 Func<int> count, Func<int, TKey> key)
+            : base(has, get, count, key) {}
+
+        public TValue this[TKey key] => Fetch(key);
+
+        public IEnumerable<TKey> Keys => EnumerateKeys();
+        public IEnumerable<TValue> Values => EnumerateValues();
+
+        IEnumerator IEnumerable.GetEnumerator() => GetEnumerator();
+    }
+
+    /// <summary>
+    /// A live, editable <see cref="IDictionary{TKey, TValue}"/> over a map property that
+    /// declared a setter -- PandaNode::tags, where <c>node.Tags["team"] = "red"</c> and
+    /// <c>node.Tags.Remove("team")</c> are set_tag and clear_tag.
+    /// </summary>
+    public sealed class NativeMap<TKey, TValue> :
+        NativeMapBase<TKey, TValue>,
+        IDictionary<TKey, TValue>, IReadOnlyDictionary<TKey, TValue> where TKey : notnull {
+
+        private readonly Action<TKey, TValue> _set;
+        private readonly Action<TKey>? _remove;
+        private readonly Action? _clear;
+
+        public NativeMap(Func<TKey, bool> has, Func<TKey, TValue> get,
+                         Func<int> count, Func<int, TKey> key,
+                         Action<TKey, TValue> set,
+                         Action<TKey>? remove = null,
+                         Action? clear = null)
+            : base(has, get, count, key) {
+            _set = set ?? throw new ArgumentNullException(nameof(set));
+            _remove = remove;
+            _clear = clear;
+        }
+
+        /// <summary>Always false: a read-only map property is a NativeReadOnlyMap instead.</summary>
+        public bool IsReadOnly => false;
+
+        public TValue this[TKey key] {
+            get => Fetch(key);
+            set {
+                ArgumentNullException.ThrowIfNull(key);
+                _set(key, value);
+            }
+        }
+
+        public ICollection<TKey> Keys => new KeyView(this);
+        public ICollection<TValue> Values => new ValueView(this);
+
+        IEnumerable<TKey> IReadOnlyDictionary<TKey, TValue>.Keys => Keys;
+        IEnumerable<TValue> IReadOnlyDictionary<TKey, TValue>.Values => Values;
+
+        public void Add(TKey key, TValue value) {
+            ArgumentNullException.ThrowIfNull(key);
             if (_has(key)) {
                 throw new ArgumentException($"An entry with the key '{key}' already exists.", nameof(key));
             }
             _set(key, value);
+        }
+
+        public bool Remove(TKey key) {
+            ArgumentNullException.ThrowIfNull(key);
+            if (_remove is null) {
+                throw new NotSupportedException("This native map declared no deleter.");
+            }
+            if (!_has(key)) {
+                return false;
+            }
+            _remove(key);
+            return true;
         }
 
         public void Clear() {
@@ -329,18 +441,12 @@ namespace Interrogate {
                 return;
             }
             if (_remove is null) {
-                throw new NotSupportedException("This native map cannot remove keys.");
+                throw new NotSupportedException("This native map declared no deleter.");
             }
-            // No clear-all in C++; take a snapshot of the keys, since removing while
-            // enumerating would read through into a shifting collection.
+            // Snapshot the keys: removing while enumerating would read through into a
+            // collection that is shifting under the enumerator.
             foreach (TKey key in EnumerateKeys().ToArray()) {
                 _remove(key);
-            }
-        }
-
-        public IEnumerator<KeyValuePair<TKey, TValue>> GetEnumerator() {
-            foreach (TKey key in EnumerateKeys()) {
-                yield return new KeyValuePair<TKey, TValue>(key, _get(key));
             }
         }
 
@@ -364,60 +470,6 @@ namespace Interrogate {
             foreach (KeyValuePair<TKey, TValue> pair in this) {
                 array[arrayIndex++] = pair;
             }
-        }
-
-        private sealed class KeyView : ICollection<TKey> {
-            private readonly NativeMap<TKey, TValue> _map;
-            internal KeyView(NativeMap<TKey, TValue> map) { _map = map; }
-
-            public int Count => _map.Count;
-            public bool IsReadOnly => true;
-            public bool Contains(TKey item) => _map.ContainsKey(item);
-            public IEnumerator<TKey> GetEnumerator() => _map.EnumerateKeys().GetEnumerator();
-            IEnumerator IEnumerable.GetEnumerator() => GetEnumerator();
-
-            public void CopyTo(TKey[] array, int arrayIndex) {
-                ArgumentNullException.ThrowIfNull(array);
-                foreach (TKey key in this) {
-                    array[arrayIndex++] = key;
-                }
-            }
-
-            public void Add(TKey item) => throw new NotSupportedException();
-            public void Clear() => throw new NotSupportedException();
-            public bool Remove(TKey item) => throw new NotSupportedException();
-        }
-
-        private sealed class ValueView : ICollection<TValue> {
-            private readonly NativeMap<TKey, TValue> _map;
-            internal ValueView(NativeMap<TKey, TValue> map) { _map = map; }
-
-            public int Count => _map.Count;
-            public bool IsReadOnly => true;
-            public bool Contains(TValue item) {
-                var comparer = EqualityComparer<TValue>.Default;
-                foreach (TValue value in this) {
-                    if (comparer.Equals(value, item)) return true;
-                }
-                return false;
-            }
-            public IEnumerator<TValue> GetEnumerator() {
-                foreach (TKey key in _map.EnumerateKeys()) {
-                    yield return _map._get(key);
-                }
-            }
-            IEnumerator IEnumerable.GetEnumerator() => GetEnumerator();
-
-            public void CopyTo(TValue[] array, int arrayIndex) {
-                ArgumentNullException.ThrowIfNull(array);
-                foreach (TValue value in this) {
-                    array[arrayIndex++] = value;
-                }
-            }
-
-            public void Add(TValue item) => throw new NotSupportedException();
-            public void Clear() => throw new NotSupportedException();
-            public bool Remove(TValue item) => throw new NotSupportedException();
         }
     }
 }
