@@ -45,6 +45,7 @@ extern ParameterRemap *make_stream_csharp_remap(CPPType *type);
 #include "interrogateManifest.h"
 #include "interrogateElement.h"
 #include "cppFunctionType.h"
+#include "cppTypedefType.h"
 #include "cppParameterList.h"
 #include "cppMakeSeq.h"
 #include "cppStructType.h"
@@ -401,6 +402,47 @@ is_pointer_to_numeric(CPPType *type) {
   return TypeManager::is_simple(pointee) && !TypeManager::is_char(pointee);
 }
 
+/**
+ * A pointer to a function -- a callback.  is_pointable() says no (a function is not
+ * pointable), so these matched nothing and the method was dropped:
+ * GraphicsStateGuardian::traverse_prepared_textures(TextureCallback *, void *) and
+ * LinearUserDefinedForce's user-supplied proc.
+ *
+ * C# carries it as IntPtr, which is what a function pointer is.  A callback whose
+ * signature is blittable can be written in C# and handed over with
+ * [UnmanagedCallersOnly]; one that is not (LinearUserDefinedForce's proc returns an
+ * LVector3 by value) can still be passed along from native code.  Either way the
+ * method exists, which beats not being there.
+ */
+static bool
+is_pointer_to_function(CPPType *type) {
+  CPPType *resolved = TypeManager::resolve_type(type);
+  if (resolved == nullptr) {
+    return false;
+  }
+  CPPPointerType *pointer = resolved->as_pointer_type();
+  if (pointer == nullptr) {
+    return false;
+  }
+  CPPType *pointee = TypeManager::resolve_type(pointer->_pointing_at);
+
+  // Peel typedefs by hand.  GraphicsStateGuardian names its callback with one
+  // (`typedef bool TextureCallback(TextureContext *, void *)`), and resolve_type
+  // leaves a named typedef alone -- as_function_type() on it is null, so the pointer
+  // did not look like a function pointer at all.
+  for (int guard = 0; pointee != nullptr && guard < 16; ++guard) {
+    if (pointee->as_function_type() != nullptr) {
+      return true;
+    }
+    CPPTypedefType *alias = pointee->as_typedef_type();
+    if (alias == nullptr) {
+      break;
+    }
+    pointee = TypeManager::resolve_type(alias->_type);
+  }
+  return false;
+}
+
 ParameterRemap *InterfaceMaker::
 remap_parameter(CPPType *struct_type, CPPType *param_type, bool is_return) {
   nassertr(param_type != nullptr, nullptr);
@@ -416,7 +458,8 @@ remap_parameter(CPPType *struct_type, CPPType *param_type, bool is_return) {
   // false.  IntPtr is honest: the method exists, and the caller pins.  An
   // out-parameter is never confused with one of these, because it carries PF_is_out.
   if (build_csharp && !is_return &&
-      (is_pointer_to_void(param_type) || is_pointer_to_numeric(param_type))) {
+      (is_pointer_to_void(param_type) || is_pointer_to_numeric(param_type) ||
+       is_pointer_to_function(param_type))) {
     return new ParameterRemapUnchanged(param_type);
   }
 
