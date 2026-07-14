@@ -233,6 +233,18 @@ parameter_is_optional(int n) const {
 }
 
 /**
+ * Returns true if the nth parameter is an out-parameter -- a non-const reference in
+ * C++, carried across as a pointer.
+ */
+INLINE bool InterrogateFunctionWrapper::
+parameter_is_out(int n) const {
+  if (n >= 0 && n < (int)_parameters.size()) {
+    return (_parameters[n]._parameter_flags & PF_is_out) != 0;
+  }
+  return false;
+}
+
+/**
  *
  */
 INLINE bool InterrogateFunctionWrapper::

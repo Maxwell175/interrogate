@@ -87,3 +87,19 @@ INLINE void ParameterRemap::
 set_default_value(CPPExpression *expr) {
   _default_value = expr;
 }
+
+/**
+ * See ParameterRemap::is_out_parameter in the header.
+ */
+INLINE bool ParameterRemap::
+is_out_parameter() const {
+  return _is_out_parameter;
+}
+
+/**
+ *
+ */
+INLINE void ParameterRemap::
+set_out_parameter(bool is_out) {
+  _is_out_parameter = is_out;
+}

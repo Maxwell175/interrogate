@@ -55,6 +55,7 @@ public:
   INLINE const std::string &parameter_get_name(int n) const;
   INLINE bool parameter_is_this(int n) const;
   INLINE bool parameter_is_optional(int n) const;
+  INLINE bool parameter_is_out(int n) const;
   INLINE bool parameter_is_nullable(int n) const;
 
   INLINE const std::string &get_unique_name() const;
@@ -89,6 +90,12 @@ private:
     PF_is_this        = 0x0002,
     PF_is_optional    = 0x0004,
     PF_nullable       = 0x0008,
+    // This parameter is an out-parameter: the C++ declaration was a non-const
+    // reference and the remap turned it into a pointer.  Recorded rather than
+    // inferred -- pass 2 only sees the pointer, and a raw `T *` buffer parameter
+    // looks exactly the same.  Guessing from the type would mean `unsigned char *into`
+    // (a buffer) and `PN_stdfloat &value` (an out-parameter) could not coexist.
+    PF_is_out         = 0x0010,
   };
 
   int _flags;

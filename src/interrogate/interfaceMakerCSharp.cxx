@@ -2013,7 +2013,14 @@ is_char_type(TypeIndex type_index) {
   }
 
   const InterrogateType &itype = InterrogateDatabase::get_ptr()->get_type(type_index);
-  return itype.is_atomic() && itype.get_atomic_token() == AT_char;
+  if (!itype.is_atomic() || itype.get_atomic_token() != AT_char) {
+    return false;
+  }
+  // `unsigned char` and `signed char` share AT_char with plain `char`, but they are
+  // not text: in C++ `char *` is a string and `unsigned char *` is a byte buffer.
+  // Treating them alike marshalled a binary buffer as UTF-8, which truncates it at the
+  // first NUL (GeomVertexArrayDataHandle::copy_data_from took a `string`).
+  return !itype.is_unsigned() && !itype.is_signed();
 }
 
 string
@@ -5742,8 +5749,9 @@ write_method(ostream &out, Function *func, Object *object, int indent_level,
       }
 
       // C++'s out-parameter idiom (a non-const reference to a number) marshals
-      // straight through as `out T` -- no pinning, no unsafe.
-      string out_type = (stream_tok == AT_not_atomic)
+      // straight through as `out T` -- no pinning, no unsafe.  The database says which
+      // parameters those are; a raw `T *` buffer looks identical by now.
+      string out_type = (stream_tok == AT_not_atomic && wrapper.parameter_is_out(i))
         ? csharp_out_parameter_type(param_type_index) : string();
       if (!out_type.empty()) {
         param_type = "out " + out_type;
@@ -7238,7 +7246,7 @@ write_dllimport(ostream &out, const InterrogateFunction &ifunc,
     if (pinvoke_type == "string" && wrapper.parameter_is_nullable(i)) {
       pinvoke_type += "?";
     }
-    if (!wrapper.parameter_is_this(i)) {
+    if (!wrapper.parameter_is_this(i) && wrapper.parameter_is_out(i)) {
       string out_type = csharp_out_parameter_type(type);
       if (!out_type.empty()) {
         pinvoke_type = "out " + out_type;
@@ -8312,12 +8320,11 @@ get_csharp_native_object_class_name(TypeIndex type_index) const {
  * instead of the class.  A global:: qualified name cannot be shadowed.
  */
 /**
- * If this parameter is an out-parameter, returns its C# element type; otherwise "".
+ * The C# element type for an out-parameter, or "" if it cannot be marshalled as one.
  *
- * A parameter arrives here as a pointer-to-numeric only if it started life as a
- * non-const reference to one: raw `T *` parameters get no remap at all (they are
- * dropped, and reported), so nothing else can produce this shape.  That makes the
- * inference safe -- `PN_stdfloat &min_depth` becomes `out float min_depth`.
+ * Only called for parameters the database flagged PF_is_out, so this does not have to
+ * guess: a raw `T *` buffer and an out-parameter are the same pointer by the time they
+ * reach here, and the flag is the only thing that tells them apart.
  */
 string InterfaceMakerCSharp::
 csharp_out_parameter_type(TypeIndex type_index) const {

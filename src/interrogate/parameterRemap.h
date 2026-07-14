@@ -47,6 +47,12 @@ public:
   INLINE CPPExpression *get_default_value() const;
   INLINE void set_default_value(CPPExpression *expr);
 
+  // True when this remap turned a non-const reference into a pointer purely so the
+  // value could be written back -- an out-parameter.  Recorded, not inferred: once it
+  // reaches the database it is indistinguishable from a raw `T *` buffer parameter.
+  INLINE bool is_out_parameter() const;
+  INLINE void set_out_parameter(bool is_out);
+
   virtual void pass_parameter(std::ostream &out, const std::string &variable_name);
   virtual std::string prepare_return_expr(std::ostream &out, int indent_level,
                                      const std::string &expression);
@@ -66,6 +72,7 @@ public:
 
 protected:
   bool _is_valid;
+  bool _is_out_parameter = false;
 
   CPPType *_orig_type;
   CPPType *_new_type;

@@ -377,11 +377,46 @@ is_pointer_to_void(CPPType *type) {
   return pointee != nullptr && TypeManager::is_void(pointee);
 }
 
+/**
+ * A raw pointer to a number -- a data buffer (`unsigned char *into`, `int16_t *data`)
+ * or a pointer-style out-parameter (`PN_stdfloat *px`).  Both cross as IntPtr; see
+ * remap_parameter.
+ */
+static bool
+is_pointer_to_numeric(CPPType *type) {
+  CPPType *resolved = TypeManager::resolve_type(type);
+  if (resolved == nullptr) {
+    return false;
+  }
+  CPPPointerType *pointer = resolved->as_pointer_type();
+  if (pointer == nullptr) {
+    return false;
+  }
+  CPPType *pointee =
+    TypeManager::unwrap_const(TypeManager::resolve_type(pointer->_pointing_at));
+  if (pointee == nullptr) {
+    return false;
+  }
+  // char * is already converted to string above; leave it alone.
+  return TypeManager::is_simple(pointee) && !TypeManager::is_char(pointee);
+}
+
 ParameterRemap *InterfaceMaker::
-remap_parameter(CPPType *struct_type, CPPType *param_type) {
+remap_parameter(CPPType *struct_type, CPPType *param_type, bool is_return) {
   nassertr(param_type != nullptr, nullptr);
 
-  if (build_csharp && is_pointer_to_void(param_type)) {
+  // `void *` and raw data pointers (`unsigned char *`, `int16_t *`, ...) cross as
+  // IntPtr.  is_pointer() rejects them all, because neither void nor a numeric is
+  // "pointable", so the whole method was dropped.
+  //
+  // They cannot become Span<T>: the length lives in a *separate* parameter, and the
+  // pairing is not something the type system records.  GeomVertexArrayDataHandle's
+  // copy_subdata_from(size_t, size_t, const unsigned char *, size_t, size_t) has two
+  // more size_t's after the pointer, so "the next integer is the length" is simply
+  // false.  IntPtr is honest: the method exists, and the caller pins.  An
+  // out-parameter is never confused with one of these, because it carries PF_is_out.
+  if (build_csharp && !is_return &&
+      (is_pointer_to_void(param_type) || is_pointer_to_numeric(param_type))) {
     return new ParameterRemapUnchanged(param_type);
   }
 
@@ -389,7 +424,9 @@ remap_parameter(CPPType *struct_type, CPPType *param_type) {
   // same hand-written extensions it already has; changing its codegen here is not
   // this change's business.
   if (build_csharp && is_nonconst_ref_to_numeric(param_type)) {
-    return new ParameterRemapReferenceToPointer(param_type);
+    ParameterRemap *remap = new ParameterRemapReferenceToPointer(param_type);
+    remap->set_out_parameter(true);
+    return remap;
   }
 
   // Stream types: handled before the generic reference-to-pointer path so

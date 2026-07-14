@@ -58,7 +58,13 @@ public:
 
   virtual void write_module(std::ostream &out, std::ostream *out_h, InterrogateModuleDef *def);
 
-  virtual ParameterRemap *remap_parameter(CPPType *struct_type, CPPType *param_type);
+  // `is_return` marks the type as the function's return rather than a parameter.
+  // The two are not interchangeable: a raw `unsigned char *` parameter is a buffer the
+  // caller pins and passes, while the same type as a *return* is a pointer into C++
+  // storage whose constness the wrapper cannot preserve (TimeVal::get_tv() const hands
+  // back a const unsigned long *).  Parameters take them; returns still do not.
+  virtual ParameterRemap *remap_parameter(CPPType *struct_type, CPPType *param_type,
+                                          bool is_return = false);
 
   virtual bool synthesize_this_parameter();
   virtual bool separate_overloading();

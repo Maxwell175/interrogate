@@ -98,7 +98,7 @@ write_functions(ostream &out) {
  * handled.
  */
 ParameterRemap *InterfaceMakerC::
-remap_parameter(CPPType *struct_type, CPPType *param_type) {
+remap_parameter(CPPType *struct_type, CPPType *param_type, bool is_return) {
   // Wrap TypeHandle and ButtonHandle, which are practically just ints, as an
   // integer instead of a pointer.  It makes things easier on the scripting
   // language, especially if there has to be a dynamic downcasting system on
@@ -107,7 +107,7 @@ remap_parameter(CPPType *struct_type, CPPType *param_type) {
     return new ParameterRemapHandleToInt(param_type);
 
   } else {
-    return InterfaceMaker::remap_parameter(struct_type, param_type);
+    return InterfaceMaker::remap_parameter(struct_type, param_type, is_return);
   }
 }
 

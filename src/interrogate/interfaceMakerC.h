@@ -33,7 +33,8 @@ public:
   virtual void write_prototypes(std::ostream &out,std::ostream *out_h);
   virtual void write_functions(std::ostream &out);
 
-  virtual ParameterRemap *remap_parameter(CPPType *struct_type, CPPType *param_type);
+  virtual ParameterRemap *remap_parameter(CPPType *struct_type, CPPType *param_type,
+                                          bool is_return = false);
 
   virtual bool synthesize_this_parameter();
 

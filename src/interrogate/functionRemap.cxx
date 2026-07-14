@@ -387,6 +387,9 @@ make_wrapper_entry(FunctionIndex function_index) {
     if ((*pi)._nullable) {
       param._parameter_flags |= InterrogateFunctionWrapper::PF_nullable;
     }
+    if ((*pi)._remap->is_out_parameter()) {
+      param._parameter_flags |= InterrogateFunctionWrapper::PF_is_out;
+    }
     iwrapper._parameters.push_back(param);
   }
 
@@ -772,7 +775,7 @@ setup_properties(const InterrogateFunction &ifunc, InterfaceMaker *interface_mak
       return false;
     }
 
-    _return_type = interface_maker->remap_parameter(_cpptype, _cpptype);
+    _return_type = interface_maker->remap_parameter(_cpptype, _cpptype, /*is_return=*/true);
     if (_return_type != nullptr) {
       _void_return = false;
     }
@@ -787,7 +790,7 @@ setup_properties(const InterrogateFunction &ifunc, InterfaceMaker *interface_mak
       return false;
     } else {
       CPPType *ref_type = CPPType::new_type(new CPPReferenceType(_cpptype));
-      _return_type = interface_maker->remap_parameter(_cpptype, ref_type);
+      _return_type = interface_maker->remap_parameter(_cpptype, ref_type, /*is_return=*/true);
       if (_return_type != nullptr) {
         _void_return = false;
       }
@@ -800,7 +803,7 @@ setup_properties(const InterrogateFunction &ifunc, InterfaceMaker *interface_mak
 
   } else {
     // The normal case.
-    _return_type = interface_maker->remap_parameter(_cpptype, rtype);
+    _return_type = interface_maker->remap_parameter(_cpptype, rtype, /*is_return=*/true);
     if (_return_type != nullptr) {
       _void_return = TypeManager::is_void(rtype);
     }
@@ -813,7 +816,7 @@ setup_properties(const InterrogateFunction &ifunc, InterfaceMaker *interface_mak
     _void_return = true;
     _ForcedVoidReturn = true;
     CPPType *void_type = TypeManager::get_void_type();
-    _return_type = interface_maker->remap_parameter(_cpptype, void_type);
+    _return_type = interface_maker->remap_parameter(_cpptype, void_type, /*is_return=*/true);
     assert(_return_type != nullptr);
   }
 
