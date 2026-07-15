@@ -8363,14 +8363,23 @@ globalize_class_name(const InterrogateType &itype) const {
   if (name.compare(0, 8, "global::") == 0) {
     return name;
   }
-  string type_module = get_type_module_name(itype);
-  if (type_module.empty()) {
-    type_module = _current_module_name;
+  // A bare name here is either a genuine current-module type (which we qualify to
+  // defeat member-name shadowing) or a dependency type that get_type_module_name
+  // misattributes to the current module (get_qualified_class_name returns bare for
+  // both, since it treats module==current as "no qualifier needed").  Qualifying the
+  // latter with the current module is wrong -- it produces e.g.
+  // global::Panda3D.Rplight.LVecBase3f for a Core type, which does not exist.
+  //
+  // The authoritative test is whether the current module actually emits the type:
+  // is_current_native_methods_type consults csharp_owned_type_indices, the set the
+  // module writes class files for.  A dependency reached via --search-dir is not in
+  // it; its bare name resolves through the file's `using` directives.
+  TypeIndex tidx = get_type_index_for_interrogate_type(itype);
+  if (tidx != 0 && !_current_module_name.empty() &&
+      is_current_native_methods_type(tidx, itype)) {
+    return "global::" + prettify_namespace(_current_module_name) + "." + name;
   }
-  if (type_module.empty()) {
-    return name;
-  }
-  return "global::" + prettify_namespace(type_module) + "." + name;
+  return name;
 }
 
 /**
