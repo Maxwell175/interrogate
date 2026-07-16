@@ -3365,6 +3365,18 @@ write_interface(ostream &out, Object *object) {
   string interface_name = get_simple_interface_name(object->_itype);
   bool is_collection_facade = is_collection_facade_type(object->_itype);
 
+  // When the class surfaces as a sequence, the interface declares the same
+  // public indexer and suppresses op_index (which the class no longer emits).
+  string indexer_type;
+  {
+    Function *lf = nullptr, *ef = nullptr;
+    const InterrogateFunctionWrapper *lw = nullptr, *ew = nullptr;
+    TypeIndex ei = 0;
+    if (!is_collection_facade) {
+      find_sequence_indexer(object, lf, lw, ef, ew, ei, indexer_type);
+    }
+  }
+
   InterrogateDatabase *idb = InterrogateDatabase::get_ptr();
   const InterrogateType &itype = object->_itype;
 
@@ -3436,6 +3448,12 @@ write_interface(ostream &out, Object *object) {
 
   Functions::const_iterator fi;
   for (fi = object->_methods.begin(); fi != object->_methods.end(); ++fi) {
+    // operator[] is superseded by the class's public indexer, so drop it from
+    // the interface too — otherwise the class fails to implement the member.
+    if (!indexer_type.empty() && (*fi)->_ifunc.has_name() &&
+        make_csharp_identifier((*fi)->_ifunc.get_name()) == "op_index") {
+      continue;
+    }
     write_method(out, (*fi), object, 4, true, &method_signatures);
   }
 
@@ -4062,6 +4080,75 @@ write_collection_adapter_class(ostream &out, Object *object) {
 }
 
 /**
+ * Detects a MAKE_SEQ (a length getter with arity 0 plus an integer-indexed
+ * element getter with arity 1) that lets a class surface as IReadOnlyList<T>.
+ * Sourced from the serialized wrappers, not FunctionRemaps: a binary .in load
+ * carries no remaps (write_method has the same wrapper fallback), so a
+ * remap-only test silently disabled this for every real build.
+ */
+bool InterfaceMakerCSharp::
+find_sequence_indexer(Object *object,
+    Function *&length_func, const InterrogateFunctionWrapper *&length_w,
+    Function *&element_func, const InterrogateFunctionWrapper *&element_w,
+    TypeIndex &element_index, string &element_type) {
+  length_func = element_func = nullptr;
+  length_w = element_w = nullptr;
+  element_index = 0;
+  element_type.clear();
+  if (object == nullptr) {
+    return false;
+  }
+
+  InterrogateDatabase *idb = InterrogateDatabase::get_ptr();
+  // Finds the instance wrapper on func_index with exactly want_arity parameters
+  // after `this`.
+  auto find_seq_wrapper = [&](FunctionIndex func_index, int want_arity,
+                              Function *&out_func) -> const InterrogateFunctionWrapper * {
+    out_func = nullptr;
+    if (func_index == 0) return nullptr;
+    FunctionsByIndex::const_iterator it = _functions.find(func_index);
+    if (it == _functions.end()) return nullptr;
+    Function *f = it->second;
+    int n = f->_ifunc.number_of_c_wrappers();
+    for (int wi = 0; wi < n; ++wi) {
+      FunctionWrapperIndex widx = f->_ifunc.get_c_wrapper(wi);
+      if (widx == 0) continue;
+      const InterrogateFunctionWrapper &w = idb->get_wrapper(widx);
+      if (w.is_explicit_self() || !is_wrapper_legal_csharp(w)) continue;
+      int np = w.number_of_parameters();
+      bool has_this = np != 0 && w.parameter_is_this(0);
+      if (np - (has_this ? 1 : 0) != want_arity) continue;
+      out_func = f;
+      return &w;
+    }
+    return nullptr;
+  };
+
+  for (MakeSeq *make_seq : object->_make_seqs) {
+    if (make_seq == nullptr) continue;
+    Function *lf = nullptr, *ef = nullptr;
+    const InterrogateFunctionWrapper *lw =
+      find_seq_wrapper(make_seq->_imake_seq.get_length_getter(), 0, lf);
+    const InterrogateFunctionWrapper *ew =
+      find_seq_wrapper(make_seq->_imake_seq.get_element_getter(), 1, ef);
+    if (lw == nullptr || ew == nullptr || !ew->has_return_value()) continue;
+    // A collection indexer reads through `this`; both accessors are instance methods.
+    if (!lw->parameter_is_this(0) || !ew->parameter_is_this(0)) continue;
+    TypeIndex eidx = ew->get_return_type();
+    string etype = get_csharp_signature_type(eidx, false);
+    if (etype.empty()) continue;
+    length_func = lf;
+    element_func = ef;
+    length_w = lw;
+    element_w = ew;
+    element_index = eidx;
+    element_type = etype;
+    return true;
+  }
+  return false;
+}
+
+/**
  *
  */
 void InterfaceMakerCSharp::
@@ -4080,56 +4167,16 @@ write_proxy_class(ostream &out, const string &, Object *object) {
   string opaque_class_name = "__Opaque_" + flat_name;
   bool is_collection_facade = is_collection_facade_type(itype);
 
-  MakeSeq *indexer_make_seq = nullptr;
-  FunctionRemap *indexer_length_remap = nullptr;
-  FunctionRemap *indexer_element_remap = nullptr;
+  // A MAKE_SEQ lets the class surface as IReadOnlyList<T>.
+  Function *indexer_length_func = nullptr;
+  Function *indexer_element_func = nullptr;
+  const InterrogateFunctionWrapper *indexer_length_w = nullptr;
+  const InterrogateFunctionWrapper *indexer_element_w = nullptr;
+  TypeIndex indexer_element_index = 0;
   string indexer_type;
-  for (MakeSeq *make_seq : object->_make_seqs) {
-    if (make_seq == nullptr || make_seq->_length_getter == nullptr ||
-        make_seq->_element_getter == nullptr) {
-      continue;
-    }
-
-    FunctionRemap *length_remap = nullptr;
-    FunctionRemap *element_remap = nullptr;
-    {
-      size_t min_lp = 999, min_ep = 999;
-      for (auto ri = make_seq->_length_getter->_remaps.begin();
-           ri != make_seq->_length_getter->_remaps.end(); ++ri) {
-        FunctionRemap *r = *ri;
-        if (r != nullptr && is_remap_legal_csharp(r) && r->_parameters.size() < min_lp) {
-          min_lp = r->_parameters.size();
-          length_remap = r;
-        }
-      }
-      for (auto ri = make_seq->_element_getter->_remaps.begin();
-           ri != make_seq->_element_getter->_remaps.end(); ++ri) {
-        FunctionRemap *r = *ri;
-        if (r == nullptr || !is_remap_legal_csharp(r) || r->_void_return) continue;
-        size_t eself = r->_has_this ? 1 : 0;
-        size_t eextra = r->_parameters.size() - eself;
-        if (eextra >= 1 && r->_parameters.size() < min_ep) {
-          min_ep = r->_parameters.size();
-          element_remap = r;
-        }
-      }
-    }
-    if (length_remap == nullptr || element_remap == nullptr) {
-      continue;
-    }
-
-    if (element_remap->_void_return ||
-        !is_remap_legal_csharp(length_remap) ||
-        !is_remap_legal_csharp(element_remap)) {
-      continue;
-    }
-
-    indexer_make_seq = make_seq;
-    indexer_length_remap = length_remap;
-    indexer_element_remap = element_remap;
-    indexer_type = get_csharp_type_for_wrapper(element_remap->_return_type, is_return_nullable(element_remap));
-    break;
-  }
+  find_sequence_indexer(object, indexer_length_func, indexer_length_w,
+                        indexer_element_func, indexer_element_w,
+                        indexer_element_index, indexer_type);
 
   bool is_abstract = is_abstract_type(itype);
   std::vector<const InterrogateType *> secondary_base_types;
@@ -4542,6 +4589,11 @@ write_proxy_class(ostream &out, const string &, Object *object) {
     }
 
     for (fi = object->_methods.begin(); fi != object->_methods.end(); ++fi) {
+      // operator[] is redundant with the public indexer emitted for the sequence.
+      if (!indexer_type.empty() && !is_collection_facade && (*fi)->_ifunc.has_name() &&
+          make_csharp_identifier((*fi)->_ifunc.get_name()) == "op_index") {
+        continue;
+      }
       write_method(out, (*fi), object, 4, false, &method_signatures);
     }
     for (const InterrogateType *base_type : secondary_base_types) {
@@ -4626,62 +4678,41 @@ write_proxy_class(ostream &out, const string &, Object *object) {
     }
   }
 
-  if (indexer_make_seq != nullptr) {
-    indent(out, 4) << "int IReadOnlyCollection<" << indexer_type << ">.Count {\n";
-    indent(out, 6) << "get {\n";
-    indent(out, 8) << "return (int)NativeMethods."
-                   << get_pinvoke_name(indexer_make_seq->_length_getter, indexer_length_remap)
-                   << "(";
-    if (indexer_length_remap->_has_this) {
-      out << "NativeHandle";
+  if (!indexer_type.empty() && !is_collection_facade) {
+    string element_this = get_native_this_argument(itype, indexer_element_func->_ifunc);
+    string length_this = get_native_this_argument(itype, indexer_length_func->_ifunc);
+    string index_cast = get_pinvoke_type(indexer_element_w->parameter_get_type(1), false);
+    string index_arg = (index_cast == "int") ? "index" : "(" + index_cast + ")index";
+    string element_call =
+      get_pinvoke_call_name(indexer_element_func->_ifunc, *indexer_element_w) +
+      "(" + element_this + ", " + index_arg + ")";
+
+    string concrete_type = get_csharp_native_object_class_name(indexer_element_index);
+    string element_expr;
+    if (!concrete_type.empty()) {
+      element_expr = concrete_type + ".__CreateFromNative(" + element_call + ", " +
+                     get_native_ownership_name(*indexer_element_w, false) + ")!";
+    } else if (is_csharp_enum_type(indexer_element_index)) {
+      element_expr = "(" + indexer_type + ")" + element_call;
+    } else if ((indexer_type == "string" || indexer_type == "string?") &&
+               get_pinvoke_type(indexer_element_index, true) != "string") {
+      element_expr = "Marshal.PtrToStringUTF8(" + element_call + ") ?? string.Empty";
+    } else {
+      element_expr = element_call;
     }
-    out << ");\n";
-    indent(out, 6) << "}\n";
+
+    // Public indexer: implicitly implements IReadOnlyList<T>.this[int] and
+    // supersedes the C++ operator[] (whose op_index method is suppressed below).
+    indent(out, 4) << "public " << indexer_type << " this[int index] {\n";
+    indent(out, 6) << "get { return " << element_expr << "; }\n";
     indent(out, 4) << "}\n\n";
 
-    indent(out, 4) << indexer_type << " IReadOnlyList<" << indexer_type
-                   << ">.this[int index] {\n";
-    indent(out, 6) << "get {\n";
-
-    string native_call = "NativeMethods." +
-      get_pinvoke_name(indexer_make_seq->_element_getter, indexer_element_remap) + "(";
-    if (indexer_element_remap->_has_this) {
-      native_call += "NativeHandle, ";
-    }
-    size_t idx_param = indexer_element_remap->_has_this ? 1 : 0;
-    if (idx_param < indexer_element_remap->_parameters.size()) {
-      string idx_pinvoke = get_pinvoke_type(
-        indexer_element_remap->_parameters[idx_param]._remap->get_new_type(), false);
-      if (idx_pinvoke != "int") {
-        native_call += "(" + idx_pinvoke + ")";
-      }
-    }
-    native_call += "index)";
-    CPPType *return_type_cpp = indexer_element_remap->_return_type->get_new_type();
-    if (TypeManager::is_bool(return_type_cpp) ||
-        TypeManager::is_simple(return_type_cpp) ||
-        TypeManager::is_enum(return_type_cpp)) {
-      if (TypeManager::is_enum(return_type_cpp) && is_enum_type(_objects, return_type_cpp)) {
-        indent(out, 8) << "return (" << indexer_type << ")" << native_call << ";\n";
-      } else {
-        indent(out, 8) << "return " << native_call << ";\n";
-      }
-    } else if (TypeManager::is_char_pointer(return_type_cpp) ||
-               TypeManager::is_const_char_pointer(return_type_cpp) ||
-               indexer_type == "string") {
-      indent(out, 8) << "IntPtr result = " << native_call << ";\n";
-      indent(out, 8) << "return result == IntPtr.Zero ? null : Marshal.PtrToStringUTF8(result);\n";
-    } else if (is_csharp_native_object_type(_objects, return_type_cpp, indexer_type)) {
-      indent(out, 8) << "IntPtr result = " << native_call << ";\n";
-      indent(out, 8) << "return " << indexer_type
-                     << ".__CreateFromNative(result, "
-                     << get_native_ownership_name(indexer_element_remap, false)
-                     << ");\n";
-    } else {
-      indent(out, 8) << "return " << native_call << ";\n";
-    }
-
-    indent(out, 6) << "}\n";
+    // Count and enumeration satisfy the interface explicitly so a public 'Count'
+    // can never collide with a same-named member of the wrapped class.
+    indent(out, 4) << "int IReadOnlyCollection<" << indexer_type << ">.Count {\n";
+    indent(out, 6) << "get { return (int)"
+                   << get_pinvoke_call_name(indexer_length_func->_ifunc, *indexer_length_w)
+                   << "(" << length_this << "); }\n";
     indent(out, 4) << "}\n\n";
 
     indent(out, 4) << "IEnumerator<" << indexer_type << "> IEnumerable<"
@@ -4689,8 +4720,7 @@ write_proxy_class(ostream &out, const string &, Object *object) {
     indent(out, 6) << "int count = ((IReadOnlyCollection<" << indexer_type
                    << ">)this).Count;\n";
     indent(out, 6) << "for (int i = 0; i < count; i++) {\n";
-    indent(out, 8) << "yield return ((IReadOnlyList<" << indexer_type
-                   << ">)this)[i];\n";
+    indent(out, 8) << "yield return this[i];\n";
     indent(out, 6) << "}\n";
     indent(out, 4) << "}\n\n";
 

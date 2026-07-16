@@ -1,4 +1,4 @@
-//FLAGS: -promiscuous -string -refcount
+//FLAGS: -promiscuous -string -refcount -DCPPPARSER
 #include <string>
 #include <vector>
 
@@ -54,6 +54,34 @@ public:
 
 // Instantiate with a concrete type so interrogate emits code for it.
 typedef FancyArray<int> fancy_array_int;
+
+// MAKE_SEQ expands to an interrogate directive under the parser and to nothing
+// for the C++ compiler, exactly as dtoolbase.h defines it.  Declared inline so
+// the fixture stays self-contained.
+#ifdef CPPPARSER
+#define MAKE_SEQ(seq_name, num_name, element_name) __make_seq(seq_name, num_name, element_name)
+#else
+#define MAKE_SEQ(seq_name, num_name, element_name)
+#endif
+
+// A hand-written collection (NOT a std::vector facade — it *holds* a vector) that
+// exposes the sequence protocol via MAKE_SEQ plus operator[] / size(), the shape
+// panda3d's NodePathCollection uses.  interrogate should surface it as an
+// IReadOnlyList<string> with a public indexer and drop the redundant operator[].
+class Roster {
+public:
+  Roster();
+
+  void add(const std::string &name);
+  int get_num_members() const;
+  std::string get_member(int i) const;
+  MAKE_SEQ(get_members, get_num_members, get_member);
+  std::string operator [](int i) const;
+  int size() const;
+
+private:
+  std::vector<std::string> _members;
+};
 
 class Bag {
 public:

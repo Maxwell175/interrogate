@@ -26,6 +26,7 @@ internal static class Driver {
         TestStringVectorIndexerSet();
         TestCollectionNoLeak();
         TestSmartPointerBackedArray();
+        TestSequenceReadOnlyList();
 
         Console.WriteLine();
         if (_failed == 0) {
@@ -181,5 +182,31 @@ internal static class Driver {
         Check(arr.Count == 3, $"Count (got: {arr.Count})");
         Check(arr[0] == 10 && arr[1] == 20 && arr[2] == 30,
               $"indexer values (got: {arr[0]},{arr[1]},{arr[2]})");
+    }
+
+    // Roster is a hand-written collection (MAKE_SEQ + operator[]), not a vector
+    // facade.  It should surface as IReadOnlyList<string> with a public indexer,
+    // and its C++ operator[] (op_index/OpIndex) should be dropped in favour of it.
+    private static void TestSequenceReadOnlyList() {
+        Console.WriteLine("TestSequenceReadOnlyList: MAKE_SEQ class -> IReadOnlyList + indexer");
+        using var roster = new Roster();
+        roster.Add("ann");
+        roster.Add("bob");
+        roster.Add("cy");
+
+        IReadOnlyList<string> ro = roster;
+        Check(ro.Count == 3, $"IReadOnlyList.Count (got: {ro.Count})");
+
+        Check(roster[0] == "ann" && roster[1] == "bob" && roster[2] == "cy",
+              $"public indexer (got: {roster[0]},{roster[1]},{roster[2]})");
+
+        var seen = new List<string>();
+        foreach (var m in roster) seen.Add(m);
+        Check(seen.Count == 3 && seen[0] == "ann" && seen[2] == "cy",
+              $"foreach over the interface (got: {string.Join(",", seen)})");
+
+        Check(typeof(Roster).GetMethod("OpIndex") == null &&
+              typeof(Roster).GetMethod("op_index") == null,
+              "operator[] (OpIndex/op_index) suppressed in favour of the indexer");
     }
 }

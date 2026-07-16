@@ -1,5 +1,12 @@
 #include "collections.h"
 
+Roster::Roster() {}
+void Roster::add(const std::string &name) { _members.push_back(name); }
+int Roster::get_num_members() const { return (int)_members.size(); }
+std::string Roster::get_member(int i) const { return _members[i]; }
+std::string Roster::operator [](int i) const { return _members[i]; }
+int Roster::size() const { return (int)_members.size(); }
+
 Bag::Bag() {}
 
 void Bag::add_int(int x) { _ints.push_back(x); }

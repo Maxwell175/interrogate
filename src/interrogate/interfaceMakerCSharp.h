@@ -75,6 +75,15 @@ private:
   void write_proxy_class(std::ostream &out, const std::string &cs_namespace,
                          Object *object);
 
+  // Detects a MAKE_SEQ (length getter + integer-indexed element getter) that
+  // lets a class surface as IReadOnlyList<T>.  Fills the wrapper/type out-params
+  // and returns true when found; the details are sourced from the serialized
+  // wrappers so it works for binary .in loads (where FunctionRemaps are absent).
+  bool find_sequence_indexer(Object *object,
+      Function *&length_func, const InterrogateFunctionWrapper *&length_w,
+      Function *&element_func, const InterrogateFunctionWrapper *&element_w,
+      TypeIndex &element_index, std::string &element_type);
+
   void write_constructor(std::ostream &out, Function *func, Object *object,
                          int indent_level);
   void write_method(std::ostream &out, Function *func, Object *object,
