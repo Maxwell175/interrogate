@@ -7,6 +7,11 @@ std::string Roster::get_member(int i) const { return _members[i]; }
 std::string Roster::operator [](int i) const { return _members[i]; }
 int Roster::size() const { return (int)_members.size(); }
 
+Bench::Bench() {}
+void Bench::add(const std::string &name) { _names.push_back(name); }
+std::string Bench::operator [](size_t i) const { return _names[i]; }
+size_t Bench::size() const { return _names.size(); }
+
 Bag::Bag() {}
 
 void Bag::add_int(int x) { _ints.push_back(x); }

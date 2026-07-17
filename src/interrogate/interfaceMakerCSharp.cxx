@@ -4079,12 +4079,38 @@ write_collection_adapter_class(ostream &out, Object *object) {
   out << "  }\n";
 }
 
+// Is this type an integer once typedefs like size_t are peeled off?  Used to
+// tell a sequence's operator[](int) / size() from a mapping's operator[](key).
+static bool is_integral_type_index(TypeIndex ti) {
+  ti = unwrap_type_aliases(ti);
+  if (ti == 0) {
+    return false;
+  }
+  const InterrogateType &it = InterrogateDatabase::get_ptr()->get_type(ti);
+  if (!it.is_atomic()) {
+    return false;
+  }
+  switch (it.get_atomic_token()) {
+  case AT_int:
+  case AT_char:
+  case AT_longlong:
+    return true;
+  default:
+    return false;
+  }
+}
+
 /**
- * Detects a MAKE_SEQ (a length getter with arity 0 plus an integer-indexed
- * element getter with arity 1) that lets a class surface as IReadOnlyList<T>.
- * Sourced from the serialized wrappers, not FunctionRemaps: a binary .in load
- * carries no remaps (write_method has the same wrapper fallback), so a
- * remap-only test silently disabled this for every real build.
+ * Detects a sequence that lets a class surface as IReadOnlyList<T>, from the
+ * serialized wrappers (a binary .in load carries no FunctionRemaps).  Two
+ * shapes, in priority order:
+ *   1. A MAKE_SEQ: a length getter (arity 0) plus an integer-indexed element
+ *      getter (arity 1).
+ *   2. The bare sequence protocol: a nullary integral size() paired with an
+ *      integer-indexed operator[].  This mirrors interfaceMaker.cxx
+ *      check_protocols(), which the Python bindings use to set PT_sequence, so
+ *      collections like InputDeviceSet that never declared a MAKE_SEQ still
+ *      surface as sequences here, matching Python.
  */
 bool InterfaceMakerCSharp::
 find_sequence_indexer(Object *object,
@@ -4144,6 +4170,52 @@ find_sequence_indexer(Object *object,
     element_index = eidx;
     element_type = etype;
     return true;
+  }
+
+  // Fallback: a nullary integral size() plus an integer-indexed operator[].
+  Function *op_func = nullptr, *size_func = nullptr;
+  const InterrogateFunctionWrapper *op_w = nullptr, *size_w = nullptr;
+  for (Function *m : object->_methods) {
+    if (m == nullptr || !m->_ifunc.has_name()) continue;
+    const string &mname = m->_ifunc.get_name();
+    bool want_op = (op_w == nullptr && mname == "operator []");
+    bool want_size = (size_w == nullptr && mname == "size");
+    if (!want_op && !want_size) continue;
+
+    int nw = m->_ifunc.number_of_c_wrappers();
+    for (int wi = 0; wi < nw; ++wi) {
+      FunctionWrapperIndex widx = m->_ifunc.get_c_wrapper(wi);
+      if (widx == 0) continue;
+      const InterrogateFunctionWrapper &w = idb->get_wrapper(widx);
+      if (w.is_explicit_self() || !is_wrapper_legal_csharp(w) ||
+          !w.has_return_value() || w.number_of_parameters() == 0 ||
+          !w.parameter_is_this(0)) {
+        continue;
+      }
+      // operator[]: `this` + one integral index.
+      if (want_op && w.number_of_parameters() == 2 &&
+          is_integral_type_index(w.parameter_get_type(1))) {
+        op_func = m; op_w = &w; break;
+      }
+      // size(): `this` only, integral return.
+      if (want_size && w.number_of_parameters() == 1 &&
+          is_integral_type_index(w.get_return_type())) {
+        size_func = m; size_w = &w; break;
+      }
+    }
+  }
+  if (op_func != nullptr && size_func != nullptr) {
+    TypeIndex eidx = op_w->get_return_type();
+    string etype = get_csharp_signature_type(eidx, false);
+    if (!etype.empty()) {
+      length_func = size_func;
+      element_func = op_func;
+      length_w = size_w;
+      element_w = op_w;
+      element_index = eidx;
+      element_type = etype;
+      return true;
+    }
   }
   return false;
 }

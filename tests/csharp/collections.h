@@ -83,6 +83,22 @@ private:
   std::vector<std::string> _members;
 };
 
+// A collection exposing only the bare STL sequence protocol -- size() plus an
+// integer-indexed operator[], with NO MAKE_SEQ -- the shape of panda3d's
+// InputDeviceSet.  interrogate should still surface it as IReadOnlyList<string>
+// (matching the Python bindings, which infer the sequence protocol the same way).
+class Bench {
+public:
+  Bench();
+
+  void add(const std::string &name);
+  std::string operator [](size_t i) const;
+  size_t size() const;
+
+private:
+  std::vector<std::string> _names;
+};
+
 class Bag {
 public:
   Bag();

@@ -27,6 +27,7 @@ internal static class Driver {
         TestCollectionNoLeak();
         TestSmartPointerBackedArray();
         TestSequenceReadOnlyList();
+        TestBareSequenceProtocol();
 
         Console.WriteLine();
         if (_failed == 0) {
@@ -208,5 +209,29 @@ internal static class Driver {
         Check(typeof(Roster).GetMethod("OpIndex") == null &&
               typeof(Roster).GetMethod("op_index") == null,
               "operator[] (OpIndex/op_index) suppressed in favour of the indexer");
+    }
+
+    // Bench has size()/operator[] but NO MAKE_SEQ; the generator infers the
+    // sequence protocol from those two methods alone, matching Python.
+    private static void TestBareSequenceProtocol() {
+        Console.WriteLine("TestBareSequenceProtocol: size()/operator[] with no MAKE_SEQ -> IReadOnlyList");
+        using var bench = new Bench();
+        bench.Add("x");
+        bench.Add("y");
+
+        Check(typeof(IReadOnlyList<string>).IsAssignableFrom(typeof(Bench)),
+              "Bench implements IReadOnlyList<string>");
+
+        IReadOnlyList<string> ro = bench;
+        Check(ro.Count == 2, $"Count (got: {ro.Count})");
+        Check(bench[0] == "x" && bench[1] == "y",
+              $"public indexer (got: {bench[0]},{bench[1]})");
+
+        var seen = new List<string>();
+        foreach (var s in bench) seen.Add(s);
+        Check(seen.Count == 2 && seen[0] == "x", $"foreach (got: {string.Join(",", seen)})");
+
+        Check(typeof(Bench).GetMethod("OpIndex") == null,
+              "operator[] suppressed in favour of the indexer");
     }
 }
