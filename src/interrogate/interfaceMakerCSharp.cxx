@@ -4779,9 +4779,32 @@ write_proxy_class(ostream &out, const string &, Object *object) {
     indent(out, 6) << "get { return " << element_expr << "; }\n";
     indent(out, 4) << "}\n\n";
 
-    // Count and enumeration satisfy the interface explicitly so a public 'Count'
-    // can never collide with a same-named member of the wrapped class.
-    indent(out, 4) << "int IReadOnlyCollection<" << indexer_type << ">.Count {\n";
+    // Count implements IReadOnlyCollection<T>.Count.  Emit it as a public
+    // property so `collection.Count` works directly, unless the wrapped class
+    // already surfaces a member whose C# (PascalCase) name is "Count" -- then
+    // fall back to an explicit interface implementation to avoid the collision.
+    bool count_collides = false;
+    {
+      InterrogateDatabase *idb2 = InterrogateDatabase::get_ptr();
+      for (Function *seq_m : object->_methods) {
+        if (seq_m != nullptr && seq_m->_ifunc.has_name() &&
+            to_pascal_case(make_csharp_identifier(seq_m->_ifunc.get_name())) == "Count") {
+          count_collides = true;
+          break;
+        }
+      }
+      for (int pei = 0; !count_collides && pei < itype.number_of_elements(); ++pei) {
+        const InterrogateElement &pel = idb2->get_element(itype.get_element(pei));
+        if (to_pascal_case(make_csharp_identifier(pel.get_name())) == "Count") {
+          count_collides = true;
+        }
+      }
+    }
+    if (count_collides) {
+      indent(out, 4) << "int IReadOnlyCollection<" << indexer_type << ">.Count {\n";
+    } else {
+      indent(out, 4) << "public int Count {\n";
+    }
     indent(out, 6) << "get { return (int)"
                    << get_pinvoke_call_name(indexer_length_func->_ifunc, *indexer_length_w)
                    << "(" << length_this << "); }\n";

@@ -195,6 +195,9 @@ internal static class Driver {
         roster.Add("bob");
         roster.Add("cy");
 
+        // Count is a public property (usable without casting to the interface)
+        // and also satisfies IReadOnlyList<string>.Count.
+        Check(roster.Count == 3, $"public Count (got: {roster.Count})");
         IReadOnlyList<string> ro = roster;
         Check(ro.Count == 3, $"IReadOnlyList.Count (got: {ro.Count})");
 
@@ -222,8 +225,9 @@ internal static class Driver {
         Check(typeof(IReadOnlyList<string>).IsAssignableFrom(typeof(Bench)),
               "Bench implements IReadOnlyList<string>");
 
+        Check(bench.Count == 2, $"public Count (got: {bench.Count})");
         IReadOnlyList<string> ro = bench;
-        Check(ro.Count == 2, $"Count (got: {ro.Count})");
+        Check(ro.Count == 2, $"IReadOnlyList.Count (got: {ro.Count})");
         Check(bench[0] == "x" && bench[1] == "y",
               $"public indexer (got: {bench[0]},{bench[1]})");
 
