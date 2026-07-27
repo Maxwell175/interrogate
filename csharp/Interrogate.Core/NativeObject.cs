@@ -154,6 +154,30 @@ namespace Interrogate {
         private const long NativeMemoryPressureHint = 512;
 
         /// <summary>
+        /// Optional hooks a binding runtime can install to bracket every native
+        /// release in a runtime-specific scope. <see cref="BeforeRelease"/> runs
+        /// immediately before <see cref="ReleaseNative"/> and
+        /// <see cref="AfterRelease"/> immediately after — on the same thread, for
+        /// every owned / ref-counted disposal, including those driven by the
+        /// finalizer thread.
+        /// <para>
+        /// Interrogate.Core attaches no meaning to these; they exist so a library
+        /// binding can satisfy an invariant of its own native runtime (for
+        /// example, entering a thread-scoped memory-reclamation critical section
+        /// so a destructor that mutates shared state is properly covered) without
+        /// that concept leaking into the generator or this base class.
+        /// </para>
+        /// <para>
+        /// Install once at startup, before any wrapper is disposed; they are read
+        /// on every disposal and are not synchronized.
+        /// </para>
+        /// </summary>
+        public static Action? BeforeRelease;
+
+        /// <inheritdoc cref="BeforeRelease"/>
+        public static Action? AfterRelease;
+
+        /// <summary>
         /// Initializes a new wrapper around a native C++ pointer.
         /// </summary>
         /// <param name="ptr">The native pointer. May be <see cref="IntPtr.Zero"/> for null objects.</param>
@@ -271,7 +295,12 @@ namespace Interrogate {
         protected virtual void Dispose(bool disposing) {
             if (!_disposed) {
                 if (Ownership != NativeOwnership.Borrowed && _handle.Handle != IntPtr.Zero) {
-                    ReleaseNative();
+                    BeforeRelease?.Invoke();
+                    try {
+                        ReleaseNative();
+                    } finally {
+                        AfterRelease?.Invoke();
+                    }
                     GC.RemoveMemoryPressure(NativeMemoryPressureHint);
                 }
                 _handle = new HandleRef(null, IntPtr.Zero);
