@@ -203,6 +203,7 @@ private:
   std::string get_collection_element_type_from_cpp_name(const std::string &cpp_name,
                                                         bool for_signature) const;
   std::string get_collection_element_cpp_type(const InterrogateType &itype) const;
+  std::string get_collection_canonical_library(const InterrogateType &itype) const;
   std::string get_collection_helper_name(const InterrogateType &itype,
                                          const std::string &op) const;
 
