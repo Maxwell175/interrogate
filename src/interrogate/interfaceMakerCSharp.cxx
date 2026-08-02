@@ -34,19 +34,29 @@
 #include "cppStructType.h"
 #include "filename.h"
 
+#include <algorithm>
 #include <cctype>
+#include <climits>
 #include <cstring>
 #include <functional>
 #include <fstream>
 #include <set>
 #include <sstream>
+#include <tuple>
 
 using std::ostream;
 using std::string;
 
 std::set<int> csharp_owned_type_indices;
 std::map<int, std::string> csharp_type_module_map;
+// Each type's library captured before search-dir merges flip _def to an
+// upper-module winner (a fallback library source when no sidecars are present).
+std::map<int, std::string> csharp_type_library_snapshot;
 std::map<std::string, std::string> csharp_library_to_module;
+std::map<std::string, std::set<std::string> > csharp_module_deps;
+std::map<std::string, int> csharp_module_rank;
+std::set<std::string> csharp_pass1_defined_collections;
+std::map<std::string, std::set<std::string> > csharp_collection_definers;
 
 // Cache for get_collection_canonical_library(): facade class name -> owner library.
 std::map<std::string, std::string> csharp_collection_canonical_library;
@@ -2503,6 +2513,9 @@ write_functions(ostream &out) {
     if (!emitted_collection_prefixes.insert(helper_prefix).second) {
       continue;
     }
+    // This library emits a helper here iff it defines the collection; recorded
+    // for the .csharpcoll sidecar.
+    csharp_pass1_defined_collections.insert(get_class_name(itype));
     string cpp_type;
     if (itype._cpptype != nullptr) {
       cpp_type = itype._cpptype->get_local_name(&parser);
@@ -2757,16 +2770,18 @@ write_csharp_files(InterrogateModuleDef *def) {
     int n = idb->get_num_all_types();
     for (int t = 0; t < n; ++t) {
       TypeIndex idx = idb->get_all_type(t);
-      if (csharp_type_module_map.count(idx)) {
-        continue;  // already attributed (from command-line range tracking
-                   // or the second-pass ownership determination)
-      }
       const InterrogateType &itype = idb->get_type(idx);
       if (itype.has_library_name()) {
         string lib = itype.get_library_name();
-        auto it = csharp_library_to_module.find(lib);
-        if (it != csharp_library_to_module.end()) {
-          csharp_type_module_map[idx] = it->second;
+        // Capture the pre-merge library (see csharp_type_library_snapshot).
+        if (!lib.empty()) {
+          csharp_type_library_snapshot.emplace(idx, lib);
+        }
+        if (!csharp_type_module_map.count(idx)) {
+          auto it = csharp_library_to_module.find(lib);
+          if (it != csharp_library_to_module.end()) {
+            csharp_type_module_map[idx] = it->second;
+          }
         }
       }
     }
@@ -2781,6 +2796,11 @@ write_csharp_files(InterrogateModuleDef *def) {
   // New types added here are in the global database but NOT in _objects, so
   // they will not generate extra .cs files.
   load_all_search_dir_databases();
+
+  // With every module's types now loaded, derive the module dependency ranks
+  // used to pick each collection's canonical owner.  Must run before the facade
+  // attribution below, which calls get_collection_canonical_library().
+  compute_module_ranks();
 
   // After search-dir loading, search-dir merges may have changed the _def
   // (and thus get_library_name()) of collection facade types.  Update
@@ -2855,6 +2875,27 @@ load_all_search_dir_databases() {
         scan_dir(child);
       } else if (entry.size() > 3 && entry.substr(entry.size() - 3) == ".in") {
         request_external_database(child);
+      } else if (entry.size() > 11 &&
+                 entry.substr(entry.size() - 11) == ".csharpcoll") {
+        // A per-library sidecar (see interrogate.cxx): the library is the
+        // basename, each line is a collection class it defines.  Aggregate into
+        // the global definer map used by get_collection_canonical_library().
+        string lib = entry.substr(0, entry.size() - 11);
+        Filename coll_file(child);
+        coll_file.set_text();
+        std::ifstream in;
+        if (coll_file.open_read(in)) {
+          string line;
+          while (std::getline(in, line)) {
+            while (!line.empty() && (line.back() == '\r' || line.back() == '\n' ||
+                                     line.back() == ' ' || line.back() == '\t')) {
+              line.pop_back();
+            }
+            if (!line.empty()) {
+              csharp_collection_definers[line].insert(lib);
+            }
+          }
+        }
       }
     }
   };
@@ -9280,42 +9321,132 @@ get_collection_element_cpp_type(const InterrogateType &itype) const {
 }
 
 /**
+ * Derives csharp_module_rank: each module's depth in the dependency graph
+ * (0 = most-core), from the explicit --module-depends edges in
+ * csharp_module_deps.  A module ranks one past its deepest dependency, so a
+ * collection defined in several modules can be owned by the lowest-ranked one --
+ * a module every user can depend on, whose native helper lands in the .so its
+ * [LibraryImport] targets.
+ */
+void InterfaceMakerCSharp::
+compute_module_ranks() const {
+  if (!csharp_module_rank.empty()) {
+    return;
+  }
+
+  // Every module named as a dependent or a dependency participates.
+  std::set<string> modules;
+  for (const auto &entry : csharp_module_deps) {
+    modules.insert(entry.first);
+    for (const string &dep : entry.second) {
+      modules.insert(dep);
+    }
+  }
+
+  // Depth = longest chain of dependencies to a root (a module that depends on
+  // nothing).  Memoized in csharp_module_rank, with a cycle guard that treats a
+  // back-edge as depth 0.
+  std::set<string> in_progress;
+  std::function<int(const string &)> rank_of = [&](const string &m) -> int {
+    auto known = csharp_module_rank.find(m);
+    if (known != csharp_module_rank.end()) {
+      return known->second;
+    }
+    if (!in_progress.insert(m).second) {
+      return 0;
+    }
+    int best = 0;
+    auto di = csharp_module_deps.find(m);
+    if (di != csharp_module_deps.end()) {
+      for (const string &dep : di->second) {
+        best = std::max(best, rank_of(dep) + 1);
+      }
+    }
+    in_progress.erase(m);
+    csharp_module_rank[m] = best;
+    return best;
+  };
+
+  for (const string &m : modules) {
+    rank_of(m);
+  }
+}
+
+/**
+ * Picks the single canonical owning library for a collection facade, so its
+ * facade, its [LibraryImport] declaration, and its native Collection_* helper
+ * all agree on one hash whose symbol lives in the .so the declaration targets.
  *
+ * The owner must be the lowest-level definer -- a module every user can depend
+ * on (its .so is loaded by all of theirs).  The authoritative definer set comes
+ * from the .csharpcoll sidecars (csharp_collection_definers), which record
+ * exactly which libraries emitted a helper for the collection; unlike the merged
+ * database (whose _def collapses to one volatile winner), this survives intact.
+ * Among the definers we pick the lowest module rank, breaking ties by module then
+ * library name for a result stable across modules and rebuilds.
  */
 string InterfaceMakerCSharp::
 get_collection_canonical_library(const InterrogateType &itype) const {
-  // Deterministic owner library for a collection facade class name: the min
-  // library over all facade entries sharing the name.  Unlike
-  // itype.get_library_name() (the volatile post-merge _def winner, which flips
-  // when a second module introduces the collection and differs per process),
-  // this is stable across modules and rebuilds, so the facade hash, declaration
-  // hash, and owner module all agree.  Each candidate is a definer whose pass-1
-  // run exported Collection_<hash(lib)>_..., so the chosen hash always resolves.
   string key = get_class_name(itype);
   auto cached = csharp_collection_canonical_library.find(key);
   if (cached != csharp_collection_canonical_library.end()) {
     return cached->second;
   }
 
-  InterrogateDatabase *idb = InterrogateDatabase::get_ptr();
-  string best;
-  int n = idb->get_num_all_types();
-  for (int t = 0; t < n; ++t) {
-    const InterrogateType &cand = idb->get_type(idb->get_all_type(t));
-    if (!cand.has_library_name() || !is_collection_facade_type(cand)) {
-      continue;
+  string best_lib, best_mod;
+  int best_rank = 0;
+  auto consider = [&](const string &lib) {
+    if (lib.empty()) {
+      return;
     }
-    if (get_class_name(cand) != key) {
-      continue;
+    string mod;
+    auto mit = csharp_library_to_module.find(lib);
+    if (mit != csharp_library_to_module.end()) {
+      mod = mit->second;
     }
-    string lib = cand.get_library_name();
-    if (!lib.empty() && (best.empty() || lib < best)) {
-      best = lib;
+    int rank = INT_MAX;
+    auto rit = csharp_module_rank.find(mod);
+    if (rit != csharp_module_rank.end()) {
+      rank = rit->second;
+    }
+    if (best_lib.empty() ||
+        std::tie(rank, mod, lib) < std::tie(best_rank, best_mod, best_lib)) {
+      best_lib = lib;
+      best_mod = mod;
+      best_rank = rank;
+    }
+  };
+
+  auto defs = csharp_collection_definers.find(key);
+  if (defs != csharp_collection_definers.end() && !defs->second.empty()) {
+    // Authoritative: the sidecar-aggregated set of libraries that define it.
+    for (const string &lib : defs->second) {
+      consider(lib);
+    }
+  } else {
+    // Fallback when no sidecars are present: scan the merged database, weighing
+    // both each entry's pre-merge snapshot library and its current
+    // get_library_name(), either of which may point at the true lowest definer.
+    InterrogateDatabase *idb = InterrogateDatabase::get_ptr();
+    int n = idb->get_num_all_types();
+    for (int t = 0; t < n; ++t) {
+      TypeIndex idx = idb->get_all_type(t);
+      const InterrogateType &cand = idb->get_type(idx);
+      if (!is_collection_facade_type(cand) || get_class_name(cand) != key) {
+        continue;
+      }
+      auto ls = csharp_type_library_snapshot.find(idx);
+      if (ls != csharp_type_library_snapshot.end()) {
+        consider(ls->second);
+      }
+      if (cand.has_library_name()) {
+        consider(cand.get_library_name());
+      }
     }
   }
 
-  csharp_collection_canonical_library[key] = best;
-  return best;
+  csharp_collection_canonical_library[key] = best_lib;
+  return best_lib;
 }
 
 /**

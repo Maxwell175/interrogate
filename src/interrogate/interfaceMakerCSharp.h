@@ -29,7 +29,16 @@ class InterrogateFunctionWrapper;
 
 extern std::set<int> csharp_owned_type_indices;
 extern std::map<int, std::string> csharp_type_module_map;
+extern std::map<int, std::string> csharp_type_library_snapshot;
 extern std::map<std::string, std::string> csharp_library_to_module;
+// Direct module dependencies from --module-depends; compute_module_ranks() turns
+// these into csharp_module_rank (dependency depth, 0 = most-core).
+extern std::map<std::string, std::set<std::string> > csharp_module_deps;
+extern std::map<std::string, int> csharp_module_rank;
+// Collections each library defines: written per-library to a .csharpcoll sidecar
+// in pass 1, aggregated into a global class -> libraries map in pass 2.
+extern std::set<std::string> csharp_pass1_defined_collections;
+extern std::map<std::string, std::set<std::string> > csharp_collection_definers;
 
 class InterfaceMakerCSharp : public InterfaceMaker {
 public:
@@ -204,6 +213,7 @@ private:
                                                         bool for_signature) const;
   std::string get_collection_element_cpp_type(const InterrogateType &itype) const;
   std::string get_collection_canonical_library(const InterrogateType &itype) const;
+  void compute_module_ranks() const;
   std::string get_collection_helper_name(const InterrogateType &itype,
                                          const std::string &op) const;
 

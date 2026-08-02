@@ -28,6 +28,10 @@ using std::string;
 // This contains a big source string determined at compile time.
 extern const char interrogate_preamble_python_native_h[];
 
+// Collections this library defines, filled during C# native generation (pass 1)
+// and written to a .csharpcoll sidecar for the pass-2 owner ranking.
+extern std::set<std::string> csharp_pass1_defined_collections;
+
 CPPParser parser;
 
 Filename output_code_filename;
@@ -720,6 +724,20 @@ main(int argc, char **argv) {
       status = -1;
     } else {
       InterrogateDatabase::get_ptr()->write(output_data, def);
+    }
+
+    // Sidecar listing the collections this library defines, next to the .in;
+    // interrogate_csharp (pass 2) aggregates them to pick each collection's owner.
+    if (build_csharp && !csharp_pass1_defined_collections.empty()) {
+      Filename manifest(output_data_filename.get_fullpath_wo_extension() + ".csharpcoll");
+      manifest.set_text();
+      std::ofstream manifest_out;
+      manifest.open_write(manifest_out);
+      if (!manifest_out.fail()) {
+        for (const std::string &coll : csharp_pass1_defined_collections) {
+          manifest_out << coll << "\n";
+        }
+      }
     }
   }
 

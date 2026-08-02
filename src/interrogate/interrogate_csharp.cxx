@@ -75,6 +75,7 @@ enum CommandOptions {
   CO_dllname,
   CO_search_dir,
   CO_module_map,
+  CO_module_depends,
 
   CO_include_header,
   CO_skip_report,
@@ -89,6 +90,7 @@ static struct option long_options[] = {
   { "dllname", required_argument, nullptr, CO_dllname },
   { "search-dir", required_argument, nullptr, CO_search_dir },
   { "module-map", required_argument, nullptr, CO_module_map },
+  { "module-depends", required_argument, nullptr, CO_module_depends },
 
   { "include-header", required_argument, nullptr, CO_include_header },
   { "skip-report", required_argument, nullptr, CO_skip_report },
@@ -108,6 +110,8 @@ show_usage() {
     << "  --module NAME    Module / namespace root (required)\n"
     << "  --library NAME   Logical library name for output grouping\n"
     << "  --dllname NAME   Native library name used by LibraryImport\n"
+    << "  --module-map LIB=MOD    Map a library to its module (repeatable)\n"
+    << "  --module-depends MOD=DEP[,DEP...]  Modules MOD directly depends on (repeatable)\n"
     << "  --include-header PATH  Header to include in supplemental native output\n";
 }
 
@@ -162,6 +166,33 @@ main(int argc, char *argv[]) {
         size_t eq = arg.find('=');
         if (eq != string::npos) {
           csharp_library_to_module[arg.substr(0, eq)] = arg.substr(eq + 1);
+        }
+      }
+      break;
+
+    case CO_module_depends:
+      {
+        // "module=dep1,dep2,..." -- the modules `module` directly depends on.
+        // An entry with an empty dependency list still registers `module` as a
+        // known root, giving it rank 0.
+        string arg = optarg;
+        size_t eq = arg.find('=');
+        if (eq != string::npos) {
+          string module = arg.substr(0, eq);
+          csharp_module_deps.emplace(module, std::set<string>());
+          string deps = arg.substr(eq + 1);
+          size_t start = 0;
+          while (start < deps.size()) {
+            size_t comma = deps.find(',', start);
+            if (comma == string::npos) {
+              comma = deps.size();
+            }
+            string dep = deps.substr(start, comma - start);
+            if (!dep.empty()) {
+              csharp_module_deps[module].insert(dep);
+            }
+            start = comma + 1;
+          }
         }
       }
       break;
