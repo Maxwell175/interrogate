@@ -2361,6 +2361,39 @@ get_supplemental_unref_destructor_name(const InterrogateType &itype) {
   return make_csharp_identifier("UnrefDestroy_" + name);
 }
 
+// The ref-counter's increment helper (mirror of the unref_delete entry point above):
+// a per-type wrapper so the C++ compiler applies the derived->ReferenceCount pointer
+// offset before calling ref().
+string
+get_supplemental_ref_entry_point(const InterrogateType &itype) {
+  string name;
+  if (itype.has_scoped_name()) {
+    name = itype.get_scoped_name();
+    for (char &c : name) {
+      if (c == ':' || c == '<' || c == '>' || c == ',' || c == ' ') {
+        c = '_';
+      }
+    }
+  } else {
+    name = get_csharp_type_name(itype);
+  }
+  return "_inCSRef_" + name;
+}
+
+string
+get_supplemental_ref_name(const InterrogateType &itype) {
+  string name;
+  if (itype.has_scoped_name()) {
+    name = itype.get_scoped_name();
+    for (char &c : name) {
+      if (c == ':') c = '_';
+    }
+  } else {
+    name = get_csharp_type_name(itype);
+  }
+  return make_csharp_identifier("Ref_" + name);
+}
+
 }  // namespace
 
 /**
@@ -2493,6 +2526,23 @@ write_functions(ostream &out) {
     out << ") {\n";
     indent(out, 2) << "if (self != nullptr) {\n";
     indent(out, 4) << "unref_delete(self);\n";
+    indent(out, 2) << "}\n";
+    out << "}\n\n";
+  }
+
+  // Emit ref() increment wrappers for all RefCounted types.  These let an owning
+  // CastTo<T>(own: true) take a reference; taking self as the derived type lets the
+  // C++ compiler apply the derived->ReferenceCount offset before calling ref().
+  for (Object *object : refcounted_objects) {
+    CPPType *cpptype = TypeManager::resolve_type(object->_itype._cpptype);
+    string entry_point = get_supplemental_ref_entry_point(object->_itype);
+
+    out << "EXPORT_FUNC void " << entry_point << "(";
+    CPPType *pointer_type = TypeManager::wrap_pointer(cpptype);
+    pointer_type->output_instance(out, 0, &parser, false, "", "self");
+    out << ") {\n";
+    indent(out, 2) << "if (self != nullptr) {\n";
+    indent(out, 4) << "self->ref();\n";
     indent(out, 2) << "}\n";
     out << "}\n\n";
   }
@@ -3090,13 +3140,19 @@ write_native_methods_file(const string &dir, const string &cs_namespace) {
             << "(IntPtr self);\n\n";
       }
 
-      // For RefCounted types, also emit an unref_delete P/Invoke.
+      // For RefCounted types, also emit an unref_delete P/Invoke and its ref() mirror.
       TypeIndex type_index = get_type_index_for_interrogate_type(itype);
       if (type_index != 0 && is_type_refcounted(type_index)) {
         string unref_name = get_supplemental_unref_destructor_name(itype);
         out << "    [LibraryImport(\"" << quote_csharp_string(_dll_name) << "\", EntryPoint = \""
             << get_supplemental_unref_destructor_entry_point(itype) << "\")]\n";
         out << "    internal static partial void " << unref_name
+            << "(IntPtr self);\n\n";
+
+        string ref_name = get_supplemental_ref_name(itype);
+        out << "    [LibraryImport(\"" << quote_csharp_string(_dll_name) << "\", EntryPoint = \""
+            << get_supplemental_ref_entry_point(itype) << "\")]\n";
+        out << "    internal static partial void " << ref_name
             << "(IntPtr self);\n\n";
       }
     }
@@ -4557,6 +4613,21 @@ write_proxy_class(ostream &out, const string &, Object *object) {
       type_has_method(itype, "is_of_type")) {
     indent(out, 4) << "static int INativeType<" << class_name
                    << ">.TypeHandle => GetClassType();\n\n";
+  }
+
+  // Reference-counted types advertise it (so an owning CastTo<T>(own: true) can take a count) and
+  // expose a hook to bump that count via the _inCSRef_ helper (the mirror of _inCSUnrefDestr_ that
+  // ReleaseNative uses).  The count is released by ReleaseNative()'s unref_delete on disposal.
+  // Gated on has_destructor() to match where the _inCSRef_/UnrefDestroy_ helpers are emitted: a
+  // ref-counted type with no destructor gets neither, so we must not reference them here either.
+  TypeIndex rc_type_index = get_type_index_for_interrogate_type(itype);
+  if (rc_type_index != 0 && is_type_refcounted(rc_type_index) && itype.has_destructor()) {
+    indent(out, 4) << "static bool INativeType<" << class_name
+                   << ">.IsReferenceCounted => true;\n\n";
+    indent(out, 4) << "protected override void AddNativeRef() {\n";
+    indent(out, 6) << "NativeMethods." << get_supplemental_ref_name(itype)
+                   << "(NativeHandle);\n";
+    indent(out, 4) << "}\n\n";
   }
 
   indent(out, 4) << "internal " << class_name

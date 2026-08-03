@@ -54,6 +54,14 @@ namespace Interrogate {
         /// classes so <see cref="NativeObjectExtensions.CastTo{T}"/> can verify the dynamic type.
         /// </summary>
         static virtual int TypeHandle => 0;
+
+        /// <summary>
+        /// Whether <typeparamref name="TSelf"/>'s C++ type participates in the project's
+        /// reference-counting system. <c>false</c> by default; the generator overrides it to
+        /// <c>true</c> for ref-counted classes so an owning <see cref="NativeObject.CastTo{T}(bool)"/>
+        /// can bump the count and hand back a wrapper that is safe to keep past the source's lifetime.
+        /// </summary>
+        static virtual bool IsReferenceCounted => false;
     }
 
     /// <summary>
@@ -92,27 +100,22 @@ namespace Interrogate {
     public static class NativeObjectExtensions {
         /// <summary>
         /// Safely casts an interface-typed wrapper to a concrete generated binding class.
-        /// Creates a borrowed wrapper of type <typeparamref name="T"/> pointing to the
-        /// same native object.
+        /// See <see cref="NativeObject.CastTo{T}(bool)"/> for the checked/fail-closed semantics
+        /// and the meaning of <paramref name="own"/>.
         /// </summary>
         /// <typeparam name="T">The target generated binding class type.</typeparam>
         /// <param name="obj">The interface-typed wrapper to cast, or <c>null</c>.</param>
+        /// <param name="own">
+        /// When <c>true</c> and <typeparamref name="T"/> is reference-counted, the result owns a
+        /// reference and is safe to keep past <paramref name="obj"/>'s lifetime.
+        /// </param>
         /// <returns>
-        /// A borrowed wrapper of type <typeparamref name="T"/>, or <c>null</c> if <paramref name="obj"/>
-        /// is null, wraps a null pointer, or is not dynamically a <typeparamref name="T"/>.
+        /// A wrapper of type <typeparamref name="T"/>, or <c>null</c> if <paramref name="obj"/> is
+        /// null, wraps a null pointer, or cannot be verified to be a <typeparamref name="T"/>.
         /// </returns>
-        public static T? CastTo<T>(this INativeObject? obj) where T : NativeObject, INativeType<T> {
-            if (obj == null || obj.NativeHandle == IntPtr.Zero) {
-                return null;
-            }
-
-            int typeHandle = T.TypeHandle;
-            if (typeHandle != 0 && obj is IRuntimeTyped typed && typed.GetTypeIndex() != 0
-                    && !typed.IsOfType(typeHandle)) {
-                return null;
-            }
-
-            return T.CreateFromNative(obj.NativeHandle, NativeOwnership.Borrowed);
+        public static T? CastTo<T>(this INativeObject? obj, bool own = false)
+                where T : NativeObject, INativeType<T> {
+            return NativeObject.Cast<T>(obj, own);
         }
     }
 
@@ -208,22 +211,41 @@ namespace Interrogate {
 
 
         /// <summary>
-        /// Safely casts this wrapper to a derived or sibling type in the C++ inheritance hierarchy.
-        /// Creates a new <see cref="NativeOwnership.Borrowed"/> wrapper of type <typeparamref name="T"/>
-        /// pointing to the same native object.
+        /// Safely casts this wrapper to another type in the C++ inheritance hierarchy, returning a
+        /// new wrapper of type <typeparamref name="T"/> pointing at the same native object.
         /// <para>
-        /// When <typeparamref name="T"/>'s C++ type participates in a runtime type system (dtool's
-        /// <c>TypedObject</c>) and this object does too, the cast is <b>checked</b>: it verifies the
-        /// object's dynamic type and returns <c>null</c> on a mismatch (like C# <c>as</c> or a pointer
-        /// <c>dynamic_cast</c>). For types without a runtime type system it is an unchecked reinterpret.
+        /// <b>Checked / fail-closed.</b> When <typeparamref name="T"/>'s C++ type participates in a
+        /// runtime type system (dtool's <c>TypedObject</c>), the cast verifies this object's dynamic
+        /// type via <c>is_of_type</c> and returns <c>null</c> on a mismatch — and also <c>null</c> if
+        /// the dynamic type cannot be queried, rather than reinterpreting blindly. When
+        /// <typeparamref name="T"/> is <i>not</i> runtime-typed there is nothing to verify against, so
+        /// the cast succeeds only if this wrapper's managed type already is a <typeparamref name="T"/>
+        /// (an identity or upcast, whose pointer is known valid) and returns <c>null</c> otherwise.
+        /// This never hands back a wrapper over a wrongly-offset or unverified pointer.
+        /// </para>
+        /// <para>
+        /// <b>Reaching a C++ secondary base</b> (e.g. a <c>ReferenceCount</c> mixin) is done through
+        /// the directly-implemented interface (<c>obj as IReferenceCount</c>), which already carries
+        /// the correct pointer offset — not through this method.
+        /// </para>
+        /// <para>
+        /// <b>Ownership.</b> By default the result is a lightweight <see cref="NativeOwnership.Borrowed"/>
+        /// view: the caller must keep the source alive for as long as the result is used. Pass
+        /// <paramref name="own"/> <c>true</c> to get a result that owns its own reference when
+        /// <typeparamref name="T"/> is reference-counted, making it safe to keep after the source is
+        /// disposed or collected. (For non-reference-counted types <paramref name="own"/> has no
+        /// effect — there is no count to hold — and the borrowed-lifetime rule still applies.)
         /// </para>
         /// </summary>
         /// <typeparam name="T">
         /// The target type. Must be a generated binding class implementing <see cref="INativeType{T}"/>.
         /// </typeparam>
+        /// <param name="own">
+        /// Request an owning result for reference-counted <typeparamref name="T"/> (see remarks).
+        /// </param>
         /// <returns>
-        /// A borrowed wrapper of type <typeparamref name="T"/>, or <c>null</c> if this wrapper holds a
-        /// null pointer or is not dynamically a <typeparamref name="T"/>.
+        /// A wrapper of type <typeparamref name="T"/>, or <c>null</c> if this wrapper holds a null
+        /// pointer or cannot be verified to be a <typeparamref name="T"/>.
         /// </returns>
         /// <example>
         /// <code>
@@ -232,14 +254,43 @@ namespace Interrogate {
         ///     ?? throw new InvalidOperationException("Not the expected type");
         /// </code>
         /// </example>
-        public T? CastTo<T>() where T : NativeObject, INativeType<T> {
-            if (_handle.Handle == IntPtr.Zero) return null;
-            int typeHandle = T.TypeHandle;
-            if (typeHandle != 0 && this is IRuntimeTyped typed && typed.GetTypeIndex() != 0
-                    && !typed.IsOfType(typeHandle)) {
+        public T? CastTo<T>(bool own = false) where T : NativeObject, INativeType<T> {
+            return Cast<T>(this, own);
+        }
+
+        /// <summary>
+        /// Shared implementation behind the instance and extension <c>CastTo</c> overloads.
+        /// See <see cref="CastTo{T}(bool)"/> for the semantics.
+        /// </summary>
+        internal static T? Cast<T>(INativeObject? source, bool own)
+                where T : NativeObject, INativeType<T> {
+            if (source == null) return null;
+            IntPtr handle = source.NativeHandle;
+            if (handle == IntPtr.Zero) return null;
+
+            if (T.TypeHandle != 0) {
+                // T is runtime-typed: only proceed on a positive dynamic-type check.  If the
+                // source cannot be queried (not runtime-typed, or its own type is unregistered)
+                // we cannot verify the cast, so fail closed instead of reinterpreting.
+                if (source is not IRuntimeTyped typed || typed.GetTypeIndex() == 0
+                        || !typed.IsOfType(T.TypeHandle)) {
+                    return null;
+                }
+                // Verified: the object is dynamically a T.  Its TypedObject subobject is at
+                // offset 0, and `handle` is the object's primary pointer, so it is a valid T*.
+            } else if (source is not T) {
+                // Nothing to verify against and this is not an identity/upcast whose pointer we
+                // already know is valid, so we cannot produce a correct T* — fail closed.
                 return null;
             }
-            return T.CreateFromNative(_handle.Handle, NativeOwnership.Borrowed);
+
+            bool wantOwn = own && T.IsReferenceCounted;
+            T? result = T.CreateFromNative(handle,
+                wantOwn ? NativeOwnership.RefCounted : NativeOwnership.Borrowed);
+            if (wantOwn) {
+                result?.AddNativeRef();
+            }
+            return result;
         }
 
         /// <summary>
@@ -279,6 +330,14 @@ namespace Interrogate {
         /// reference-count decrement.
         /// </summary>
         protected abstract void ReleaseNative();
+
+        /// <summary>
+        /// Increments the native reference count of this object. No-op by default; the generator
+        /// overrides it for reference-counted classes so an owning <see cref="CastTo{T}(bool)"/> can
+        /// take a reference it will release via <see cref="ReleaseNative"/> on disposal. Only called
+        /// on wrappers whose type reports <see cref="INativeType{T}.IsReferenceCounted"/>.
+        /// </summary>
+        protected virtual void AddNativeRef() { }
 
         /// <summary>
         /// Releases native resources. Acts on both <see cref="NativeOwnership.Owned"/> and
