@@ -973,6 +973,14 @@ record_object(TypeIndex type_index) {
 string InterfaceMaker::
 manage_return_value(ostream &out, int indent_level,
                     FunctionRemap *remap, const string &return_expr) const {
+  if (build_csharp && remap->_type == FunctionRemap::T_typecast) {
+    // A synthesized up/downcast thunk hands C# a raw pointer it uses only
+    // transiently -- as an inherited-method `this`, or a cached secondary-base
+    // IntPtr -- and never wraps in a managed object, so nothing ever unrefs it.
+    // The ref manage_reference_counts would add here is pure leak: the cast
+    // target could never reach zero.  Return the pointer untouched.
+    return return_expr;
+  }
   if (remap->_manage_reference_count) {
     // If we're managing reference counts, and we're about to return a
     // reference countable object, then increment its count.
