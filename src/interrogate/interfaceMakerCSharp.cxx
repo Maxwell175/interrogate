@@ -1561,6 +1561,20 @@ marshal_managed_argument(TypeIndex param_type_index, const string &param_type,
   return param_name;
 }
 
+// True when marshal_managed_argument reads a native handle out of a managed
+// wrapper (a native-object or collection parameter).  Such an argument -- and,
+// for an instance member, `this` -- must be kept alive with GC.KeepAlive across
+// the native call: the marshalled handle is the wrapper's last managed use, so
+// without it the JIT may let the finalizer run mid-call and free (or unref) the
+// native object the C++ code is still reading.  Value-like arguments
+// (primitives, enums, strings, out params, streams) carry no such handle.
+static bool
+csharp_argument_needs_keepalive(TypeIndex param_type_index,
+                                const string &param_type) {
+  return is_csharp_native_object_type(param_type_index, param_type) ||
+         is_collection_type_index(param_type_index);
+}
+
 // If param_type_index refers to an atomic stream token, returns the
 // corresponding AtomicToken.  Otherwise returns AT_not_atomic.
 AtomicToken
@@ -3997,23 +4011,36 @@ write_collection_adapter_class(ostream &out, Object *object) {
   }
 
 
+  // Count reads `this.NativeHandle` and then has no further use of `this`, so it
+  // must keep `this` alive across the native call like any other accessor.
   if (use_collection_helpers) {
-    indent(out, 4) << "public override int Count => NativeMethods."
-                   << get_collection_helper_name(itype, "size") << "(NativeHandle);\n\n";
+    indent(out, 4) << "public override int Count {\n";
+    indent(out, 6) << "get { var __c = NativeMethods."
+                   << get_collection_helper_name(itype, "size")
+                   << "(NativeHandle); GC.KeepAlive(this); return (int)__c; }\n";
+    indent(out, 4) << "}\n\n";
   } else if (indexer_make_seq != nullptr && indexer_length_remap != nullptr) {
-    indent(out, 4) << "public override int Count => (int)NativeMethods."
+    indent(out, 4) << "public override int Count {\n";
+    indent(out, 6) << "get { var __c = NativeMethods."
                    << get_pinvoke_name(indexer_make_seq->_length_getter, indexer_length_remap)
-                   << "(NativeHandle);\n\n";
+                   << "(NativeHandle); GC.KeepAlive(this); return (int)__c; }\n";
+    indent(out, 4) << "}\n\n";
   } else if (indexer_length_remap != nullptr) {
-    indent(out, 4) << "public override int Count => (int)NativeMethods."
+    indent(out, 4) << "public override int Count {\n";
+    indent(out, 6) << "get { var __c = NativeMethods."
                    << get_pinvoke_name(indexer_length_func, indexer_length_remap)
-                   << "(NativeHandle);\n\n";
+                   << "(NativeHandle); GC.KeepAlive(this); return (int)__c; }\n";
+    indent(out, 4) << "}\n\n";
   } else if (indexer_length_func != nullptr && indexer_length_wrapper != nullptr) {
-    indent(out, 4) << "public override int Count => (int)NativeMethods."
+    indent(out, 4) << "public override int Count {\n";
+    indent(out, 6) << "get { var __c = NativeMethods."
                    << get_pinvoke_name(indexer_length_func->_ifunc, *indexer_length_wrapper)
-                   << "(NativeHandle);\n\n";
+                   << "(NativeHandle); GC.KeepAlive(this); return (int)__c; }\n";
+    indent(out, 4) << "}\n\n";
   }
 
+  // Every GetItem below reads `this.NativeHandle` and then does no more with
+  // `this`, so each keeps `this` alive across the native call (see write_method).
   if (use_collection_helpers) {
     string native_call = "NativeMethods." + get_collection_helper_name(itype, "get_element") + "(NativeHandle, index)";
     indent(out, 4) << "protected override " << element_type << " GetItem(int index) {\n";
@@ -4022,9 +4049,12 @@ write_collection_adapter_class(ostream &out, Object *object) {
       // Pinvoke returns IntPtr (see write_dllimport for collection helpers);
       // convert by copying into a managed string without freeing native mem.
       indent(out, 6) << "IntPtr result = " << native_call << ";\n";
+      indent(out, 6) << "GC.KeepAlive(this);\n";
       indent(out, 6) << "return result == IntPtr.Zero ? throw new InvalidOperationException(\"Native method returned null.\") : Marshal.PtrToStringUTF8(result)!;\n";
     } else if (is_csharp_primitive_type(element_type_value)) {
-      indent(out, 6) << "return " << native_call << ";\n";
+      indent(out, 6) << "var __e = " << native_call << ";\n";
+      indent(out, 6) << "GC.KeepAlive(this);\n";
+      indent(out, 6) << "return __e;\n";
     } else {
       // A PT(T) element arrives ref'd by the helper, so the managed wrapper owns a
       // reference to it; a value element arrives freshly heap-copied, and the
@@ -4034,6 +4064,7 @@ write_collection_adapter_class(ostream &out, Object *object) {
       bool handle_element = !collection_element_pointee(element_true_name).empty();
 
       indent(out, 6) << "IntPtr result = " << native_call << ";\n";
+      indent(out, 6) << "GC.KeepAlive(this);\n";
       indent(out, 6) << "return " << element_value_type << ".__CreateFromNative(result, "
                      << (handle_element ? "NativeOwnership.RefCounted" : "NativeOwnership.Owned") << ")"
                      << " ?? throw new InvalidOperationException(\"Native method returned null.\");\n";
@@ -4074,23 +4105,31 @@ write_collection_adapter_class(ostream &out, Object *object) {
          TypeManager::is_simple(return_type_cpp) ||
          TypeManager::is_enum(return_type_cpp))) {
       if (TypeManager::is_enum(return_type_cpp) && is_enum_type(_objects, return_type_cpp)) {
-        indent(out, 6) << "return (" << element_type << ")" << native_call << ";\n";
+        indent(out, 6) << "var __e = " << native_call << ";\n";
+        indent(out, 6) << "GC.KeepAlive(this);\n";
+        indent(out, 6) << "return (" << element_type << ")__e;\n";
       } else {
-        indent(out, 6) << "return " << native_call << ";\n";
+        indent(out, 6) << "var __e = " << native_call << ";\n";
+        indent(out, 6) << "GC.KeepAlive(this);\n";
+        indent(out, 6) << "return __e;\n";
       }
     } else if ((return_type_cpp != nullptr &&
                 (TypeManager::is_char_pointer(return_type_cpp) ||
                  TypeManager::is_const_char_pointer(return_type_cpp))) ||
                element_type == "string") {
       indent(out, 6) << "IntPtr result = " << native_call << ";\n";
+      indent(out, 6) << "GC.KeepAlive(this);\n";
       indent(out, 6) << "return result == IntPtr.Zero ? null : Marshal.PtrToStringUTF8(result);\n";
     } else if (is_csharp_native_object_type(_objects, return_type_cpp, element_type)) {
       indent(out, 6) << "IntPtr result = " << native_call << ";\n";
+      indent(out, 6) << "GC.KeepAlive(this);\n";
       indent(out, 6) << "return " << element_value_type << ".__CreateFromNative(result, "
                      << get_native_ownership_name(indexer_element_remap, false) << ")";
       out << " ?? throw new InvalidOperationException(\"Native method returned null.\");\n";
     } else {
-      indent(out, 6) << "return " << native_call << ";\n";
+      indent(out, 6) << "var __e = " << native_call << ";\n";
+      indent(out, 6) << "GC.KeepAlive(this);\n";
+      indent(out, 6) << "return __e;\n";
     }
     indent(out, 4) << "}\n\n";
   }
@@ -4102,12 +4141,11 @@ write_collection_adapter_class(ostream &out, Object *object) {
       indent(out, 4) << "protected override void SetItem(int index, " << element_type << " value) {\n";
       indent(out, 6) << "NativeMethods." << get_collection_helper_name(itype, "set_element") << "(NativeHandle, index, ";
       string element_type_value = get_collection_element_type(itype, false);
-      if (is_csharp_primitive_type(element_type_value) || element_type_value == "string") {
-        out << "value";
-      } else {
-        out << "NativeObject.Unwrap(value)";
-      }
+      bool value_is_handle = !(is_csharp_primitive_type(element_type_value) || element_type_value == "string");
+      out << (value_is_handle ? "NativeObject.Unwrap(value)" : "value");
       out << ");\n";
+      indent(out, 6) << "GC.KeepAlive(this);\n";
+      if (value_is_handle) { indent(out, 6) << "GC.KeepAlive(value);\n"; }
       indent(out, 4) << "}\n\n";
     } else if (set_element_remap != nullptr || set_element_wrapper != nullptr) {
       indent(out, 4) << "protected override void SetItem(int index, " << element_type << " value) {\n";
@@ -4119,12 +4157,11 @@ write_collection_adapter_class(ostream &out, Object *object) {
       TypeIndex value_type = set_element_remap != nullptr
         ? get_parameter_type_for_remap(set_element_remap, set_element_remap->_has_this ? 2 : 1)
         : set_element_wrapper->parameter_get_type(set_element_wrapper->parameter_is_this(0) ? 2 : 1);
-      if (is_csharp_native_object_type(value_type, element_type)) {
-        out << "NativeObject.Unwrap(value)";
-      } else {
-        out << "value";
-      }
+      bool value_is_handle = is_csharp_native_object_type(value_type, element_type);
+      out << (value_is_handle ? "NativeObject.Unwrap(value)" : "value");
       out << ");\n";
+      indent(out, 6) << "GC.KeepAlive(this);\n";
+      if (value_is_handle) { indent(out, 6) << "GC.KeepAlive(value);\n"; }
       indent(out, 4) << "}\n\n";
     } else {
       indent(out, 4) << "protected override void SetItem(int index, " << element_type << " value) => throw new NotSupportedException();\n\n";
@@ -4134,12 +4171,11 @@ write_collection_adapter_class(ostream &out, Object *object) {
       indent(out, 4) << "public override void Add(" << element_type << " item) {\n";
       indent(out, 6) << "NativeMethods." << get_collection_helper_name(itype, "push_back") << "(NativeHandle, ";
       string element_type_value = get_collection_element_type(itype, false);
-      if (is_csharp_primitive_type(element_type_value) || element_type_value == "string") {
-        out << "item";
-      } else {
-        out << "NativeObject.Unwrap(item)";
-      }
+      bool item_is_handle = !(is_csharp_primitive_type(element_type_value) || element_type_value == "string");
+      out << (item_is_handle ? "NativeObject.Unwrap(item)" : "item");
       out << ");\n";
+      indent(out, 6) << "GC.KeepAlive(this);\n";
+      if (item_is_handle) { indent(out, 6) << "GC.KeepAlive(item);\n"; }
       indent(out, 4) << "}\n\n";
     } else if (push_back_remap != nullptr || push_back_wrapper != nullptr) {
       indent(out, 4) << "public override void Add(" << element_type << " item) {\n";
@@ -4151,12 +4187,11 @@ write_collection_adapter_class(ostream &out, Object *object) {
       TypeIndex value_type = push_back_remap != nullptr
         ? get_parameter_type_for_remap(push_back_remap, push_back_remap->_has_this ? 1 : 0)
         : push_back_wrapper->parameter_get_type(push_back_wrapper->parameter_is_this(0) ? 1 : 0);
-      if (is_csharp_native_object_type(value_type, element_type)) {
-        out << "NativeObject.Unwrap(item)";
-      } else {
-        out << "item";
-      }
+      bool item_is_handle = is_csharp_native_object_type(value_type, element_type);
+      out << (item_is_handle ? "NativeObject.Unwrap(item)" : "item");
       out << ");\n";
+      indent(out, 6) << "GC.KeepAlive(this);\n";
+      if (item_is_handle) { indent(out, 6) << "GC.KeepAlive(item);\n"; }
       indent(out, 4) << "}\n\n";
     } else {
       indent(out, 4) << "public override void Add(" << element_type << " item) => throw new NotSupportedException();\n\n";
@@ -4165,6 +4200,7 @@ write_collection_adapter_class(ostream &out, Object *object) {
     if (use_collection_helpers) {
       indent(out, 4) << "public override void Clear() {\n";
       indent(out, 6) << "NativeMethods." << get_collection_helper_name(itype, "clear") << "(NativeHandle);\n";
+      indent(out, 6) << "GC.KeepAlive(this);\n";
       indent(out, 4) << "}\n\n";
     } else if (clear_remap != nullptr || clear_wrapper != nullptr) {
       indent(out, 4) << "public override void Clear() {\n";
@@ -4173,6 +4209,7 @@ write_collection_adapter_class(ostream &out, Object *object) {
                          ? get_pinvoke_name(clear_func, clear_remap)
                          : get_pinvoke_name(clear_func->_ifunc, *clear_wrapper))
                      << "(NativeHandle);\n";
+      indent(out, 6) << "GC.KeepAlive(this);\n";
       indent(out, 4) << "}\n\n";
     } else {
       indent(out, 4) << "public override void Clear() => throw new NotSupportedException();\n\n";
@@ -4914,7 +4951,7 @@ write_proxy_class(ostream &out, const string &, Object *object) {
     // Public indexer: implicitly implements IReadOnlyList<T>.this[int] and
     // supersedes the C++ operator[] (whose op_index method is suppressed below).
     indent(out, 4) << "public " << indexer_type << " this[int index] {\n";
-    indent(out, 6) << "get { return " << element_expr << "; }\n";
+    indent(out, 6) << "get { var __e = " << element_expr << "; GC.KeepAlive(this); return __e; }\n";
     indent(out, 4) << "}\n\n";
 
     // Count implements IReadOnlyCollection<T>.Count.  Emit it as a public
@@ -4943,9 +4980,9 @@ write_proxy_class(ostream &out, const string &, Object *object) {
     } else {
       indent(out, 4) << "public int Count {\n";
     }
-    indent(out, 6) << "get { return (int)"
+    indent(out, 6) << "get { var __c = (int)"
                    << get_pinvoke_call_name(indexer_length_func->_ifunc, *indexer_length_w)
-                   << "(" << length_this << "); }\n";
+                   << "(" << length_this << "); GC.KeepAlive(this); return __c; }\n";
     indent(out, 4) << "}\n\n";
 
     indent(out, 4) << "IEnumerator<" << indexer_type << "> IEnumerable<"
@@ -4995,6 +5032,9 @@ write_constructor(ostream &out, Function *func, Object *object, int indent_level
     std::vector<string> param_decls;
     std::vector<string> param_names;
     std::vector<string> native_args;
+    // Managed arguments whose native handle we pass to the native constructor;
+    // they must be kept alive across that call (a ctor has no `this` yet).
+    std::vector<string> keepalive_params;
 
     struct StreamBridgeSite { string var; string factory; string param; };
     std::vector<StreamBridgeSite> stream_bridges;
@@ -5033,6 +5073,7 @@ write_constructor(ostream &out, Function *func, Object *object, int indent_level
         } else {
           native_args.push_back("NativeObject.Unwrap(" + param_name + ")");
         }
+        keepalive_params.push_back(param_name);
       } else if (!is_csharp_primitive_type(param_type) && is_csharp_enum_type(param_type_index)) {
         native_args.push_back("(int)" + param_name);
       } else {
@@ -5063,8 +5104,8 @@ write_constructor(ostream &out, Function *func, Object *object, int indent_level
       (wrapper != nullptr) ? get_native_ownership_name(*wrapper, true)
                            : get_native_ownership_name(remap, true);
 
-    if (stream_bridges.empty()) {
-      // No stream bridges needed — fast path with chained `: this(…)`.
+    if (stream_bridges.empty() && keepalive_params.empty()) {
+      // Nothing to keep alive and no stream bridges — fast chained `: this(…)`.
       indent(out, indent_level) << "public " << class_name << "(";
       for (size_t i = 0; i < param_decls.size(); ++i) {
         if (i != 0) { out << ", "; }
@@ -5078,9 +5119,10 @@ write_constructor(ostream &out, Function *func, Object *object, int indent_level
       out << "), " << ownership << ") {\n";
       indent(out, indent_level) << "}\n\n";
     } else {
-      // Stream params need `using var` lifetime management, which a chained
-      // initializer can't provide.  Route through a private static helper
-      // that owns the bridge for the duration of the native call.
+      // Stream params need `using var` lifetime management, and managed handles
+      // need a GC.KeepAlive after the call -- neither of which a chained
+      // initializer can express.  Route through a private static helper that
+      // owns those lifetimes for the duration of the native call.
       string helper_name = "__p3Create" + get_pinvoke_name(func, remap);
       indent(out, indent_level) << "public " << class_name << "(";
       for (size_t i = 0; i < param_decls.size(); ++i) {
@@ -5105,13 +5147,17 @@ write_constructor(ostream &out, Function *func, Object *object, int indent_level
         indent(out, indent_level + 2) << "using var " << b.var << " = "
                                       << b.factory << "(" << b.param << ");\n";
       }
-      indent(out, indent_level + 2) << "return NativeMethods."
+      indent(out, indent_level + 2) << "var __p3ret = NativeMethods."
                                     << get_pinvoke_name(func, remap) << "(";
       for (size_t i = 0; i < native_args.size(); ++i) {
         if (i != 0) { out << ", "; }
         out << native_args[i];
       }
       out << ");\n";
+      for (const string &k : keepalive_params) {
+        indent(out, indent_level + 2) << "GC.KeepAlive(" << k << ");\n";
+      }
+      indent(out, indent_level + 2) << "return __p3ret;\n";
       indent(out, indent_level) << "}\n\n";
     }
   }
@@ -5137,6 +5183,9 @@ write_constructor(ostream &out, Function *func, Object *object, int indent_level
     std::vector<string> param_decls;
     std::vector<string> param_names;
     std::vector<string> native_args;
+    // Managed arguments whose native handle we pass to the native constructor;
+    // they must be kept alive across that call (a ctor has no `this` yet).
+    std::vector<string> keepalive_params;
 
     struct StreamBridgeSite { string var; string factory; string param; };
     std::vector<StreamBridgeSite> stream_bridges;
@@ -5173,6 +5222,7 @@ write_constructor(ostream &out, Function *func, Object *object, int indent_level
         } else {
           native_args.push_back("NativeObject.Unwrap(" + param_name + ")");
         }
+        keepalive_params.push_back(param_name);
       } else if (!is_csharp_primitive_type(param_type) && is_csharp_enum_type(param_type_index)) {
         native_args.push_back("(int)" + param_name);
       } else {
@@ -5201,7 +5251,7 @@ write_constructor(ostream &out, Function *func, Object *object, int indent_level
 
     string ownership = get_native_ownership_name(wrapper, true);
 
-    if (stream_bridges.empty()) {
+    if (stream_bridges.empty() && keepalive_params.empty()) {
       indent(out, indent_level) << "public " << class_name << "(";
       for (size_t i = 0; i < param_decls.size(); ++i) {
         if (i != 0) { out << ", "; }
@@ -5239,13 +5289,17 @@ write_constructor(ostream &out, Function *func, Object *object, int indent_level
         indent(out, indent_level + 2) << "using var " << b.var << " = "
                                       << b.factory << "(" << b.param << ");\n";
       }
-      indent(out, indent_level + 2) << "return NativeMethods."
+      indent(out, indent_level + 2) << "var __p3ret = NativeMethods."
                                     << get_pinvoke_name(func->_ifunc, wrapper) << "(";
       for (size_t i = 0; i < native_args.size(); ++i) {
         if (i != 0) { out << ", "; }
         out << native_args[i];
       }
       out << ");\n";
+      for (const string &k : keepalive_params) {
+        indent(out, indent_level + 2) << "GC.KeepAlive(" << k << ");\n";
+      }
+      indent(out, indent_level + 2) << "return __p3ret;\n";
       indent(out, indent_level) << "}\n\n";
     }
   }
@@ -5684,10 +5738,14 @@ write_method(ostream &out, Function *func, Object *object, int indent_level,
     std::vector<string> param_decls;
     std::vector<string> param_names;
     std::vector<string> native_args;
+    // Managed values that must outlive the native call (see
+    // csharp_argument_needs_keepalive); `this` leads for an instance method.
+    std::vector<string> keepalive_exprs;
 
     size_t first_param = remap->_has_this ? 1 : 0;
     if (remap->_has_this) {
       native_args.push_back(get_native_this_argument(object, func, remap));
+      keepalive_exprs.push_back("this");
     }
 
     // Collected stream-bridge allocations needed before the native call:
@@ -5723,6 +5781,9 @@ write_method(ostream &out, Function *func, Object *object, int indent_level,
         native_args.push_back(bridge_var + ".Handle");
       } else {
         native_args.push_back(marshal_managed_argument(param_type_index, param_type, param_name));
+        if (csharp_argument_needs_keepalive(param_type_index, param_type)) {
+          keepalive_exprs.push_back(param_name);
+        }
       }
     }
 
@@ -5833,6 +5894,20 @@ write_method(ostream &out, Function *func, Object *object, int indent_level,
     }
     native_call += ")";
 
+    // Root every managed handle we passed (and `this`) across the native call.
+    // GC.KeepAlive is a use the JIT can't hoist before the call, so the wrapper
+    // can't be finalized -- freeing/unref'ing the native object -- while C++ is
+    // still dereferencing its pointer.  For a non-void call we capture the
+    // result first, then keep-alive, then let the return block consume the
+    // local; the void case appends the keep-alives after the call statement.
+    if (!keepalive_exprs.empty() && !remap->_void_return) {
+      indent(out, indent_level + 2) << "var __p3ret = " << native_call << ";\n";
+      for (const string &k : keepalive_exprs) {
+        indent(out, indent_level + 2) << "GC.KeepAlive(" << k << ");\n";
+      }
+      native_call = "__p3ret";
+    }
+
     string concrete_return_type = (return_type_index != 0)
       ? get_csharp_native_object_class_name(return_type_index)
       : get_csharp_native_object_class_name(remap->_return_type->get_new_type());
@@ -5844,6 +5919,9 @@ write_method(ostream &out, Function *func, Object *object, int indent_level,
       : get_pinvoke_type(remap->_return_type->get_new_type(), true);
     if (remap->_void_return) {
       indent(out, indent_level + 2) << native_call << ";\n";
+      for (const string &k : keepalive_exprs) {
+        indent(out, indent_level + 2) << "GC.KeepAlive(" << k << ");\n";
+      }
 
     } else if (managed_return_type == "string" || managed_return_type == "string?") {
       if (pinvoke_return_type == "string") {
@@ -5992,10 +6070,13 @@ write_method(ostream &out, Function *func, Object *object, int indent_level,
     std::vector<string> param_decls;
     std::vector<string> param_names;
     std::vector<string> native_args;
+    // Managed values that must outlive the native call (see the remap path).
+    std::vector<string> keepalive_exprs;
 
     int first_param = has_this ? 1 : 0;
     if (has_this && object != nullptr) {
       native_args.push_back(get_native_this_argument(object->_itype, func->_ifunc));
+      keepalive_exprs.push_back("this");
     }
 
     struct StreamBridgeSite { string var; string factory; string param; bool nullable; };
@@ -6036,6 +6117,9 @@ write_method(ostream &out, Function *func, Object *object, int indent_level,
         native_args.push_back(bridge_var + ".Handle");
       } else {
         native_args.push_back(marshal_managed_argument(param_type_index, param_type, param_name));
+        if (csharp_argument_needs_keepalive(param_type_index, param_type)) {
+          keepalive_exprs.push_back(param_name);
+        }
       }
     }
 
@@ -6156,12 +6240,25 @@ write_method(ostream &out, Function *func, Object *object, int indent_level,
     }
     native_call += ")";
 
+    // Keep managed handles (and `this`) rooted across the call -- see the remap
+    // path above for why.
+    if (!keepalive_exprs.empty() && wrapper.has_return_value()) {
+      indent(out, indent_level + 2) << "var __p3ret = " << native_call << ";\n";
+      for (const string &k : keepalive_exprs) {
+        indent(out, indent_level + 2) << "GC.KeepAlive(" << k << ");\n";
+      }
+      native_call = "__p3ret";
+    }
+
     string concrete_return_type = get_csharp_native_object_class_name(return_type_index);
     string managed_return_type = get_csharp_type(return_type_index, return_nullable);
     string pinvoke_return_type = get_pinvoke_type(return_type_index, true);
 
     if (!wrapper.has_return_value()) {
       indent(out, indent_level + 2) << native_call << ";\n";
+      for (const string &k : keepalive_exprs) {
+        indent(out, indent_level + 2) << "GC.KeepAlive(" << k << ");\n";
+      }
 
     } else if (return_stream_tok != AT_not_atomic) {
       indent(out, indent_level + 2) << "IntPtr result = " << native_call << ";\n";
@@ -6363,6 +6460,13 @@ write_property(ostream &out, Property *prop, Object *object, int indent_level,
     }
     native_call += ")";
 
+    // Keep `this` rooted across the getter's native call (see write_method).
+    if (getter->_has_this) {
+      indent(out, indent_level + 4) << "var __p3ret = " << native_call << ";\n";
+      indent(out, indent_level + 4) << "GC.KeepAlive(this);\n";
+      native_call = "__p3ret";
+    }
+
     CPPType *return_type_cpp = getter->_return_type->get_new_type();
     bool return_nullable = is_return_nullable(getter);
     if (TypeManager::is_bool(return_type_cpp) ||
@@ -6432,15 +6536,24 @@ write_property(ostream &out, Property *prop, Object *object, int indent_level,
     if (need_comma) {
       native_call += ", ";
     }
+    bool value_needs_keepalive = false;
     if (!setter->_parameters.empty()) {
       ParameterRemap *value_remap = setter->_parameters.back()._remap;
       string value_type = get_csharp_type_for_wrapper(value_remap, false);
       TypeIndex value_type_index = get_type_index_for_cpp_type(value_remap->get_new_type());
       native_call += marshal_managed_argument(value_type_index, value_type, "value");
+      value_needs_keepalive = csharp_argument_needs_keepalive(value_type_index, value_type);
     }
     native_call += ")";
 
     indent(out, indent_level + 4) << native_call << ";\n";
+    // Keep `this` and the assigned handle rooted across the native call.
+    if (setter->_has_this) {
+      indent(out, indent_level + 4) << "GC.KeepAlive(this);\n";
+    }
+    if (value_needs_keepalive) {
+      indent(out, indent_level + 4) << "GC.KeepAlive(value);\n";
+    }
     indent(out, indent_level + 2) << "}\n";
   }
 
@@ -6692,6 +6805,13 @@ write_property_from_wrapper(ostream &out, const InterrogateElement &ielement,
         << "(" << has_this_arg << ")) return null;\n";
     }
 
+    // Keep `this` rooted across the getter's native call (see write_method).
+    if (has_this) {
+      indent(out, indent_level + 4) << "var __p3ret = " << native_call << ";\n";
+      indent(out, indent_level + 4) << "GC.KeepAlive(this);\n";
+      native_call = "__p3ret";
+    }
+
     if (!concrete_type.empty()) {
       indent(out, indent_level + 4) << "IntPtr result = " << native_call << ";\n";
       indent(out, indent_level + 4) << "return " << concrete_type
@@ -6733,6 +6853,13 @@ write_property_from_wrapper(ostream &out, const InterrogateElement &ielement,
     }
     native_call += marshal_managed_argument(value_idx, value_type, "value") + ")";
     indent(out, indent_level + 4) << native_call << ";\n";
+    // Keep `this` and the assigned handle rooted across the native call.
+    if (has_this) {
+      indent(out, indent_level + 4) << "GC.KeepAlive(this);\n";
+    }
+    if (csharp_argument_needs_keepalive(value_idx, value_type)) {
+      indent(out, indent_level + 4) << "GC.KeepAlive(value);\n";
+    }
     indent(out, indent_level + 2) << "}\n";
   }
 
@@ -7100,15 +7227,32 @@ write_map_property_from_wrapper(ostream &out, const InterrogateElement &ielement
   string get_this = get_native_this_argument(object->_itype, get_func->_ifunc);
   string key_arg = marshal_managed_argument(key_index, key_type, "__key");
 
+  // The lambdas capture the owner (via `this.NativeHandle`), so the map keeps
+  // the owner alive.  But the per-call `__key`/`__value` are lambda parameters:
+  // if they carry a native handle they must be kept alive across the native
+  // call, which an expression-bodied lambda can't do -- so those become
+  // statement-bodied when a handle is in play.  A `__lam(expr, [keeps])` helper
+  // builds the right lambda body; a value-typed key/value keeps the terse form.
+  bool key_keep = csharp_argument_needs_keepalive(key_index, key_type);
+  auto keyed_lambda = [&](const string &body, bool returns) -> string {
+    if (!key_keep) {
+      return "__key => " + body;
+    }
+    if (returns) {
+      return "__key => { var __r = " + body + "; GC.KeepAlive(__key); return __r; }";
+    }
+    return "__key => { " + body + "; GC.KeepAlive(__key); }";
+  };
+
   string has_call = get_pinvoke_call_name(has_func->_ifunc, *has_w) +
     "(" + has_this + ", " + marshal_managed_argument(has_w->parameter_get_type(1), key_type, "__key") + ")";
   string get_call = get_pinvoke_call_name(get_func->_ifunc, *get_w) +
     "(" + get_this + ", " + key_arg + ")";
 
   indent(out, indent_level + 4) << "return new " << map_type << "(\n";
-  indent(out, indent_level + 6) << "__key => " << has_call << ",\n";
-  indent(out, indent_level + 6) << "__key => "
-                                << managed_expr(value_index, value_type, *get_w, get_call);
+  indent(out, indent_level + 6) << keyed_lambda(has_call, true) << ",\n";
+  indent(out, indent_level + 6)
+    << keyed_lambda(managed_expr(value_index, value_type, *get_w, get_call), true);
 
   if (enumerable) {
     string len_this = get_native_this_argument(object->_itype, len_func->_ifunc);
@@ -7132,23 +7276,27 @@ write_map_property_from_wrapper(ostream &out, const InterrogateElement &ielement
     TypeIndex set_value_index = set_w->parameter_get_type(2);
     string set_value_type = get_csharp_type(set_value_index, false);
     string set_this = get_native_this_argument(object->_itype, set_func->_ifunc);
+    bool val_keep = csharp_argument_needs_keepalive(set_value_index, set_value_type);
+    string set_call = get_pinvoke_call_name(set_func->_ifunc, *set_w) +
+      "(" + set_this + ", " +
+      marshal_managed_argument(set_w->parameter_get_type(1), key_type, "__key") + ", " +
+      marshal_managed_argument(set_value_index, set_value_type, "__value") + ")";
     out << ",\n";
-    indent(out, indent_level + 6) << "(__key, __value) => "
-                                  << get_pinvoke_call_name(set_func->_ifunc, *set_w)
-                                  << "(" << set_this << ", "
-                                  << marshal_managed_argument(set_w->parameter_get_type(1), key_type, "__key")
-                                  << ", "
-                                  << marshal_managed_argument(set_value_index, set_value_type, "__value")
-                                  << ")";
+    if (key_keep || val_keep) {
+      string keeps = string(key_keep ? "GC.KeepAlive(__key); " : "") +
+                     (val_keep ? "GC.KeepAlive(__value); " : "");
+      indent(out, indent_level + 6) << "(__key, __value) => { " << set_call << "; " << keeps << "}";
+    } else {
+      indent(out, indent_level + 6) << "(__key, __value) => " << set_call;
+    }
 
     if (del_w != nullptr) {
       string del_this = get_native_this_argument(object->_itype, del_func->_ifunc);
+      string del_call = get_pinvoke_call_name(del_func->_ifunc, *del_w) +
+        "(" + del_this + ", " +
+        marshal_managed_argument(del_w->parameter_get_type(1), key_type, "__key") + ")";
       out << ",\n";
-      indent(out, indent_level + 6) << "__key => "
-                                    << get_pinvoke_call_name(del_func->_ifunc, *del_w)
-                                    << "(" << del_this << ", "
-                                    << marshal_managed_argument(del_w->parameter_get_type(1), key_type, "__key")
-                                    << ")";
+      indent(out, indent_level + 6) << keyed_lambda(del_call, true);
     } else if (enumerable && clear_w != nullptr) {
       out << ",\n";
       indent(out, indent_level + 6) << "null";
