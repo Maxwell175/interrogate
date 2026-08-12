@@ -61,6 +61,18 @@ std::map<std::string, std::set<std::string> > csharp_collection_definers;
 // Cache for get_collection_canonical_library(): facade class name -> owner library.
 std::map<std::string, std::string> csharp_collection_canonical_library;
 
+// A collection's C++ identity (true name minus const/*/&) -> the facade record
+// holding the mutable class name.  A `const T &` parameter must name the mutable
+// facade, whose class name is not derivable from the const one by text: the const
+// record of PolylightEffect::LightGroup is called LightGroup_const while its
+// mutable record is called PolylightEffect_LightGroup.
+std::map<std::string, int> csharp_collection_mutable_type;
+
+// Mutable facade class name -> its record.  Consulted first, so a collection whose
+// mutable class really is the const one minus "_const" keeps resolving to exactly
+// that class, and only the cases where no such class exists fall back to identity.
+std::map<std::string, int> csharp_collection_mutable_by_class;
+
 // Remap for std::wstring parameters/returns in C# mode.
 // Uses UTF-8 (char const *) at the C boundary instead of wchar_t const *,
 // converting via TextEncoder::decode_text / encode_wtext so that
@@ -1438,6 +1450,77 @@ static CollectionFacadeKind get_collection_facade_kind(const InterrogateType &it
 
 static bool is_collection_facade_type(const InterrogateType &itype) {
   return get_collection_facade_kind(itype) != CF_none;
+}
+
+/**
+ * The C++ identity shared by every record of one collection: the true name with
+ * `const`, `*` and `&` removed and whitespace collapsed, so that
+ * "pvector< LPoint3 > const *" and "pvector< LPoint3 > *" agree.  A `const`
+ * inside a template argument is stripped too, but identically for both records,
+ * so they still meet on the same key.
+ */
+static string collection_facade_identity(const InterrogateType &itype) {
+  if (!itype.has_true_name()) {
+    return string();
+  }
+  string name = itype.get_true_name();
+  string out;
+  size_t i = 0;
+  while (i < name.size()) {
+    if (name.compare(i, 5, "const") == 0 &&
+        (i == 0 || !isalnum((unsigned char)name[i - 1])) &&
+        (i + 5 >= name.size() || !isalnum((unsigned char)name[i + 5]))) {
+      i += 5;
+      continue;
+    }
+    char c = name[i++];
+    if (c == '*' || c == '&') {
+      continue;
+    }
+    if (isspace((unsigned char)c)) {
+      if (!out.empty() && out.back() != ' ') {
+        out += ' ';
+      }
+      continue;
+    }
+    out += c;
+  }
+  while (!out.empty() && out.back() == ' ') {
+    out.pop_back();
+  }
+  return out;
+}
+
+/**
+ * Given a const collection facade, the record carrying the mutable class a
+ * `const T &` parameter should name, or 0 if none is known.  Prefers the class
+ * that is the const one minus "_const" -- the historical assumption, still true
+ * for most collections -- and only when no such class exists falls back to the
+ * record sharing this collection's C++ identity, which is how a nested facade
+ * (LightGroup_const vs PolylightEffect_LightGroup) is resolved.
+ */
+static int resolve_mutable_collection_index(const InterrogateType &const_itype,
+                                            const string &const_class_name) {
+  string base = const_class_name;
+  if (base.size() > 6 && base.compare(base.size() - 6, 6, "_const") == 0) {
+    base = base.substr(0, base.size() - 6);
+  }
+  string identity = collection_facade_identity(const_itype);
+
+  auto by_class = csharp_collection_mutable_by_class.find(base);
+  if (by_class != csharp_collection_mutable_by_class.end()) {
+    InterrogateDatabase *idb = InterrogateDatabase::get_ptr();
+    const InterrogateType &cand = idb->get_type((TypeIndex)by_class->second);
+    if (identity.empty() || collection_facade_identity(cand) == identity) {
+      return by_class->second;
+    }
+  }
+
+  auto by_identity = csharp_collection_mutable_type.find(identity);
+  if (!identity.empty() && by_identity != csharp_collection_mutable_type.end()) {
+    return by_identity->second;
+  }
+  return 0;
 }
 
 static bool is_collection_type_index(TypeIndex type_index) {
@@ -2893,6 +2976,76 @@ write_csharp_files(InterrogateModuleDef *def) {
           // Overwrite with the post-merge canonical module
           csharp_type_module_map[idx] = it->second;
         }
+      }
+    }
+  }
+
+  // Resolve, for every collection, which record carries its mutable class name,
+  // and make sure that record is actually generated.  A `const T &` parameter is
+  // bound to the mutable facade (see get_csharp_signature_type), but a library
+  // that only ever takes the collection by const reference -- CollisionPolygon's
+  // setup_points(const pvector<LPoint3> &) -- contributes only const records to
+  // its own database.  The mutable one then reaches us solely through the
+  // search-dir load, so it is absent from _objects and no module writes it, even
+  // though it is attributed here.
+  {
+    InterrogateDatabase *idb = InterrogateDatabase::get_ptr();
+    int n = idb->get_num_all_types();
+    std::vector<TypeIndex> const_records_in_objects;
+
+    for (int t = 0; t < n; ++t) {
+      TypeIndex idx = idb->get_all_type(t);
+      const InterrogateType &itype = idb->get_type(idx);
+      if (!is_collection_facade_type(itype) || should_skip_csharp_type(itype)) {
+        continue;
+      }
+      string identity = collection_facade_identity(itype);
+      if (identity.empty()) {
+        continue;
+      }
+      if (is_const_qualified_type(itype)) {
+        if (_objects.find(idx) != _objects.end()) {
+          const_records_in_objects.push_back(idx);
+        }
+        continue;
+      }
+      // Mutable: one collection can have several mutable records under different
+      // typedef names -- pvector<LPoint3> is both collide's pvector_LPoint3 and
+      // navigation's PointList.  Pick the most-core one, the same rule that
+      // decides a collection's canonical owner, so every module resolves the same
+      // class and that class lives in a module they all import.
+      auto rank_of = [&](TypeIndex cand) {
+        string mod = get_type_module_name(idb->get_type(cand));
+        auto rit = csharp_module_rank.find(mod);
+        return rit != csharp_module_rank.end() ? rit->second : INT_MAX;
+      };
+      auto prefer = [&](std::map<string, int> &table, const string &key) {
+        auto existing = table.find(key);
+        if (existing == table.end()) {
+          table[key] = idx;
+          return;
+        }
+        TypeIndex prev = (TypeIndex)existing->second;
+        int this_rank = rank_of(idx), prev_rank = rank_of(prev);
+        if (this_rank < prev_rank || (this_rank == prev_rank && idx < prev)) {
+          table[key] = idx;
+        }
+      };
+      prefer(csharp_collection_mutable_type, identity);
+      prefer(csharp_collection_mutable_by_class, get_class_name(itype));
+    }
+
+    for (TypeIndex const_idx : const_records_in_objects) {
+      const InterrogateType &const_type = idb->get_type(const_idx);
+      int mutable_idx =
+        resolve_mutable_collection_index(const_type, get_class_name(const_type));
+      if (mutable_idx == 0 ||
+          _objects.find((TypeIndex)mutable_idx) != _objects.end()) {
+        continue;
+      }
+      const InterrogateType &mutable_type = idb->get_type((TypeIndex)mutable_idx);
+      if (is_current_native_methods_type((TypeIndex)mutable_idx, mutable_type)) {
+        record_object((TypeIndex)mutable_idx);
       }
     }
   }
@@ -8558,13 +8711,27 @@ get_csharp_signature_type(TypeIndex type_index, bool for_return,
       if (is_parameter && is_const_qualified_type(original_type) &&
           facade_name.size() > 6 &&
           facade_name.compare(facade_name.size() - 6, 6, "_const") == 0) {
-        // Drop the const by dropping the suffix, rather than by resolving to the
-        // non-const TypeIndex.  Both class names come from the same C++ name --
-        // "vector_uchar const" gives vector_uchar_const, "vector_uchar" gives
-        // vector_uchar -- so removing "_const" always lands on the class that was
-        // in fact generated.  Walking the type graph does not: a nested facade
-        // like PolylightEffect::LightGroup has several database records, and the
-        // non-const one there names a class that is never written.
+        // Name the mutable record for this same C++ collection.  Dropping the
+        // "_const" suffix instead only works when the two class names differ by
+        // exactly that suffix, which a nested facade breaks: the const record of
+        // PolylightEffect::LightGroup is LightGroup_const while its mutable record
+        // is PolylightEffect_LightGroup, so the stripped name is one nobody wrote.
+        int mutable_idx =
+          resolve_mutable_collection_index(original_type, get_class_name(original_type));
+        if (mutable_idx != 0) {
+          // Name it with get_class_name, not get_qualified_class_name: a facade is
+          // written as a top-level class, while the latter runs the nested-name
+          // path and would yield PolylightEffectLightGroup for the class actually
+          // called PolylightEffect_LightGroup.
+          const InterrogateType &mutable_type = idb->get_type((TypeIndex)mutable_idx);
+          string mutable_name = get_class_name(mutable_type);
+          string type_module = get_type_module_name(mutable_type);
+          if (!_current_module_name.empty() && !type_module.empty() &&
+              type_module != _current_module_name) {
+            return "global::" + prettify_namespace(type_module) + "." + mutable_name;
+          }
+          return mutable_name;
+        }
         return facade_name.substr(0, facade_name.size() - 6);
       }
       return facade_name + (for_return ? "?" : "");
