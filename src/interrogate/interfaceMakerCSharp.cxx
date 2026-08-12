@@ -73,6 +73,12 @@ std::map<std::string, int> csharp_collection_mutable_type;
 // that class, and only the cases where no such class exists fall back to identity.
 std::map<std::string, int> csharp_collection_mutable_by_class;
 
+// "<underlying C++ type>\x01<c|m>" -> the one record whose class name every
+// spelling of that collection reports.  One C++ collection reached through two
+// typedefs (collide's pvector<LPoint3>, navigation's PointList) would otherwise
+// be written as two classes, the upper one binding helpers only its own .so has.
+std::map<std::string, int> csharp_collection_canonical_class;
+
 // Remap for std::wstring parameters/returns in C# mode.
 // Uses UTF-8 (char const *) at the C boundary instead of wchar_t const *,
 // converting via TextEncoder::decode_text / encode_wtext so that
@@ -1492,6 +1498,38 @@ static string collection_facade_identity(const InterrogateType &itype) {
 }
 
 /**
+ * The identity above, with typedefs resolved by name, so that navigation's
+ * PointList and collide's pvector<LPoint3> -- the same std::vector reached
+ * through two typedefs -- agree.  Resolution follows typedefs only: a smart
+ * pointer holding a vector (PointerToArray<uchar>) is its own type and must not
+ * collapse into the vector it wraps.
+ */
+static string collection_canonical_identity(const InterrogateType &itype) {
+  string id = collection_facade_identity(itype);
+  InterrogateDatabase *idb = InterrogateDatabase::get_ptr();
+  for (int guard = 0; guard < 8 && !id.empty(); ++guard) {
+    TypeIndex ti = idb->lookup_type_by_scoped_name(id);
+    if (ti == 0) {
+      break;
+    }
+    const InterrogateType &t = idb->get_type(ti);
+    if (!t.is_typedef()) {
+      break;
+    }
+    TypeIndex wrapped = t.get_wrapped_type();
+    if (wrapped == 0) {
+      break;
+    }
+    string next = collection_facade_identity(idb->get_type(wrapped));
+    if (next.empty() || next == id) {
+      break;
+    }
+    id = next;
+  }
+  return id;
+}
+
+/**
  * Given a const collection facade, the record carrying the mutable class a
  * `const T &` parameter should name, or 0 if none is known.  Prefers the class
  * that is the const one minus "_const" -- the historical assumption, still true
@@ -1621,6 +1659,10 @@ find_method_on_type_recursive(InterfaceMakerCSharp *maker, const InterrogateType
 
   return nullptr;
 }
+
+// The facade classes that emitted a __Coerce, so a parameter of that type can be
+// widened to IReadOnlyList<T>.  Filled while the classes are written.
+std::set<std::string> csharp_collection_coercible;
 
 string
 marshal_managed_argument(TypeIndex param_type_index, const string &param_type,
@@ -2769,6 +2811,21 @@ write_functions(ostream &out) {
       out << "EXPORT_FUNC void " << helper_prefix << "clear(" << cpp_type << " *self) { self->clear(); }\n";
       if (is_blittable) {
         out << "EXPORT_FUNC void " << helper_prefix << "resize(" << cpp_type << " *self, int n) { self->resize(n); }\n";
+      } else if (!is_string) {
+        // Fill from an array of pointers to the elements, so a managed sequence
+        // crosses in one call instead of one per element.  Built on clear() and
+        // push_back() rather than resize(), which would additionally require the
+        // element to be default-constructible.  Strings are left out: they have
+        // no native handle to point at, so they would have to be marshalled
+        // one at a time anyway.
+        out << "EXPORT_FUNC void " << helper_prefix << "assign_pointers(" << cpp_type
+            << " *self, void *const *items, int count) { self->clear(); for (int i = 0; i < count; ++i) { self->push_back(";
+        if (is_handle) {
+          out << "(" << element_pointee << " *)items[i]";
+        } else {
+          out << "*(" << e_cpp_type << " *)items[i]";
+        }
+        out << "); } }\n";
       }
     }
 
@@ -2948,6 +3005,67 @@ write_csharp_files(InterrogateModuleDef *def) {
   // used to pick each collection's canonical owner.  Must run before the facade
   // attribution below, which calls get_collection_canonical_library().
   compute_module_ranks();
+
+  // Elect one class name per collection, before anything asks for a facade's
+  // name.  A collection reached through two typedefs -- collide's
+  // pvector<LPoint3> and navigation's PointList are the same std::vector -- is
+  // otherwise written once per name, and the copy in the upper module binds
+  // Collection_ helpers that only that module's .so exports, so the lower
+  // module's copy throws EntryPointNotFound the moment it is touched.  Elect the
+  // record whose canonical library sits in the most-core module; get_class_name
+  // reports that name for every other spelling, which carries the attribution,
+  // the helper names and every reference along with it.
+  {
+    InterrogateDatabase *idb = InterrogateDatabase::get_ptr();
+    int n = idb->get_num_all_types();
+    // key -> candidates, as (rank, class name, index) plus the owning module, so
+    // a key can be judged only after every spelling of it has been seen.
+    std::map<string, std::vector<std::tuple<int, int, string, int> > > candidates;
+    std::map<string, std::set<string> > candidate_modules;
+
+    for (int t = 0; t < n; ++t) {
+      TypeIndex idx = idb->get_all_type(t);
+      const InterrogateType &itype = idb->get_type(idx);
+      if (!is_collection_facade_type(itype) || should_skip_csharp_type(itype)) {
+        continue;
+      }
+      string identity = collection_canonical_identity(itype);
+      if (identity.empty()) {
+        continue;
+      }
+      string key = identity + (is_const_qualified_type(itype) ? "\x01" "c" : "\x01" "m");
+
+      string lib = get_collection_canonical_library(itype);
+      string mod;
+      auto mit = csharp_library_to_module.find(lib);
+      if (mit != csharp_library_to_module.end()) {
+        mod = mit->second;
+      }
+      int rank = INT_MAX;
+      auto rit = csharp_module_rank.find(mod);
+      if (rit != csharp_module_rank.end()) {
+        rank = rit->second;
+      }
+      string name = get_csharp_type_name(itype);
+      if (name.empty()) {
+        continue;
+      }
+      // Module rank decides first, so a collection always lands in the most-core
+      // module that defines it.  Between spellings within that module prefer the
+      // shorter, which is the plain typedef rather than the scope-qualified or
+      // fully-expanded form -- vector_uchar over pvector_unsigned_char, Futures
+      // over AsyncFuture_Futures -- keeping the names that already exist.
+      candidates[key].push_back(std::make_tuple(rank, (int)name.size(), name, (int)idx));
+      candidate_modules[key].insert(mod);
+    }
+
+    for (auto &entry : candidates) {
+      auto best = std::min_element(entry.second.begin(), entry.second.end());
+      if (best != entry.second.end()) {
+        csharp_collection_canonical_class[entry.first] = std::get<3>(*best);
+      }
+    }
+  }
 
   // After search-dir loading, search-dir merges may have changed the _def
   // (and thus get_library_name()) of collection facade types.  Update
@@ -3388,6 +3506,9 @@ write_native_methods_file(const string &dir, const string &cs_namespace) {
       if (is_blittable) {
         out << "    [LibraryImport(\"" << quote_csharp_string(_dll_name) << "\", EntryPoint = \"" << helper_prefix << "resize\")]\n";
         out << "    internal static partial void " << helper_prefix << "resize(IntPtr self, int n);\n\n";
+      } else if (!is_string) {
+        out << "    [LibraryImport(\"" << quote_csharp_string(_dll_name) << "\", EntryPoint = \"" << helper_prefix << "assign_pointers\")]\n";
+        out << "    internal static partial void " << helper_prefix << "assign_pointers(IntPtr self, IntPtr[] items, int count);\n\n";
       }
     }
 
@@ -3571,18 +3692,26 @@ write_enum_type(ostream &out, const InterrogateType &itype) {
  */
 void InterfaceMakerCSharp::
 write_class_files(const string &dir, const string &cs_namespace) {
-  Objects::iterator oi;
-  for (oi = _objects.begin(); oi != _objects.end(); ++oi) {
-    TypeIndex obj_tidx = (*oi).first;
-    Object *object = (*oi).second;
-    const InterrogateType &itype = object->_itype;
-    if (is_empty_pointer_facade_type(itype) ||
-        (!is_collection_facade_type(itype) && !itype.is_class() && !itype.is_struct()) || should_skip_csharp_type(itype) ||
-        !is_current_native_methods_type(obj_tidx, itype)) {
-      continue;
-    }
+  // Collection facades first, then everything else.  Writing a facade is what
+  // records whether it can be built from an arbitrary sequence, and the classes
+  // that take one as a parameter need that answer to type the parameter.
+  for (int pass = 0; pass < 2; ++pass) {
+    Objects::iterator oi;
+    for (oi = _objects.begin(); oi != _objects.end(); ++oi) {
+      TypeIndex obj_tidx = (*oi).first;
+      Object *object = (*oi).second;
+      const InterrogateType &itype = object->_itype;
+      if (is_empty_pointer_facade_type(itype) ||
+          (!is_collection_facade_type(itype) && !itype.is_class() && !itype.is_struct()) || should_skip_csharp_type(itype) ||
+          !is_current_native_methods_type(obj_tidx, itype)) {
+        continue;
+      }
+      if ((pass == 0) != is_collection_facade_type(itype)) {
+        continue;
+      }
 
-    write_class_file(dir, cs_namespace, object);
+      write_class_file(dir, cs_namespace, object);
+    }
   }
 
 
@@ -4106,6 +4235,52 @@ write_collection_adapter_class(ostream &out, Object *object) {
     indent(out, 6) << "foreach (var item in source) {\n";
     indent(out, 8) << "Add(item);\n";
     indent(out, 6) << "}\n";
+    indent(out, 4) << "}\n\n";
+
+    // Entry point for parameters, which are typed IReadOnlyList<T> so a caller
+    // can pass a List, an array, or one of these.  Passing one of these is the
+    // point of the type test: it hands back the very same object, so the common
+    // case costs no copy and no extra native call.
+    csharp_collection_coercible.insert(class_name);
+    indent(out, 4) << "internal static " << class_name << " __Coerce(IReadOnlyList<"
+                   << element_type << "> source) {\n";
+    indent(out, 6) << "if (source is " << class_name << " native) {\n";
+    indent(out, 8) << "return native;\n";
+    indent(out, 6) << "}\n";
+    indent(out, 6) << "if (source is null) throw new ArgumentNullException(nameof(source));\n";
+    indent(out, 6) << "var result = new " << class_name << "();\n";
+    indent(out, 6) << "int count = source.Count;\n";
+    if (is_blittable_element) {
+      // Size once, then fill through the mapped buffer: two native calls for the
+      // whole sequence instead of one per element.
+      indent(out, 6) << "if (count != 0) {\n";
+      indent(out, 8) << "NativeMethods." << get_collection_helper_name(itype, "resize")
+                     << "(result.NativeHandle, count);\n";
+      indent(out, 8) << "var span = result.AsSpan();\n";
+      indent(out, 8) << "for (int i = 0; i < count; ++i) {\n";
+      indent(out, 10) << "span[i] = source[i];\n";
+      indent(out, 8) << "}\n";
+      indent(out, 6) << "}\n";
+    } else if (element_value_type == "string") {
+      // No native handle to point at; each one marshals on its own.
+      indent(out, 6) << "for (int i = 0; i < count; ++i) {\n";
+      indent(out, 8) << "result.Add(source[i]);\n";
+      indent(out, 6) << "}\n";
+    } else {
+      // Gather the elements' native pointers and hand the whole array over at
+      // once.  KeepAlive holds the source -- and so its elements -- until the
+      // native side has finished copying out of those pointers.
+      indent(out, 6) << "if (count != 0) {\n";
+      indent(out, 8) << "var handles = new IntPtr[count];\n";
+      indent(out, 8) << "for (int i = 0; i < count; ++i) {\n";
+      indent(out, 10) << "handles[i] = NativeObject.Unwrap(source[i]);\n";
+      indent(out, 8) << "}\n";
+      indent(out, 8) << "NativeMethods." << get_collection_helper_name(itype, "assign_pointers")
+                     << "(result.NativeHandle, handles, count);\n";
+      indent(out, 8) << "GC.KeepAlive(source);\n";
+      indent(out, 6) << "}\n";
+    }
+    indent(out, 6) << "return result;\n";
     indent(out, 4) << "}\n\n";
   }
 
@@ -5906,6 +6081,11 @@ write_method(ostream &out, Function *func, Object *object, int indent_level,
     struct StreamBridgeSite { string var; string factory; string param; bool nullable; };
     std::vector<StreamBridgeSite> stream_bridges;
 
+    // Collection parameters widened to IReadOnlyList<T>, each needing a
+    // __Coerce before the native call: (temp name, facade class, parameter).
+    struct CoercionSite { string var; string facade; string param; bool nullable; };
+    std::vector<CoercionSite> coercions;
+
     for (size_t i = first_param; i < remap->_parameters.size(); ++i) {
       ParameterRemap *param_remap = remap->_parameters[i]._remap;
       TypeIndex param_type_index = get_parameter_type_for_remap(remap, i);
@@ -5923,6 +6103,25 @@ write_method(ostream &out, Function *func, Object *object, int indent_level,
       }
 
       string param_name = get_csharp_parameter_name(remap, i);
+
+      // A collection parameter takes any IReadOnlyList<T>; __Coerce turns one
+      // into the native facade, and returns it unchanged when it already is one.
+      string coerce_element;
+      string coerce_facade;
+      if (stream_tok == AT_not_atomic) {
+        coerce_element = get_collection_param_element(param_type_index, param_type);
+        if (!coerce_element.empty()) {
+          coerce_facade = param_type;
+          if (!coerce_facade.empty() && coerce_facade.back() == '?') {
+            coerce_facade.pop_back();
+          }
+          param_type = "IReadOnlyList<" + coerce_element + ">";
+          if (param_nullable) {
+            param_type += "?";
+          }
+        }
+      }
+
       param_types.push_back(param_type);
       param_decls.push_back(param_type + " " + param_name);
       param_names.push_back(param_name);
@@ -5932,6 +6131,11 @@ write_method(ostream &out, Function *func, Object *object, int indent_level,
         stream_bridges.push_back({bridge_var, csharp_stream_bridge_factory(stream_tok),
                                   param_name, param_nullable});
         native_args.push_back(bridge_var + ".Handle");
+      } else if (!coerce_facade.empty()) {
+        string var = "__p3coll" + std::to_string(coercions.size());
+        coercions.push_back({var, coerce_facade, param_name, param_nullable});
+        native_args.push_back("NativeObject.Unwrap(" + var + ")");
+        keepalive_exprs.push_back(var);
       } else {
         native_args.push_back(marshal_managed_argument(param_type_index, param_type, param_name));
         if (csharp_argument_needs_keepalive(param_type_index, param_type)) {
@@ -6036,6 +6240,14 @@ write_method(ostream &out, Function *func, Object *object, int indent_level,
     for (const auto &b : stream_bridges) {
       indent(out, indent_level + 2) << "using var " << b.var << " = "
                                     << b.factory << "(" << b.param << ");\n";
+    }
+
+    for (const auto &c : coercions) {
+      indent(out, indent_level + 2) << c.facade << (c.nullable ? "? " : " ") << c.var << " = ";
+      if (c.nullable) {
+        out << c.param << " is null ? null : ";
+      }
+      out << c.facade << ".__Coerce(" << c.param << ");\n";
     }
 
     string native_call = get_pinvoke_call_name(func, remap) + "(";
@@ -6235,6 +6447,9 @@ write_method(ostream &out, Function *func, Object *object, int indent_level,
     struct StreamBridgeSite { string var; string factory; string param; bool nullable; };
     std::vector<StreamBridgeSite> stream_bridges;
 
+    struct CoercionSite { string var; string facade; string param; bool nullable; };
+    std::vector<CoercionSite> coercions;
+
     for (int i = first_param; i < wrapper.number_of_parameters(); ++i) {
       TypeIndex param_type_index = wrapper.parameter_get_type(i);
       bool param_nullable = wrapper.parameter_is_nullable(i);
@@ -6257,6 +6472,24 @@ write_method(ostream &out, Function *func, Object *object, int indent_level,
       string param_name = wrapper.parameter_has_name(i)
         ? make_csharp_identifier(wrapper.parameter_get_name(i))
         : string("param") + std::to_string(i - first_param);
+
+      // See the remap path above: a collection parameter takes any
+      // IReadOnlyList<T> and __Coerce hands back the facade.
+      string coerce_facade;
+      if (stream_tok == AT_not_atomic && out_type.empty()) {
+        string coerce_element = get_collection_param_element(param_type_index, param_type);
+        if (!coerce_element.empty()) {
+          coerce_facade = param_type;
+          if (!coerce_facade.empty() && coerce_facade.back() == '?') {
+            coerce_facade.pop_back();
+          }
+          param_type = "IReadOnlyList<" + coerce_element + ">";
+          if (param_nullable) {
+            param_type += "?";
+          }
+        }
+      }
+
       param_types.push_back(param_type);
       param_decls.push_back(param_type + " " + param_name);
       param_names.push_back(param_name);
@@ -6268,6 +6501,11 @@ write_method(ostream &out, Function *func, Object *object, int indent_level,
         stream_bridges.push_back({bridge_var, csharp_stream_bridge_factory(stream_tok),
                                   param_name, param_nullable});
         native_args.push_back(bridge_var + ".Handle");
+      } else if (!coerce_facade.empty()) {
+        string var = "__p3coll" + std::to_string(coercions.size());
+        coercions.push_back({var, coerce_facade, param_name, param_nullable});
+        native_args.push_back("NativeObject.Unwrap(" + var + ")");
+        keepalive_exprs.push_back(var);
       } else {
         native_args.push_back(marshal_managed_argument(param_type_index, param_type, param_name));
         if (csharp_argument_needs_keepalive(param_type_index, param_type)) {
@@ -6382,6 +6620,14 @@ write_method(ostream &out, Function *func, Object *object, int indent_level,
     for (const auto &b : stream_bridges) {
       indent(out, indent_level + 2) << "using var " << b.var << " = "
                                     << b.factory << "(" << b.param << ");\n";
+    }
+
+    for (const auto &c : coercions) {
+      indent(out, indent_level + 2) << c.facade << (c.nullable ? "? " : " ") << c.var << " = ";
+      if (c.nullable) {
+        out << c.param << " is null ? null : ";
+      }
+      out << c.facade << ".__Coerce(" << c.param << ");\n";
     }
 
     string native_call = get_pinvoke_call_name(func->_ifunc, wrapper) + "(";
@@ -9007,6 +9253,22 @@ get_class_name(const InterrogateType &itype) const {
     return get_pointer_facade_target_name(itype);
   }
 
+  // Every spelling of a collection answers with the elected class name, so one
+  // C++ collection is written once (see write_csharp_files).  Only in pass 2:
+  // pass 1 must keep naming helpers after the type its own library declared.
+  if (csharp_database_only_pass && !csharp_collection_canonical_class.empty() &&
+      is_collection_facade_type(itype)) {
+    string identity = collection_canonical_identity(itype);
+    if (!identity.empty()) {
+      auto it = csharp_collection_canonical_class.find(
+        identity + (is_const_qualified_type(itype) ? "\x01" "c" : "\x01" "m"));
+      if (it != csharp_collection_canonical_class.end()) {
+        InterrogateDatabase *idb = InterrogateDatabase::get_ptr();
+        return get_csharp_type_name(idb->get_type((TypeIndex)it->second));
+      }
+    }
+  }
+
   return get_csharp_type_name(itype);
 }
 
@@ -9287,6 +9549,36 @@ get_type_module_name(const InterrogateType &itype) const {
     return itype.get_module_name();
   }
   return string();
+}
+
+/**
+ * If this parameter is a collection facade that can be built from an arbitrary
+ * sequence, the element type its IReadOnlyList<> should carry; empty otherwise.
+ * The caller keeps the facade name to reach its __Coerce.
+ */
+string InterfaceMakerCSharp::
+get_collection_param_element(TypeIndex param_type_index,
+                             const string &param_type) const {
+  if (param_type_index == 0 || param_type.empty()) {
+    return string();
+  }
+  // Interface-typed parameters go through the existing `as` path.
+  if (param_type[0] == 'I' && param_type.size() > 1 && isupper((unsigned char)param_type[1])) {
+    return string();
+  }
+  string facade = param_type;
+  if (!facade.empty() && facade.back() == '?') {
+    facade.pop_back();
+  }
+  if (csharp_collection_coercible.count(facade) == 0) {
+    return string();
+  }
+  InterrogateDatabase *idb = InterrogateDatabase::get_ptr();
+  const InterrogateType &itype = idb->get_type(param_type_index);
+  if (!is_collection_facade_type(itype)) {
+    return string();
+  }
+  return get_collection_element_type(itype, true);
 }
 
 string InterfaceMakerCSharp::

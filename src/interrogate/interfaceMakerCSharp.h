@@ -211,6 +211,8 @@ private:
                                           bool for_signature) const;
   std::string get_collection_element_type_from_cpp_name(const std::string &cpp_name,
                                                         bool for_signature) const;
+  std::string get_collection_param_element(TypeIndex param_type_index,
+                                           const std::string &param_type) const;
   std::string get_collection_element_cpp_type(const InterrogateType &itype) const;
   std::string get_collection_canonical_library(const InterrogateType &itype) const;
   void compute_module_ranks() const;
