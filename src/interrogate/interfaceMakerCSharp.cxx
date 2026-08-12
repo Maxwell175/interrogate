@@ -3231,6 +3231,42 @@ load_all_search_dir_databases() {
             }
           }
         }
+      } else if (entry.size() > 11 &&
+                 entry.substr(entry.size() - 11) == ".csharpmods") {
+        // The whole module layout, written once by the build rather than passed
+        // per module.  --module-map and --module-depends are fixed when a module
+        // is declared, so the first module declared sees only itself and ranks
+        // every other module INT_MAX -- each module then ranks the same
+        // collection differently and they disagree about which class to emit.
+        // Reading it from disk gives every pass the same answer.
+        //   map <library> <module>
+        //   depends <module> <dependency>
+        Filename mods_file(child);
+        mods_file.set_text();
+        std::ifstream in;
+        if (mods_file.open_read(in)) {
+          string line;
+          while (std::getline(in, line)) {
+            while (!line.empty() && (line.back() == '\r' || line.back() == '\n' ||
+                                     line.back() == ' ' || line.back() == '\t')) {
+              line.pop_back();
+            }
+            std::istringstream parts(line);
+            string kind, first, second;
+            if (!(parts >> kind >> first)) {
+              continue;
+            }
+            parts >> second;
+            if (kind == "map" && !second.empty()) {
+              csharp_library_to_module[first] = second;
+            } else if (kind == "depends") {
+              csharp_module_deps[first];
+              if (!second.empty()) {
+                csharp_module_deps[first].insert(second);
+              }
+            }
+          }
+        }
       }
     }
   };
