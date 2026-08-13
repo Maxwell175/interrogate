@@ -56,6 +56,13 @@ std::map<std::string, std::string> csharp_library_to_module;
 std::map<std::string, std::set<std::string> > csharp_module_deps;
 std::map<std::string, int> csharp_module_rank;
 std::set<std::string> csharp_pass1_defined_collections;
+
+// Scoped C++ name -> the class name pass 1 gave that collection, which is what
+// its Collection_ helpers are named after.  Pass 2 flattens a nested typedef
+// only when the merge kept the record's outer class, so left to itself it can
+// name the same type PolylightEffect_LightGroup on one machine and LightGroup on
+// another -- and the first of those binds helpers nobody exported.
+std::map<std::string, std::string> csharp_pass1_name_by_scoped;
 std::map<std::string, std::set<std::string> > csharp_collection_definers;
 
 // Cache for get_collection_canonical_library(): facade class name -> owner library.
@@ -2703,8 +2710,19 @@ write_functions(ostream &out) {
       continue;
     }
     // This library emits a helper here iff it defines the collection; recorded
-    // for the .csharpcoll sidecar.
-    csharp_pass1_defined_collections.insert(get_class_name(itype));
+    // for the .csharpcoll sidecar as "<class>\t<scoped C++ name>".  The class
+    // name is the one the native symbols are named after, and pass 2 cannot
+    // always rederive it: a nested typedef flattens to PolylightEffect_LightGroup
+    // or stays LightGroup depending on which duplicate wins the search-dir merge,
+    // so pass 2 adopts what is written here instead of naming it again.
+    {
+      string scoped = itype.has_scoped_name() ? itype.get_scoped_name() : string();
+      string entry = get_class_name(itype);
+      if (!scoped.empty()) {
+        entry += "\t" + scoped;
+      }
+      csharp_pass1_defined_collections.insert(entry);
+    }
     string cpp_type;
     if (itype._cpptype != nullptr) {
       cpp_type = itype._cpptype->get_local_name(&parser);
@@ -3226,8 +3244,23 @@ load_all_search_dir_databases() {
                                      line.back() == ' ' || line.back() == '\t')) {
               line.pop_back();
             }
-            if (!line.empty()) {
-              csharp_collection_definers[line].insert(lib);
+            if (line.empty()) {
+              continue;
+            }
+            // "<class>" or "<class>\t<scoped C++ name>".
+            string cls = line;
+            string scoped;
+            size_t tab = line.find('\t');
+            if (tab != string::npos) {
+              cls = line.substr(0, tab);
+              scoped = line.substr(tab + 1);
+            }
+            if (cls.empty()) {
+              continue;
+            }
+            csharp_collection_definers[cls].insert(lib);
+            if (!scoped.empty()) {
+              csharp_pass1_name_by_scoped[scoped] = cls;
             }
           }
         }
@@ -9287,6 +9320,36 @@ string InterfaceMakerCSharp::
 get_class_name(const InterrogateType &itype) const {
   if (is_empty_pointer_facade_type(itype)) {
     return get_pointer_facade_target_name(itype);
+  }
+
+  // Answer with the name pass 1 gave this exact type, which its Collection_
+  // helpers are named after.  Renaming it here is how a facade ends up bound to
+  // entry points that were never exported.
+  if (csharp_database_only_pass && is_collection_facade_type(itype) &&
+      itype.has_scoped_name()) {
+    auto pass1 = csharp_pass1_name_by_scoped.find(itype.get_scoped_name());
+    if (pass1 != csharp_pass1_name_by_scoped.end()) {
+      string elected = pass1->second;
+      // ...then collapse spellings of one collection onto the elected class.
+      if (!csharp_collection_canonical_class.empty()) {
+        string identity = collection_canonical_identity(itype);
+        if (!identity.empty()) {
+          auto it = csharp_collection_canonical_class.find(
+            identity + (is_const_qualified_type(itype) ? "\x01" "c" : "\x01" "m"));
+          if (it != csharp_collection_canonical_class.end()) {
+            InterrogateDatabase *idb = InterrogateDatabase::get_ptr();
+            const InterrogateType &winner = idb->get_type((TypeIndex)it->second);
+            if (winner.has_scoped_name()) {
+              auto wp = csharp_pass1_name_by_scoped.find(winner.get_scoped_name());
+              if (wp != csharp_pass1_name_by_scoped.end()) {
+                elected = wp->second;
+              }
+            }
+          }
+        }
+      }
+      return elected;
+    }
   }
 
   // Every spelling of a collection answers with the elected class name, so one
