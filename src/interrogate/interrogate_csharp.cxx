@@ -240,6 +240,7 @@ main(int argc, char *argv[]) {
   // do a SECOND PASS over all IDB types after ALL command-line files are
   // loaded, checking the post-merge state of each type.
   std::set<std::string> owned_libraries(library_names.begin(), library_names.end());
+  csharp_owned_libraries = owned_libraries;
 
   for (int i = 1; i < argc; ++i) {
     Filename pathname = Filename::from_os_specific(argv[i]);

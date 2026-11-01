@@ -132,3 +132,64 @@ csharp_test(nullability)
 csharp_test(refcounting)
 csharp_test(secondary_base_methods)
 csharp_test(streams)
+
+# Two libraries that both publish the same template instantiations each emit
+# their per-type helpers.  Linked statically into one executable -- as a
+# NativeAOT executable links every module's archive -- the two copies must be
+# different symbols, and each library's C# bindings must name its own copy.  The
+# test runs pass 2 for both libraries, takes the entry points their bindings
+# declare for Box<int>'s delete helper and the reference-counted Counted<int>'s
+# unref-delete and ref helpers, checks that a module emitting none of its own
+# binds the most-core module's copy, and links and calls exactly those.
+set(_si_dir "${CMAKE_CURRENT_BINARY_DIR}/shared_instantiation")
+file(MAKE_DIRECTORY "${_si_dir}/db")
+foreach(_lib alpha beta)
+  set(_name "shared_instantiation_${_lib}")
+  set(_hdr "${CSHARP_TEST_DIR}/${_name}.h")
+  _csharp_extract_flags("${_hdr}" _flags)
+  separate_arguments(_extra_args UNIX_COMMAND "${_flags}")
+  add_custom_command(
+    OUTPUT "${_si_dir}/${_name}.gen.cxx" "${_si_dir}/db/${_name}.in"
+    BYPRODUCTS "${_si_dir}/db/${_name}.csharphelpers"
+    COMMAND ${CMAKE_COMMAND} -E make_directory "${_si_dir}/pass1_${_lib}"
+    COMMAND
+      $<TARGET_FILE:interrogate> --csharp
+      -ocs "${_si_dir}/pass1_${_lib}"
+      -oc "${_si_dir}/${_name}.gen.cxx"
+      -od "${_si_dir}/db/${_name}.in"
+      -module "${_name}" -library "${_name}"
+      ${_extra_args} -D__cplusplus
+      "-S${PROJECT_SOURCE_DIR}/parser-inc"
+      "${CSHARP_TEST_DIR}/shared_instantiation.h" "${_hdr}"
+    DEPENDS interrogate "${_hdr}" "${CSHARP_TEST_DIR}/shared_instantiation.h"
+    COMMENT "interrogate (pass 1) ${_name}"
+    VERBATIM)
+
+  add_library(test_${_name} STATIC EXCLUDE_FROM_ALL
+    "${CSHARP_TEST_DIR}/${_name}.cxx"
+    "${_si_dir}/${_name}.gen.cxx")
+  target_include_directories(test_${_name} PRIVATE
+    "${CSHARP_TEST_DIR}"
+    "${CSHARP_TEST_DIR}/support"
+    "${PROJECT_SOURCE_DIR}/src/dtoolbase"
+    "${PROJECT_SOURCE_DIR}/src/interrogatedb")
+  set_target_properties(test_${_name} PROPERTIES
+    CXX_STANDARD 17
+    UNITY_BUILD OFF)
+endforeach()
+
+add_executable(test_shared_instantiation EXCLUDE_FROM_ALL
+  "${CSHARP_TEST_DIR}/shared_instantiation.cxx")
+target_include_directories(test_shared_instantiation PRIVATE
+  "${CSHARP_TEST_DIR}" "${_si_dir}")
+target_link_libraries(test_shared_instantiation PRIVATE
+  test_shared_instantiation_alpha test_shared_instantiation_beta interrogate_support)
+set_target_properties(test_shared_instantiation PROPERTIES CXX_STANDARD 17)
+
+add_test(NAME csharp_shared_instantiation
+  COMMAND ${CMAKE_COMMAND}
+    "-DBUILD_DIR=${CMAKE_BINARY_DIR}"
+    "-DWORK_DIR=${_si_dir}"
+    "-DINTERROGATE_CS=$<TARGET_FILE:interrogate_csharp>"
+    "-DEXE=$<TARGET_FILE:test_shared_instantiation>"
+    -P "${PROJECT_SOURCE_DIR}/cmake/scripts/RunSharedInstantiationTest.cmake")

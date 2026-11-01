@@ -31,6 +31,9 @@ extern const char interrogate_preamble_python_native_h[];
 // Collections this library defines, filled during C# native generation (pass 1)
 // and written to a .csharpcoll sidecar for the pass-2 owner ranking.
 extern std::set<std::string> csharp_pass1_defined_collections;
+// Types this library emits the per-type C# helpers for, written to a
+// .csharphelpers sidecar so pass 2 binds each module to its own library's copy.
+extern std::set<std::string> csharp_pass1_defined_helpers;
 
 CPPParser parser;
 
@@ -736,6 +739,20 @@ main(int argc, char **argv) {
       if (!manifest_out.fail()) {
         for (const std::string &coll : csharp_pass1_defined_collections) {
           manifest_out << coll << "\n";
+        }
+      }
+    }
+
+    // And the types it emits the per-type helpers for.  Written even when empty,
+    // so a library that stops emitting them does not leave a stale list behind.
+    if (build_csharp) {
+      Filename helpers(output_data_filename.get_fullpath_wo_extension() + ".csharphelpers");
+      helpers.set_text();
+      std::ofstream helpers_out;
+      helpers.open_write(helpers_out);
+      if (!helpers_out.fail()) {
+        for (const std::string &type : csharp_pass1_defined_helpers) {
+          helpers_out << type << "\n";
         }
       }
     }

@@ -39,6 +39,13 @@ extern std::map<std::string, int> csharp_module_rank;
 // in pass 1, aggregated into a global class -> libraries map in pass 2.
 extern std::set<std::string> csharp_pass1_defined_collections;
 extern std::map<std::string, std::set<std::string> > csharp_collection_definers;
+// Types each library emits the per-type helpers (_inCSDestr_, _inCSUnrefDestr_,
+// _inCSRef_) for: written per-library to a .csharphelpers sidecar in pass 1,
+// aggregated into a global type -> libraries map in pass 2.
+extern std::set<std::string> csharp_pass1_defined_helpers;
+extern std::map<std::string, std::set<std::string> > csharp_helper_definers;
+// The libraries pass 2 is generating this module for (its --library flags).
+extern std::set<std::string> csharp_owned_libraries;
 
 class InterfaceMakerCSharp : public InterfaceMaker {
 public:
@@ -218,6 +225,7 @@ private:
   void compute_module_ranks() const;
   std::string get_collection_helper_name(const InterrogateType &itype,
                                          const std::string &op) const;
+  std::string get_supplemental_helper_hash(const InterrogateType &itype) const;
 
   int inherited_method_signature_kind(const InterrogateType &itype,
                                       const std::string &method_name,

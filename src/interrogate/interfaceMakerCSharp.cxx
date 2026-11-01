@@ -65,6 +65,13 @@ std::set<std::string> csharp_pass1_defined_collections;
 std::map<std::string, std::string> csharp_pass1_name_by_scoped;
 std::map<std::string, std::set<std::string> > csharp_collection_definers;
 
+// Per-type helpers: the types this library's supplemental emits them for (pass 1,
+// written to the .csharphelpers sidecar), and every library that does (pass 2,
+// aggregated from the sidecars) -- see get_supplemental_helper_hash().
+std::set<std::string> csharp_pass1_defined_helpers;
+std::map<std::string, std::set<std::string> > csharp_helper_definers;
+std::set<std::string> csharp_owned_libraries;
+
 // Cache for get_collection_canonical_library(): facade class name -> owner library.
 std::map<std::string, std::string> csharp_collection_canonical_library;
 
@@ -2447,20 +2454,42 @@ ensure_make_seqs(InterfaceMaker &maker, InterfaceMaker::Object *object) {
   }
 }
 
+// The type a per-type helper is emitted for, as the .csharphelpers sidecar names
+// it: its scoped C++ name, which pass 1 and pass 2 both read off the type.
 string
-get_supplemental_destructor_entry_point(const InterrogateType &itype) {
-  string name;
+get_supplemental_helper_type_key(const InterrogateType &itype) {
   if (itype.has_scoped_name()) {
-    name = itype.get_scoped_name();
-    for (char &c : name) {
-      if (c == ':' || c == '<' || c == '>' || c == ',' || c == ' ') {
-        c = '_';
-      }
-    }
-  } else {
-    name = get_csharp_type_name(itype);
+    return itype.get_scoped_name();
   }
-  return "_inCSDestr_" + name;
+  return get_csharp_type_name(itype);
+}
+
+// The per-type helpers are named _inCSDestr_<library hash>_<type> (and likewise
+// _inCSUnrefDestr_ and _inCSRef_).  The type alone is not unique: a template
+// instantiation such as pvector<NodePath> is emitted by every library whose
+// interface spells it, so two libraries linked into one executable would each
+// define the same symbol.  The library's hash keeps them apart, as it does for
+// the C wrappers and the Collection_ helpers.
+string
+get_supplemental_entry_point(const string &family, const string &library_hash,
+                             const InterrogateType &itype) {
+  string name = get_supplemental_helper_type_key(itype);
+  for (char &c : name) {
+    if (c == ':' || c == '<' || c == '>' || c == ',' || c == ' ') {
+      c = '_';
+    }
+  }
+  string entry = family;
+  if (!library_hash.empty()) {
+    entry += library_hash + "_";
+  }
+  return entry + name;
+}
+
+string
+get_supplemental_destructor_entry_point(const InterrogateType &itype,
+                                        const string &library_hash) {
+  return get_supplemental_entry_point("_inCSDestr_", library_hash, itype);
 }
 
 string
@@ -2478,19 +2507,9 @@ get_supplemental_destructor_name(const InterrogateType &itype) {
 }
 
 string
-get_supplemental_unref_destructor_entry_point(const InterrogateType &itype) {
-  string name;
-  if (itype.has_scoped_name()) {
-    name = itype.get_scoped_name();
-    for (char &c : name) {
-      if (c == ':' || c == '<' || c == '>' || c == ',' || c == ' ') {
-        c = '_';
-      }
-    }
-  } else {
-    name = get_csharp_type_name(itype);
-  }
-  return "_inCSUnrefDestr_" + name;
+get_supplemental_unref_destructor_entry_point(const InterrogateType &itype,
+                                              const string &library_hash) {
+  return get_supplemental_entry_point("_inCSUnrefDestr_", library_hash, itype);
 }
 
 string
@@ -2511,19 +2530,9 @@ get_supplemental_unref_destructor_name(const InterrogateType &itype) {
 // a per-type wrapper so the C++ compiler applies the derived->ReferenceCount pointer
 // offset before calling ref().
 string
-get_supplemental_ref_entry_point(const InterrogateType &itype) {
-  string name;
-  if (itype.has_scoped_name()) {
-    name = itype.get_scoped_name();
-    for (char &c : name) {
-      if (c == ':' || c == '<' || c == '>' || c == ',' || c == ' ') {
-        c = '_';
-      }
-    }
-  } else {
-    name = get_csharp_type_name(itype);
-  }
-  return "_inCSRef_" + name;
+get_supplemental_ref_entry_point(const InterrogateType &itype,
+                                 const string &library_hash) {
+  return get_supplemental_entry_point("_inCSRef_", library_hash, itype);
 }
 
 string
@@ -2639,7 +2648,9 @@ write_functions(ostream &out) {
   for (Object *object : destructor_objects) {
     CPPType *cpptype = object->_itype._cpptype != nullptr
       ? TypeManager::resolve_type(object->_itype._cpptype) : nullptr;
-    string entry_point = get_supplemental_destructor_entry_point(object->_itype);
+    string entry_point = get_supplemental_destructor_entry_point(
+      object->_itype, get_supplemental_helper_hash(object->_itype));
+    csharp_pass1_defined_helpers.insert(get_supplemental_helper_type_key(object->_itype));
 
     out << "EXPORT_FUNC void " << entry_point << "(";
     if (cpptype != nullptr) {
@@ -2664,7 +2675,9 @@ write_functions(ostream &out) {
   // Emit unref_delete wrappers for all RefCounted types.
   for (Object *object : refcounted_objects) {
     CPPType *cpptype = TypeManager::resolve_type(object->_itype._cpptype);
-    string entry_point = get_supplemental_unref_destructor_entry_point(object->_itype);
+    string entry_point = get_supplemental_unref_destructor_entry_point(
+      object->_itype, get_supplemental_helper_hash(object->_itype));
+    csharp_pass1_defined_helpers.insert(get_supplemental_helper_type_key(object->_itype));
 
     out << "EXPORT_FUNC void " << entry_point << "(";
     CPPType *pointer_type = TypeManager::wrap_pointer(cpptype);
@@ -2681,7 +2694,8 @@ write_functions(ostream &out) {
   // C++ compiler apply the derived->ReferenceCount offset before calling ref().
   for (Object *object : refcounted_objects) {
     CPPType *cpptype = TypeManager::resolve_type(object->_itype._cpptype);
-    string entry_point = get_supplemental_ref_entry_point(object->_itype);
+    string entry_point = get_supplemental_ref_entry_point(
+      object->_itype, get_supplemental_helper_hash(object->_itype));
 
     out << "EXPORT_FUNC void " << entry_point << "(";
     CPPType *pointer_type = TypeManager::wrap_pointer(cpptype);
@@ -3264,6 +3278,26 @@ load_all_search_dir_databases() {
             }
           }
         }
+      } else if (entry.size() > 14 &&
+                 entry.substr(entry.size() - 14) == ".csharphelpers") {
+        // A per-library sidecar (see interrogate.cxx): the library is the
+        // basename, each line is a type it emits the per-type helpers for.
+        // Aggregate into the definer map used by get_supplemental_helper_hash().
+        string lib = entry.substr(0, entry.size() - 14);
+        Filename helpers_file(child);
+        helpers_file.set_text();
+        std::ifstream in;
+        if (helpers_file.open_read(in)) {
+          string line;
+          while (std::getline(in, line)) {
+            while (!line.empty() && (line.back() == '\r' || line.back() == '\n')) {
+              line.pop_back();
+            }
+            if (!line.empty()) {
+              csharp_helper_definers[line].insert(lib);
+            }
+          }
+        }
       } else if (entry.size() > 11 &&
                  entry.substr(entry.size() - 11) == ".csharpmods") {
         // The whole module layout, written once by the build rather than passed
@@ -3486,7 +3520,8 @@ write_native_methods_file(const string &dir, const string &cs_namespace) {
           const InterrogateFunctionWrapper &wrapper = idb->get_wrapper(ifunc.get_c_wrapper(0));
           out << "_inC" << wrapper.get_unique_name();
         } else {
-          out << get_supplemental_destructor_entry_point(itype);
+          out << get_supplemental_destructor_entry_point(
+            itype, get_supplemental_helper_hash(itype));
         }
 
         out << "\")]\n";
@@ -3499,13 +3534,15 @@ write_native_methods_file(const string &dir, const string &cs_namespace) {
       if (type_index != 0 && is_type_refcounted(type_index)) {
         string unref_name = get_supplemental_unref_destructor_name(itype);
         out << "    [LibraryImport(\"" << quote_csharp_string(_dll_name) << "\", EntryPoint = \""
-            << get_supplemental_unref_destructor_entry_point(itype) << "\")]\n";
+            << get_supplemental_unref_destructor_entry_point(
+                 itype, get_supplemental_helper_hash(itype)) << "\")]\n";
         out << "    internal static partial void " << unref_name
             << "(IntPtr self);\n\n";
 
         string ref_name = get_supplemental_ref_name(itype);
         out << "    [LibraryImport(\"" << quote_csharp_string(_dll_name) << "\", EntryPoint = \""
-            << get_supplemental_ref_entry_point(itype) << "\")]\n";
+            << get_supplemental_ref_entry_point(
+                 itype, get_supplemental_helper_hash(itype)) << "\")]\n";
         out << "    internal static partial void " << ref_name
             << "(IntPtr self);\n\n";
       }
@@ -10263,6 +10300,81 @@ get_collection_helper_name(const InterrogateType &itype, const string &op) const
   }
   strm << get_class_name(itype) << "_" << op;
   return strm.str();
+}
+
+/**
+ * Returns the hash of the library whose supplemental defines the per-type
+ * helpers (_inCSDestr_, _inCSUnrefDestr_, _inCSRef_) for this type, which is
+ * the part of their names that tells one library's copy from another's.
+ *
+ * Pass 1 is that library: it emits them only for its own library's types and
+ * lists each in its own .csharphelpers sidecar, which pass 2 hashes by the
+ * library the sidecar names.  So pass 1 hashes the library it is generating,
+ * rather than the type's: the two agree only because
+ * is_current_native_methods_type() filters on it, and pass 2 depends on their
+ * agreeing.  In pass 2 a type may have been emitted by several libraries (every
+ * library whose interface spells a template instantiation emits it), and the
+ * merged database keeps only one of them as the type's library; the definers
+ * come from the .csharphelpers sidecars instead.  A module binds its own
+ * library's copy, which is in the DLL its declarations name; failing that, the
+ * copy in the most-core module that has one, the same rule that picks a
+ * collection's owner.  Without sidecars (a pass 2 given only its own databases)
+ * the type's library is the only definer pass 2 can know of.
+ */
+string InterfaceMakerCSharp::
+get_supplemental_helper_hash(const InterrogateType &itype) const {
+  if (!csharp_database_only_pass) {
+    if (_def != nullptr && _def->library_hash_name != nullptr) {
+      return _def->library_hash_name;
+    }
+    return string();
+  }
+
+  string lib;
+  auto defs = csharp_helper_definers.find(get_supplemental_helper_type_key(itype));
+  if (defs != csharp_helper_definers.end()) {
+    for (const string &definer : defs->second) {
+      if (csharp_owned_libraries.count(definer) != 0) {
+        lib = definer;
+        break;
+      }
+    }
+    if (lib.empty()) {
+      string best_mod;
+      int best_rank = 0;
+      for (const string &definer : defs->second) {
+        string mod;
+        auto mit = csharp_library_to_module.find(definer);
+        if (mit != csharp_library_to_module.end()) {
+          mod = mit->second;
+        }
+        int rank = INT_MAX;
+        auto rit = csharp_module_rank.find(mod);
+        if (rit != csharp_module_rank.end()) {
+          rank = rit->second;
+        }
+        if (lib.empty() ||
+            std::tie(rank, mod, definer) < std::tie(best_rank, best_mod, lib)) {
+          lib = definer;
+          best_mod = mod;
+          best_rank = rank;
+        }
+      }
+    }
+  }
+  if (lib.empty() && itype.has_library_name()) {
+    const char *l = itype.get_library_name();
+    if (l != nullptr && *l != '\0') {
+      lib = l;
+    }
+  }
+  if (!lib.empty()) {
+    return InterrogateBuilder::hash_string(lib, 5);
+  }
+  if (_def != nullptr && _def->library_hash_name != nullptr) {
+    return _def->library_hash_name;
+  }
+  return string();
 }
 
 /**
