@@ -14,6 +14,7 @@
 
 #include "interrogate.h"
 #include "interrogateBuilder.h"
+#include "pnotify.h"
 #include "functionRemap.h"
 #include "parameterRemap.h"
 #include "parameterRemapToString.h"
