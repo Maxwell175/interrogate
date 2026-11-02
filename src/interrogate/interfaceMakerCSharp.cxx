@@ -5170,20 +5170,28 @@ write_proxy_class(ostream &out, const string &, Object *object) {
     return field;
   };
 
-  // Helper: find the pointer expression to use as input to an upcast owned by 'owner'.
-  // Returns "ptr" if owner is on itype's primary chain, or a field name if owner is
-  // reachable through a secondary base.
-  auto get_owner_ptr_expr = [&](const InterrogateType *owner) -> string {
+  // Helper: find the secondary base whose field is the input to an upcast owned by
+  // 'owner'.  Returns nullptr if the input is `ptr`: the owner is on itype's primary
+  // chain, or on no secondary base's.
+  auto get_owner_source = [&](const InterrogateType *owner) -> const InterrogateType * {
     if (is_on_primary_chain(itype, owner)) {
-      return "ptr";
+      return nullptr;
     }
     for (const InterrogateType *sec : all_secondary_bases) {
       if (sec == nullptr) continue;
       if (is_on_primary_chain(*sec, owner)) {
-        return get_field_name_for(sec);
+        return sec;
       }
     }
-    return "ptr";
+    return nullptr;
+  };
+
+  // Helper: find the pointer expression to use as input to an upcast owned by 'owner'.
+  // Returns "ptr" if owner is on itype's primary chain, or a field name if owner is
+  // reachable through a secondary base.
+  auto get_owner_ptr_expr = [&](const InterrogateType *owner) -> string {
+    const InterrogateType *source = get_owner_source(owner);
+    return source != nullptr ? get_field_name_for(source) : string("ptr");
   };
 
   // Process in order: direct secondary bases first (they use ptr or primary chain),
@@ -5232,8 +5240,33 @@ write_proxy_class(ostream &out, const string &, Object *object) {
     indent(out, 6) << field_name << " = " << upcast_func << "(" << input_ptr << ");\n";
   };
 
+  // Pass 2 keeps interface-name order, except that each base is written after the base
+  // whose field it reads.  A base owned through two levels of secondary bases reads a
+  // field that pass 2 itself sets, and by name it can come first.
+  std::vector<const InterrogateType *> pass2_ordered;
+  std::set<const InterrogateType *> pass2_pending(pass2.begin(), pass2.end());
+  while (!pass2_pending.empty()) {
+    const InterrogateType *next = nullptr;
+    for (const InterrogateType *sec_base : pass2) {
+      if (pass2_pending.count(sec_base) == 0) continue;
+      const InterrogateType *source = get_owner_source(secondary_base_owner[sec_base]);
+      if (source == nullptr || source == sec_base || pass2_pending.count(source) == 0) {
+        next = sec_base;
+        break;
+      }
+    }
+    if (next == nullptr) {
+      // Only a cycle of sources, which no C++ hierarchy has, leaves nothing ready.
+      for (const InterrogateType *sec_base : pass2) {
+        if (pass2_pending.count(sec_base) != 0) { next = sec_base; break; }
+      }
+    }
+    pass2_pending.erase(next);
+    pass2_ordered.push_back(next);
+  }
+
   for (const InterrogateType *sec_base : pass1) emit_upcast_init(sec_base);
-  for (const InterrogateType *sec_base : pass2) emit_upcast_init(sec_base);
+  for (const InterrogateType *sec_base : pass2_ordered) emit_upcast_init(sec_base);
 
   indent(out, 4) << "}\n\n";
 

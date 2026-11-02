@@ -47,3 +47,50 @@ class OrderDerived : public OrderBase, public OrderCharlie, public OrderLeaf,
 public:
   OrderDerived();
 };
+
+// OrderChained owns OrderXray through two levels of secondary bases: its
+// secondary base OrderZulu has OrderYankee as a secondary base, which has
+// OrderXray as one.  OrderChained's constructor sets OrderYankee's pointer from
+// OrderZulu's and OrderXray's from OrderYankee's, so it must set them in that
+// order, although by name OrderXray comes first.
+
+class OrderChainBase {
+public:
+  OrderChainBase();
+  int get_chain_base() const;
+};
+
+class OrderXray {
+public:
+  OrderXray();
+  int get_xray() const;
+};
+
+class OrderYankeeRoot {
+public:
+  OrderYankeeRoot();
+  int get_yankee_root() const;
+};
+
+class OrderYankee : public OrderYankeeRoot, public OrderXray {
+public:
+  OrderYankee();
+  int get_yankee() const;
+};
+
+class OrderZuluRoot {
+public:
+  OrderZuluRoot();
+  int get_zulu_root() const;
+};
+
+class OrderZulu : public OrderZuluRoot, public OrderYankee {
+public:
+  OrderZulu();
+  int get_zulu() const;
+};
+
+class OrderChained : public OrderChainBase, public OrderZulu {
+public:
+  OrderChained();
+};

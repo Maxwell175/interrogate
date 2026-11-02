@@ -25,7 +25,8 @@ add_test(NAME csharp_pass1_sidecars
     -P "${PROJECT_SOURCE_DIR}/cmake/scripts/RunPass1SidecarTest.cmake")
 
 # A class with several secondary bases lists them in interface-name order
-# wherever the generated class names them, whatever order they sit in in memory.
+# wherever the generated class names them, whatever order they sit in in memory,
+# and its constructor sets each base's pointer before an upcast reads it.
 # Reads the generated text only, so it needs no dotnet either.
 add_test(NAME csharp_interface_order
   COMMAND ${CMAKE_COMMAND}

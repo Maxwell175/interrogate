@@ -12,7 +12,10 @@
 # Leaf) in each of the four places the generator lists them: the interface list,
 # the pointer fields, the explicit NativeHandle implementations and the
 # constructor's upcasts.  OrderStem, on OrderLeaf's primary chain, must share
-# OrderLeaf's pointer.  Exit code 0 means pass.
+# OrderLeaf's pointer.  OrderChained, which owns OrderXray through two levels of
+# secondary bases, must set each upcast's pointer before the upcast that reads
+# it: OrderZulu's, then OrderYankee's from it, then OrderXray's from that,
+# although its fields still come in name order.  Exit code 0 means pass.
 
 foreach(var INTERROGATE INTERROGATE_CS PARSER_INC WORK_DIR HEADER)
   if(NOT DEFINED ${var})
@@ -56,12 +59,17 @@ if(NOT rv EQUAL 0)
   message(FATAL_ERROR "interrogate_csharp pass 2 failed (exit ${rv})")
 endif()
 
-file(GLOB_RECURSE derived_files "${WORK_DIR}/cs/OrderDerived.cs")
-if(NOT derived_files)
-  message(FATAL_ERROR "pass 2 wrote no OrderDerived.cs")
-endif()
-list(GET derived_files 0 derived_file)
-file(READ "${derived_file}" text)
+# Reads the generated class ${name} into ${text}, and its path into ${derived_file}.
+macro(read_generated_class name)
+  file(GLOB_RECURSE derived_files "${WORK_DIR}/cs/${name}.cs")
+  if(NOT derived_files)
+    message(FATAL_ERROR "pass 2 wrote no ${name}.cs")
+  endif()
+  list(GET derived_files 0 derived_file)
+  file(READ "${derived_file}" text)
+endmacro()
+
+read_generated_class(OrderDerived)
 
 # Fails unless every argument after the first occurs in ${text}, each after the one before it.
 function(expect_in_order what)
@@ -105,4 +113,20 @@ if(at EQUAL -1)
   message(FATAL_ERROR "OrderStem must share OrderLeaf's pointer; found '${stem_line}'")
 endif()
 
-message(STATUS "OrderDerived lists its secondary bases in interface-name order")
+read_generated_class(OrderChained)
+expect_in_order("chained pointer fields"
+  "private IntPtr _orderXrayPtr" "private IntPtr _orderYankeePtr" "private IntPtr _orderZuluPtr")
+expect_in_order("chained NativeHandle implementations"
+  "IOrderXray.NativeHandle =>" "IOrderYankee.NativeHandle =>" "IOrderZulu.NativeHandle =>")
+expect_in_order("chained constructor upcasts"
+  "_orderZuluPtr = " "_orderYankeePtr = " "_orderXrayPtr = ")
+foreach(pair "_orderZuluPtr = [^;]*\\(ptr\\);"
+             "_orderYankeePtr = [^;]*\\(_orderZuluPtr\\);"
+             "_orderXrayPtr = [^;]*\\(_orderYankeePtr\\);")
+  string(REGEX MATCH "${pair}" found "${text}")
+  if(found STREQUAL "")
+    message(FATAL_ERROR "chained constructor upcasts: no line matching '${pair}' in ${derived_file}")
+  endif()
+endforeach()
+
+message(STATUS "OrderDerived and OrderChained list their secondary bases in interface-name order")
