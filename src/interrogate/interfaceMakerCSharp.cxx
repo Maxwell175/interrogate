@@ -4858,9 +4858,12 @@ write_proxy_class(ostream &out, const string &, Object *object) {
   // all_secondary_bases: types with their own upcast function (actual secondary derivations)
   // secondary_base_owner: maps each such type to its direct owner (the class where di>0 points to it)
   // primary_chain_aliases: types on a secondary base's primary chain (share its pointer)
-  std::set<const InterrogateType *> all_secondary_bases;
+  //
+  // Both lists are filled in the order full_secondary_list visits them, then sorted by
+  // interface name below.
+  std::vector<const InterrogateType *> all_secondary_bases;
   std::map<const InterrogateType *, const InterrogateType *> secondary_base_owner;
-  std::map<const InterrogateType *, const InterrogateType *> primary_chain_aliases;
+  std::vector<std::pair<const InterrogateType *, const InterrogateType *> > primary_chain_aliases;
 
   // get_secondary_base_types already does all the heavy lifting of cross-module resolution.
   // It returns ALL types we need (both actual secondaries and primary-chain aliases).
@@ -4876,6 +4879,20 @@ write_proxy_class(ostream &out, const string &, Object *object) {
   // Secondary bases have upcast functions; primary-chain types don't.
   // We identify actual secondary bases by checking if get_upcast_pinvoke_name succeeds.
   // For that we need to find the owner that has the type as derivation[di>0].
+
+  // Whether the type named target_name is on from's primary-base chain (from included).
+  auto primary_chain_includes = [&](const InterrogateType &from, const string &target_name) -> bool {
+    const InterrogateType *cur = &from;
+    while (cur != nullptr) {
+      if (get_interface_name(*cur) == target_name) return true;
+      ensure_database_loaded(*cur);
+      if (cur->number_of_derivations() == 0) break;
+      TypeIndex primary_idx = cur->get_derivation(0);
+      if (!is_wrapped_type(primary_idx)) break;
+      cur = &idb_collect->get_type(primary_idx);
+    }
+    return false;
+  };
 
   // Build a lookup by interface name for dedup
   std::set<string> added_names;
@@ -4897,7 +4914,7 @@ write_proxy_class(ostream &out, const string &, Object *object) {
       if (get_interface_name(dt) == base_name) {
         string upcast = get_upcast_pinvoke_name(itype, di);
         if (!upcast.empty()) {
-          all_secondary_bases.insert(base_type);
+          all_secondary_bases.push_back(base_type);
           secondary_base_owner[base_type] = &itype;
           found_upcast = true;
         }
@@ -4917,7 +4934,7 @@ write_proxy_class(ostream &out, const string &, Object *object) {
           if (get_interface_name(dt) == base_name) {
             string upcast = get_upcast_pinvoke_name(*potential_owner, di);
             if (!upcast.empty()) {
-              all_secondary_bases.insert(base_type);
+              all_secondary_bases.push_back(base_type);
               secondary_base_owner[base_type] = potential_owner;
               found_upcast = true;
             }
@@ -4944,7 +4961,7 @@ write_proxy_class(ostream &out, const string &, Object *object) {
           if (get_interface_name(dt) == base_name) {
             string upcast = get_upcast_pinvoke_name(*cur, di);
             if (!upcast.empty()) {
-              all_secondary_bases.insert(base_type);
+              all_secondary_bases.push_back(base_type);
               secondary_base_owner[base_type] = cur;
               found_upcast = true;
             }
@@ -4959,15 +4976,33 @@ write_proxy_class(ostream &out, const string &, Object *object) {
       for (const InterrogateType *sec : all_secondary_bases) {
         if (get_interface_name(*sec) == base_name) { found_upcast = true; break; }
       }
-      if (!found_upcast) {
-        // Find the nearest secondary base whose primary chain includes this type
+      if (!found_upcast && !all_secondary_bases.empty()) {
+        // Share the pointer of the first secondary base whose primary chain includes this
+        // type, or failing that the first secondary base.
+        const InterrogateType *alias_owner = all_secondary_bases.front();
         for (const InterrogateType *sec : all_secondary_bases) {
-          primary_chain_aliases[base_type] = sec;
-          break;
+          if (primary_chain_includes(*sec, base_name)) {
+            alias_owner = sec;
+            break;
+          }
         }
+        primary_chain_aliases.push_back(std::make_pair(base_type, alias_owner));
       }
     }
   }
+
+  // The fields, handles and upcasts are written in interface-name order.  Ordering them
+  // by the address of each type's record made the generated text differ between two
+  // builds of the same sources.
+  auto by_interface_name = [&](const InterrogateType *a, const InterrogateType *b) {
+    return get_interface_name(*a) < get_interface_name(*b);
+  };
+  std::stable_sort(all_secondary_bases.begin(), all_secondary_bases.end(), by_interface_name);
+  std::stable_sort(primary_chain_aliases.begin(), primary_chain_aliases.end(),
+    [&](const std::pair<const InterrogateType *, const InterrogateType *> &a,
+        const std::pair<const InterrogateType *, const InterrogateType *> &b) {
+      return by_interface_name(a.first, b.first);
+    });
 
   InterrogateDatabase *idb = InterrogateDatabase::get_ptr();
 
@@ -5153,7 +5188,7 @@ write_proxy_class(ostream &out, const string &, Object *object) {
 
   // Process in order: direct secondary bases first (they use ptr or primary chain),
   // then inherited ones (which may depend on already-computed fields).
-  // The set iteration order may not guarantee this, so process in two passes:
+  // Process in two passes:
   // Pass 1: bases whose owner is on itype's primary chain (always use ptr)
   // Pass 2: bases whose owner is a secondary base (use that base's field)
   std::vector<const InterrogateType *> pass1, pass2;
@@ -9900,7 +9935,10 @@ get_interface_list(const InterrogateType &itype) const {
   // Collect ALL secondary bases from the entire primary-base ancestry chain.
   // C# explicit interface implementations don't inherit, so each class must
   // declare every secondary base interface it implements, not just direct ones.
-  std::set<const InterrogateType *> all_secondary_bases;
+  // They are listed in interface-name order, as write_proxy_class lists them;
+  // the set only stops a base from being visited twice.
+  std::vector<const InterrogateType *> all_secondary_bases;
+  std::set<const InterrogateType *> visited_secondary_bases;
   std::set<string> emitted_interfaces;
   string interface_list;
 
@@ -9909,7 +9947,8 @@ get_interface_list(const InterrogateType &itype) const {
     std::vector<const InterrogateType *> secondaries;
     get_secondary_base_types(t, secondaries);
     for (const InterrogateType *sec : secondaries) {
-      if (sec != nullptr && all_secondary_bases.insert(sec).second) {
+      if (sec != nullptr && visited_secondary_bases.insert(sec).second) {
+        all_secondary_bases.push_back(sec);
         collect(*sec);
       }
     }
@@ -9923,6 +9962,10 @@ get_interface_list(const InterrogateType &itype) const {
     }
   };
   collect(itype);
+  std::stable_sort(all_secondary_bases.begin(), all_secondary_bases.end(),
+    [&](const InterrogateType *a, const InterrogateType *b) {
+      return get_interface_name(*a) < get_interface_name(*b);
+    });
 
   for (const InterrogateType *base_type : all_secondary_bases) {
     if (is_collection_facade_type(*base_type) ||

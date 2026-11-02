@@ -24,6 +24,18 @@ add_test(NAME csharp_pass1_sidecars
     "-DSOME_HEADER=${CMAKE_CURRENT_SOURCE_DIR}/collections.h"
     -P "${PROJECT_SOURCE_DIR}/cmake/scripts/RunPass1SidecarTest.cmake")
 
+# A class with several secondary bases lists them in interface-name order
+# wherever the generated class names them, whatever order they sit in in memory.
+# Reads the generated text only, so it needs no dotnet either.
+add_test(NAME csharp_interface_order
+  COMMAND ${CMAKE_COMMAND}
+    "-DINTERROGATE=$<TARGET_FILE:interrogate>"
+    "-DINTERROGATE_CS=$<TARGET_FILE:interrogate_csharp>"
+    "-DPARSER_INC=${PROJECT_SOURCE_DIR}/parser-inc"
+    "-DWORK_DIR=${CMAKE_CURRENT_BINARY_DIR}/interface_order"
+    "-DHEADER=${CMAKE_CURRENT_SOURCE_DIR}/interface_order.h"
+    -P "${PROJECT_SOURCE_DIR}/cmake/scripts/RunInterfaceOrderTest.cmake")
+
 find_program(DOTNET_EXECUTABLE dotnet)
 if(NOT DOTNET_EXECUTABLE)
   message(STATUS "dotnet not found; skipping C# runtime tests")
