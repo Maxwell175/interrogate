@@ -731,7 +731,11 @@ main(int argc, char **argv) {
 
     // Sidecar listing the collections this library defines, next to the .in;
     // interrogate_csharp (pass 2) aggregates them to pick each collection's owner.
-    if (build_csharp && !csharp_pass1_defined_collections.empty()) {
+    // Written even when empty, as the helpers below are: a build that declares
+    // it as an output would otherwise rerun this pass on every build for a
+    // library that defines none, and one that stops defining them would leave
+    // a stale list behind.
+    if (build_csharp) {
       Filename manifest(output_data_filename.get_fullpath_wo_extension() + ".csharpcoll");
       manifest.set_text();
       std::ofstream manifest_out;

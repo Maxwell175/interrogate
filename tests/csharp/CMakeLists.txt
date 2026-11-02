@@ -12,6 +12,18 @@
 #      that compiles the generated .cs files + the driver, and invokes
 #      `dotnet run`.  The driver exits 0 on success.
 
+# Pass 1 writes both C# sidecars for every library, whether or not the library
+# has anything to list.  A build declares them as pass-1 outputs, and a missing
+# output reruns the pass on every build.  Needs no dotnet, so it comes first.
+add_test(NAME csharp_pass1_sidecars
+  COMMAND ${CMAKE_COMMAND}
+    "-DINTERROGATE=$<TARGET_FILE:interrogate>"
+    "-DPARSER_INC=${PROJECT_SOURCE_DIR}/parser-inc"
+    "-DWORK_DIR=${CMAKE_CURRENT_BINARY_DIR}/pass1_sidecars"
+    "-DNONE_HEADER=${CMAKE_CURRENT_SOURCE_DIR}/basic_class.h"
+    "-DSOME_HEADER=${CMAKE_CURRENT_SOURCE_DIR}/collections.h"
+    -P "${PROJECT_SOURCE_DIR}/cmake/scripts/RunPass1SidecarTest.cmake")
+
 find_program(DOTNET_EXECUTABLE dotnet)
 if(NOT DOTNET_EXECUTABLE)
   message(STATUS "dotnet not found; skipping C# runtime tests")
