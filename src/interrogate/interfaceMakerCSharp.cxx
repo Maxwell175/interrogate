@@ -1597,6 +1597,7 @@ TypeIndex get_type_index_for_cpp_type(CPPType *type, CPPScope *scope);
 bool is_csharp_primitive_type(const string &type_name);
 bool is_csharp_enum_type(TypeIndex type_index);
 bool is_csharp_native_object_type(TypeIndex type_index, const string &type_name);
+static bool is_handle_parameter_type(TypeIndex type_index);
 
 bool
 is_wrapped_interrogate_type(TypeIndex type_index) {
@@ -1682,6 +1683,11 @@ std::set<std::string> csharp_collection_coercible;
 string
 marshal_managed_argument(TypeIndex param_type_index, const string &param_type,
                          const string &param_name) {
+  if (is_handle_parameter_type(param_type_index)) {
+    // The wrapper's handle is the index the C wrapper takes; null is index 0,
+    // as a wrapper of index 0 has a zero handle.
+    return "(int)NativeObject.Unwrap(" + param_name + ")";
+  }
   if (is_csharp_native_object_type(param_type_index, param_type) ||
       is_collection_type_index(param_type_index)) {
     if (!param_type.empty() && param_type[0] == 'I' && param_type.size() > 1 && isupper(param_type[1])) {
@@ -2118,6 +2124,24 @@ get_native_ownership_name(const InterrogateFunctionWrapper &wrapper,
 static bool
 is_handle_type(const InterrogateType &itype) {
   return itype.has_true_name() && TypeManager::is_handle_name(itype.get_true_name());
+}
+
+/**
+ * Returns true if a parameter of this type is a handle that the C wrapper
+ * takes as its index (or, flagged PF_is_out, as a pointer to its index) and
+ * the C# signature keeps as the handle: one passed by const reference, by
+ * pointer or by non-const reference.  The database records such a parameter
+ * as the handle's own type (ParameterRemap::get_recorded_type), where any
+ * other object is recorded as a pointer and a handle passed by value as int.
+ */
+static bool
+is_handle_parameter_type(TypeIndex type_index) {
+  type_index = unwrap_type_aliases(type_index);
+  if (type_index == 0) {
+    return false;
+  }
+  const InterrogateType &itype = InterrogateDatabase::get_ptr()->get_type(type_index);
+  return !itype.is_pointer() && is_handle_type(itype);
 }
 
 const InterrogateFunctionWrapper *
@@ -5717,6 +5741,12 @@ write_constructor(ostream &out, Function *func, Object *object, int indent_level
       string param_name = wrapper.parameter_has_name(i)
         ? make_csharp_identifier(wrapper.parameter_get_name(i))
         : string("param") + std::to_string(i);
+      bool is_handle = is_handle_parameter_type(param_type_index);
+      if (is_handle && wrapper.parameter_is_out(i)) {
+        // Only write_method passes a handle by ref and reads it back; the
+        // constructor is left unwritten, as for a type with no mapping.
+        param_type.clear();
+      }
       param_types.push_back(param_type);
       param_decls.push_back(param_type + " " + param_name);
       param_names.push_back(param_name);
@@ -5726,6 +5756,9 @@ write_constructor(ostream &out, Function *func, Object *object, int indent_level
         stream_bridges.push_back({bridge_var, csharp_stream_bridge_factory(stream_tok),
                                   param_name});
         native_args.push_back(bridge_var + ".Handle");
+      } else if (is_handle) {
+        native_args.push_back(marshal_managed_argument(param_type_index, param_type, param_name));
+        keepalive_params.push_back(param_name);
       } else if (is_csharp_native_object_type(param_type_index, param_type) ||
                  is_collection_type_index(param_type_index)) {
         if (!param_type.empty() && param_type[0] == 'I' && param_type.size() > 1 && isupper(param_type[1])) {
@@ -5976,7 +6009,9 @@ write_operator_aliases(ostream &out, Object *object, int indent_level,
       bool bad_param = false;
       for (int i = 1; i < wrapper.number_of_parameters(); ++i) {
         TypeIndex param_type_index = wrapper.parameter_get_type(i);
-        if (csharp_stream_token_for_type(param_type_index) != AT_not_atomic) {
+        if (csharp_stream_token_for_type(param_type_index) != AT_not_atomic ||
+            (wrapper.parameter_is_out(i) && is_handle_parameter_type(param_type_index))) {
+          // An operator cannot pass a handle by ref (see write_method).
           bad_param = true;
           break;
         }
@@ -6080,6 +6115,19 @@ write_operator_aliases(ostream &out, Object *object, int indent_level,
 
   auto emit_equality_overrides = [&](const std::vector<const CSharpOperatorCandidate *> &equality_candidates) {
     if (equality_candidates.empty() || !emitted.insert("O:EqualsOverride").second) {
+      return;
+    }
+
+    if (is_handle_type(object->_itype)) {
+      // A handle's wrapper holds its index (see is_handle_type), and two
+      // handles are equal when their indices are, so compare those here
+      // rather than ask the C++ ==, and hash the index; the hash below would
+      // put every handle in one bucket.  operator == still treats null as
+      // index 0, whose wrapper has a zero handle.  (A handle type with no
+      // == of its own gets NativeObject's, which compares the same.)
+      indent(out, indent_level) << "public override bool Equals(object? obj) => obj is "
+                                << class_name << " __p3other && __p3other.NativeHandle == NativeHandle;\n";
+      indent(out, indent_level) << "public override int GetHashCode() => (int)NativeHandle;\n\n";
       return;
     }
 
@@ -6563,9 +6611,11 @@ write_method(ostream &out, Function *func, Object *object, int indent_level,
         if (i != 0) {
           out << ", ";
         }
-        // An out-parameter has to be forwarded as one.
+        // An out- or ref parameter has to be forwarded as one.
         if (i < param_types.size() && param_types[i].compare(0, 4, "out ") == 0) {
           out << "out ";
+        } else if (i < param_types.size() && param_types[i].compare(0, 4, "ref ") == 0) {
+          out << "ref ";
         }
         out << param_names[i];
       }
@@ -6639,6 +6689,10 @@ write_method(ostream &out, Function *func, Object *object, int indent_level,
     struct CoercionSite { string var; string facade; string param; bool nullable; };
     std::vector<CoercionSite> coercions;
 
+    // Handles passed by ref: (index variable, parameter, wrapper class).
+    struct HandleRefSite { string var; string param; string handle_class; };
+    std::vector<HandleRefSite> handle_refs;
+
     for (int i = first_param; i < wrapper.number_of_parameters(); ++i) {
       TypeIndex param_type_index = wrapper.parameter_get_type(i);
       bool param_nullable = wrapper.parameter_is_nullable(i);
@@ -6658,6 +6712,25 @@ write_method(ostream &out, Function *func, Object *object, int indent_level,
         param_type = "out " + out_type;
       }
 
+      // A pointer or non-const reference to a handle: the C wrapper builds a
+      // local handle from the index it is pointed to and writes the index back,
+      // so the handle goes by ref -- in, since the C++ may read it, and out,
+      // since it may change it.  The caller's variable then holds a wrapper of
+      // the index the call left (null for index 0, as __CreateFromNative gives;
+      // hence always nullable), and the same wrapper if the index is unchanged.
+      // The wrapper itself never changes: it is a value, which others may hold
+      // or hash.
+      bool handle_by_ref = stream_tok == AT_not_atomic && wrapper.parameter_is_out(i) &&
+                           is_handle_parameter_type(param_type_index) && !param_type.empty();
+      string handle_class;
+      if (handle_by_ref) {
+        handle_class = get_csharp_native_object_class_name(param_type_index);
+        if (param_type.back() != '?') {
+          param_type += "?";
+        }
+        param_type = "ref " + param_type;
+      }
+
       string param_name = wrapper.parameter_has_name(i)
         ? make_csharp_identifier(wrapper.parameter_get_name(i))
         : string("param") + std::to_string(i - first_param);
@@ -6665,7 +6738,7 @@ write_method(ostream &out, Function *func, Object *object, int indent_level,
       // See the remap path above: a collection parameter takes any
       // IReadOnlyList<T> and __Coerce hands back the facade.
       string coerce_facade;
-      if (stream_tok == AT_not_atomic && out_type.empty()) {
+      if (stream_tok == AT_not_atomic && out_type.empty() && !handle_by_ref) {
         string coerce_element = get_collection_param_element(param_type_index, param_type);
         if (!coerce_element.empty()) {
           coerce_facade = param_type;
@@ -6685,6 +6758,10 @@ write_method(ostream &out, Function *func, Object *object, int indent_level,
 
       if (!out_type.empty()) {
         native_args.push_back("out " + param_name);
+      } else if (handle_by_ref) {
+        string var = "__p3handle" + std::to_string(handle_refs.size());
+        handle_refs.push_back({var, param_name, handle_class});
+        native_args.push_back("ref " + var);
       } else if (stream_tok != AT_not_atomic) {
         string bridge_var = "__p3stream" + std::to_string(stream_bridges.size());
         stream_bridges.push_back({bridge_var, csharp_stream_bridge_factory(stream_tok),
@@ -6819,6 +6896,21 @@ write_method(ostream &out, Function *func, Object *object, int indent_level,
       out << c.facade << ".__Coerce(" << c.param << ");\n";
     }
 
+    for (const auto &h : handle_refs) {
+      indent(out, indent_level + 2) << "int " << h.var << " = (int)NativeObject.Unwrap("
+                                    << h.param << ");\n";
+    }
+    auto write_handle_refs_back = [&]() {
+      for (const auto &h : handle_refs) {
+        indent(out, indent_level + 2) << "if (" << h.var << " != (int)NativeObject.Unwrap("
+                                      << h.param << ")) {\n";
+        indent(out, indent_level + 4) << h.param << " = " << h.handle_class
+                                      << ".__CreateFromNative((IntPtr)" << h.var
+                                      << ", NativeOwnership.Borrowed);\n";
+        indent(out, indent_level + 2) << "}\n";
+      }
+    };
+
     string native_call = get_pinvoke_call_name(func->_ifunc, wrapper) + "(";
     for (size_t i = 0; i < native_args.size(); ++i) {
       if (i != 0) {
@@ -6829,12 +6921,13 @@ write_method(ostream &out, Function *func, Object *object, int indent_level,
     native_call += ")";
 
     // Keep managed handles (and `this`) rooted across the call -- see the remap
-    // path above for why.
-    if (!keepalive_exprs.empty() && wrapper.has_return_value()) {
+    // path above for why.  A handle passed by ref is read back after it, too.
+    if ((!keepalive_exprs.empty() || !handle_refs.empty()) && wrapper.has_return_value()) {
       indent(out, indent_level + 2) << "var __p3ret = " << native_call << ";\n";
       for (const string &k : keepalive_exprs) {
         indent(out, indent_level + 2) << "GC.KeepAlive(" << k << ");\n";
       }
+      write_handle_refs_back();
       native_call = "__p3ret";
     }
 
@@ -6847,6 +6940,7 @@ write_method(ostream &out, Function *func, Object *object, int indent_level,
       for (const string &k : keepalive_exprs) {
         indent(out, indent_level + 2) << "GC.KeepAlive(" << k << ");\n";
       }
+      write_handle_refs_back();
 
     } else if (return_stream_tok != AT_not_atomic) {
       indent(out, indent_level + 2) << "IntPtr result = " << native_call << ";\n";
@@ -6938,9 +7032,11 @@ write_method(ostream &out, Function *func, Object *object, int indent_level,
         if (i != 0) {
           out << ", ";
         }
-        // An out-parameter has to be forwarded as one.
+        // An out- or ref parameter has to be forwarded as one.
         if (i < param_types.size() && param_types[i].compare(0, 4, "out ") == 0) {
           out << "out ";
+        } else if (i < param_types.size() && param_types[i].compare(0, 4, "ref ") == 0) {
+          out << "ref ";
         }
         out << param_names[i];
       }
@@ -8245,7 +8341,10 @@ write_dllimport(ostream &out, const InterrogateFunction &ifunc,
     if (pinvoke_type == "string" && wrapper.parameter_is_nullable(i)) {
       pinvoke_type += "?";
     }
-    if (!wrapper.parameter_is_this(i) && wrapper.parameter_is_out(i)) {
+    if (!wrapper.parameter_is_this(i) && is_handle_parameter_type(type)) {
+      // The index, or a pointer to it that the wrapper writes back.
+      pinvoke_type = wrapper.parameter_is_out(i) ? "ref int" : "int";
+    } else if (!wrapper.parameter_is_this(i) && wrapper.parameter_is_out(i)) {
       string out_type = csharp_out_parameter_type(type);
       if (!out_type.empty()) {
         pinvoke_type = "out " + out_type;

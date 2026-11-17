@@ -1,14 +1,20 @@
 // Handle-type tests.  TypeHandle and ButtonHandle cross the C ABI as their
 // index, so their wrappers hold an index, own nothing, and hand the index on
-// wherever the C++ takes a handle by value or by const reference.
+// wherever the C++ takes a handle by value or by const reference.  A const
+// reference keeps the handle in the C# signature; a pointer or a non-const
+// reference goes by ref, through a temporary the C wrapper builds from the
+// index; and two handles are equal, and hash alike, when their indices are.
 //
 // Before this was so, a wrapper made from an index or a name deleted the index
 // when it was released -- "free(): invalid pointer", disposed or finalized --
 // and a const-reference parameter was given the index as an address.  The
-// driver is written to compile against those bindings too, so that they are
-// seen to crash rather than fail to build.
+// driver is written to compile against those bindings too, and against each
+// later one (a const reference as an int; pointers unbound), so that they are
+// seen to crash or fail rather than fail to build: what one of them lacks is
+// reached by reflection.
 
 using System;
+using System.Collections.Generic;
 using System.Linq;
 using System.Reflection;
 using System.Runtime.InteropServices;
@@ -25,13 +31,16 @@ internal static class Driver {
 
     public static int Main() {
         TestNothingNativeToDestroy();
-        TestPointersToHandlesAreNotBound();
         TestReleasedWrappersFreeNothing();
         TestFinalizedWrappersFreeNothing();
         TestAnOwnedWrapperFreesNothing();
         TestAConstReferenceReturnIsTheIndex();
-        TestAConstReferenceParameterTakesTheIndex();
+        TestAConstReferenceParameterKeepsTheHandle();
         TestTypeHandleIsPassedTheSameWay();
+        TestAConstReferenceConstructorParameterKeepsTheHandle();
+        TestAPointerOrReferenceGoesByRef();
+        TestOnlyMethodsTakeAHandleByRef();
+        TestHandlesCompareByIndex();
 
         Console.WriteLine();
         if (_failed == 0) {
@@ -49,9 +58,8 @@ internal static class Driver {
         }
     }
 
-    // Before the fix a const-reference parameter took a wrapper, whose handle
-    // is the index; after it, the index itself.  Calling through these keeps
-    // one driver for both bindings.
+    // A const-reference parameter takes the handle, or (in the older binding)
+    // its index.  Calling through these keeps one driver for both.
     private static ButtonHandle Wrap(int index) =>
         ButtonHandle.__CreateFromNative((IntPtr)index, NativeOwnership.Borrowed)!;
     private static TypeHandle WrapType(int index) =>
@@ -64,6 +72,10 @@ internal static class Driver {
     private static bool PassType(Func<int, bool> call, int index) => call(index);
     private static int IndexOf(ButtonHandle handle) => handle.GetIndex();
     private static int IndexOf(int index) => index;
+    private static int IndexOf(object? handle) => (int)NativeObject.Unwrap(handle as INativeObject);
+
+    private static Type ParameterType(Type type, string method) =>
+        type.GetMethod(method)!.GetParameters()[0].ParameterType;
 
     // Neither the bindings nor the native library carry a destructor for a
     // handle: there is nothing to destroy.
@@ -101,18 +113,6 @@ internal static class Driver {
               $"a handle made from a name owns nothing (got {fromName.Ownership})");
         using var list = new ButtonList();
         Check(list.Ownership == NativeOwnership.Owned, "control: a ButtonList owns its object");
-    }
-
-    // A non-const reference or a pointer to a handle would take the index as an
-    // address, so those methods are left unbound.
-    private static void TestPointersToHandlesAreNotBound() {
-        Console.WriteLine("TestPointersToHandlesAreNotBound");
-        var names = typeof(ButtonList).GetMethods().Select(m => m.Name).ToHashSet();
-        Check(!names.Contains("GetFirstButton"), "get_first_button(ButtonHandle &) is not bound");
-        Check(!names.Contains("AddButtonPtr"), "add_button_ptr(ButtonHandle const *) is not bound");
-        Check(names.Contains("AddButtonRef"), "control: add_button_ref(ButtonHandle const &) is bound");
-        var parameter = typeof(ButtonList).GetMethod("HasButton")!.GetParameters()[0].ParameterType;
-        Check(parameter == typeof(int), $"a const-reference parameter is the index (got {parameter.Name})");
     }
 
     // The reported abort: every handle released by Dispose, from an index or a
@@ -175,10 +175,21 @@ internal static class Driver {
         Check(new ButtonHandle(2).GetAlias() == 1, "by value: enter's alias is mouse1");
     }
 
-    // The second half of the fault: the index given where a const reference
-    // was wanted was read as an address.
-    private static void TestAConstReferenceParameterTakesTheIndex() {
-        Console.WriteLine("TestAConstReferenceParameterTakesTheIndex");
+    // A const-reference parameter keeps the handle in C#, and the wrapper's
+    // index is what the C wrapper is given.  Given as an address, as it once
+    // was, the C++ read the index as one.
+    private static void TestAConstReferenceParameterKeepsTheHandle() {
+        Console.WriteLine("TestAConstReferenceParameterKeepsTheHandle");
+        foreach (var (type, method) in new[] {
+                     (typeof(ButtonList), "HasButton"), (typeof(ButtonList), "AddButtonRef"),
+                     (typeof(ButtonHandle), "Matches"), (typeof(ButtonHandle), "CompareTo") }) {
+            Type parameter = ParameterType(type, method);
+            Check(parameter == typeof(ButtonHandle),
+                  $"{type.Name}.{method} takes a ButtonHandle (got {parameter.Name})");
+        }
+        Type byValue = ParameterType(typeof(ButtonList), "AddButton");
+        Check(byValue == typeof(int), $"control: a handle by value is its index (got {byValue.Name})");
+
         using var list = new ButtonList();
         Check(Pass(list.AddButtonRef, 2), "added enter by const reference");
         Check(!Pass(list.AddButtonRef, 2), "enter is not added twice");
@@ -194,6 +205,9 @@ internal static class Driver {
 
     private static void TestTypeHandleIsPassedTheSameWay() {
         Console.WriteLine("TestTypeHandleIsPassedTheSameWay");
+        Type parameter = ParameterType(typeof(ButtonList), "IsKind");
+        Check(parameter == typeof(TypeHandle), $"ButtonList.IsKind takes a TypeHandle (got {parameter.Name})");
+
         using var list = new ButtonList();
         list.SetKind(7);
         Check(list.GetKind() == 7, $"by value: the kind is 7 (got {list.GetKind()})");
@@ -205,5 +219,138 @@ internal static class Driver {
         var owned = TypeHandle.__CreateFromNative((IntPtr)7, NativeOwnership.Owned)!;
         owned.Dispose();
         Check(true, "disposed a TypeHandle marked owned");
+    }
+
+    // The constructors take a const-reference handle the same way: the
+    // implicit copy constructor of a handle, and ButtonList's.
+    private static void TestAConstReferenceConstructorParameterKeepsTheHandle() {
+        Console.WriteLine("TestAConstReferenceConstructorParameterKeepsTheHandle");
+        ConstructorInfo? copy = typeof(ButtonHandle).GetConstructor(new[] { typeof(ButtonHandle) });
+        int copied = copy == null ? -1 : ((ButtonHandle)copy.Invoke(new object[] { Wrap(3) })).GetIndex();
+        Check(copied == 3, $"ButtonHandle(ButtonHandle) copies shift (got {(copy == null ? "no such constructor" : copied.ToString())})");
+        ConstructorInfo? first = typeof(ButtonList).GetConstructor(new[] { typeof(ButtonHandle) });
+        using var list = (ButtonList?)first?.Invoke(new object[] { Wrap(2) });
+        Check(list != null && list.GetNumButtons() == 1 && list.GetButton(0) == 2,
+              $"ButtonList(ButtonHandle) holds enter (got {(list == null ? "no such constructor" : list.GetNumButtons() + " buttons")})");
+    }
+
+    // Invokes a method taking one handle by ref; null if it is not bound so.
+    private static (object? result, object? handle)? CallByRef(object target, string method, Type type, object? handle) {
+        MethodInfo? info = target.GetType().GetMethod(method);
+        ParameterInfo[]? parameters = info?.GetParameters();
+        if (info == null || parameters!.Length != 1 || !parameters[0].ParameterType.IsByRef ||
+            parameters[0].ParameterType.GetElementType() != type) {
+            Check(false, $"{target.GetType().Name}.{method} takes a handle by ref (got " +
+                  (info == null ? "nothing" : string.Join(", ", parameters!.Select(p => p.ParameterType.Name))) + ")");
+            return null;
+        }
+        var args = new[] { handle };
+        object? result = info.Invoke(target, args);
+        return (result, args[0]);
+    }
+
+    // A pointer or a non-const reference to a handle goes by ref: the C wrapper
+    // builds a local handle from the index it is pointed to, calls with it, and
+    // writes its index back, and the C# variable then holds that index.
+    private static void TestAPointerOrReferenceGoesByRef() {
+        Console.WriteLine("TestAPointerOrReferenceGoesByRef");
+        foreach (var (method, handle) in new[] {
+                     ("NextButton", typeof(ButtonHandle)), ("GetFirstButton", typeof(ButtonHandle)),
+                     ("ClearButton", typeof(ButtonHandle)), ("AddButtonPtr", typeof(ButtonHandle)),
+                     ("NextKind", typeof(TypeHandle)) }) {
+            MethodInfo? info = typeof(ButtonList).GetMethod(method);
+            Type? parameter = info?.GetParameters()[0].ParameterType;
+            Check(parameter != null && parameter.IsByRef && parameter.GetElementType() == handle,
+                  $"ButtonList.{method} takes a {handle.Name} by ref (got {parameter?.Name ?? "nothing"})");
+        }
+
+        using var list = new ButtonList();
+        list.AddButton(1);
+        list.AddButton(2);
+        list.AddButton(3);
+
+        ButtonHandle enter = Wrap(2);
+        if (CallByRef(list, "NextButton", typeof(ButtonHandle), enter) is var (found, next)) {
+            Check(found is true, "next_button read enter and found the button after it");
+            Check(IndexOf(next) == 3, $"next_button wrote shift back (got {IndexOf(next)})");
+            Check(enter.GetIndex() == 2, "control: the wrapper given is unchanged: it is a value");
+        }
+        ButtonHandle shift = Wrap(3);
+        if (CallByRef(list, "NextButton", typeof(ButtonHandle), shift) is var (more, same)) {
+            Check(more is false, "control: next_button found nothing after shift");
+            Check(ReferenceEquals(same, shift), "an unchanged index leaves the same wrapper");
+        }
+        if (CallByRef(list, "GetFirstButton", typeof(ButtonHandle), null) is var (_, firstButton)) {
+            Check(IndexOf(firstButton) == 1, $"get_first_button wrote mouse1 over null (got {IndexOf(firstButton)})");
+        }
+        if (CallByRef(list, "ClearButton", typeof(ButtonHandle), Wrap(3)) is var (_, cleared)) {
+            Check(cleared == null, $"clear_button left index 0, which comes back as null (got {IndexOf(cleared)})");
+        }
+        if (CallByRef(list, "AddButtonPtr", typeof(ButtonHandle), enter) is var (_, added)) {
+            Check(list.GetNumButtons() == 4 && list.GetButton(3) == 2,
+                  $"add_button_ptr read enter through the pointer (got {list.GetNumButtons()} buttons)");
+            Check(ReferenceEquals(added, enter), "a const pointer leaves the same wrapper");
+        }
+        if (CallByRef(list, "NextKind", typeof(TypeHandle), WrapType(7)) is var (_, kind)) {
+            Check(IndexOf(kind) == 8, $"next_kind read kind 7 and wrote 8 (got {IndexOf(kind)})");
+        }
+    }
+
+    // A constructor or an operator would have to read the handle back too;
+    // they are not written, and the method an operator names still is.
+    private static void TestOnlyMethodsTakeAHandleByRef() {
+        Console.WriteLine("TestOnlyMethodsTakeAHandleByRef");
+        bool byRefCtor = typeof(ButtonList).GetConstructors()
+            .Any(c => c.GetParameters().Length == 2);
+        Check(!byRefCtor, "ButtonList(ButtonHandle &, int) is not bound");
+        Check(typeof(ButtonList).GetMethod("op_Addition") == null, "ButtonList has no C# operator +");
+
+        MethodInfo? plus = typeof(ButtonList).GetMethods()
+            .FirstOrDefault(m => m.ReturnType == typeof(ButtonList) && m.GetParameters().Length == 1 &&
+                                 m.GetParameters()[0].ParameterType == typeof(ButtonHandle).MakeByRefType());
+        Check(plus != null, $"operator + is bound as a method taking the handle by ref ({plus?.Name ?? "none"})");
+        if (plus != null) {
+            using var list = new ButtonList();
+            var args = new object?[] { Wrap(1) };
+            using var sum = (ButtonList)plus.Invoke(list, args)!;
+            Check(sum.GetNumButtons() == 1 && sum.GetButton(0) == 1,
+                  $"the sum holds mouse1 (got {sum.GetNumButtons()} buttons)");
+        }
+    }
+
+    // Two wrappers of one index are one handle: equal, with the same hash, and
+    // compared in C# without asking the C++ == or !=.
+    private static void TestHandlesCompareByIndex() {
+        Console.WriteLine("TestHandlesCompareByIndex");
+        var enter = new ButtonHandle(2);
+        var named = new ButtonHandle("enter");
+        var shift = new ButtonHandle(3);
+        int calls = HandlesGlobals.handles_equality_calls();
+
+        Check(enter.Equals(named), "two wrappers of enter are equal");
+        Check(!enter.Equals(shift), "control: enter is not shift");
+        Check(enter == named && !(enter != named), "control: == and != agree");
+        Check(enter != shift && !(enter == shift), "control: == and != tell enter from shift");
+        Check(HandlesGlobals.handles_equality_calls() == calls,
+              $"compared without the C++ == or != (it ran {HandlesGlobals.handles_equality_calls() - calls} times)");
+
+        Check(enter.GetHashCode() == 2 && shift.GetHashCode() == 3,
+              $"the hash is the index (got {enter.GetHashCode()} and {shift.GetHashCode()})");
+        var set = new HashSet<ButtonHandle> { enter, named, shift };
+        Check(set.Count == 2, $"a set holds enter once (got {set.Count})");
+        var names = new Dictionary<ButtonHandle, string> { [enter] = "enter" };
+        Check(names.TryGetValue(named, out string? name) && name == "enter",
+              "another wrapper of enter finds it in a dictionary");
+
+        ButtonHandle? none = null;
+        Check(none == new ButtonHandle(0), "null is index 0 to ==");
+
+        var kind = WrapType(7);
+        calls = HandlesGlobals.handles_equality_calls();
+        Check(kind.Equals(WrapType(7)) && kind == WrapType(7) && kind != WrapType(8),
+              "two TypeHandle wrappers of 7 are equal, and not 8");
+        Check(kind.GetHashCode() == 7, $"a TypeHandle's hash is its index (got {kind.GetHashCode()})");
+        Check(HandlesGlobals.handles_equality_calls() == calls,
+              "a TypeHandle is compared without the C++ == or !=");
     }
 }

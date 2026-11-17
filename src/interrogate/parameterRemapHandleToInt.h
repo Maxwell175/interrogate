@@ -31,6 +31,7 @@ public:
   ParameterRemapHandleToInt(CPPType *orig_type);
 
   virtual void pass_parameter(std::ostream &out, const std::string &variable_name);
+  virtual CPPType *get_recorded_type();
   virtual std::string get_return_expr(const std::string &expression);
 };
 

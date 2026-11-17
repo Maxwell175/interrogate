@@ -54,6 +54,15 @@ public:
   INLINE void set_out_parameter(bool is_out);
 
   virtual void pass_parameter(std::ostream &out, const std::string &variable_name);
+  // The lines a parameter needs before and after the call: a temporary the
+  // call is given instead of the parameter, and the copy of it back.
+  virtual void prepare_parameter(std::ostream &out, int indent_level,
+                                 const std::string &variable_name);
+  virtual void finish_parameter(std::ostream &out, int indent_level,
+                                const std::string &variable_name);
+  // The type the database records for this parameter instead of new_type, or
+  // null to record new_type.
+  virtual CPPType *get_recorded_type();
   virtual std::string prepare_return_expr(std::ostream &out, int indent_level,
                                      const std::string &expression);
   virtual std::string get_return_expr(const std::string &expression);

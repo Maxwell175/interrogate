@@ -22,6 +22,7 @@ set(INTERROGATE_HEADERS
   parameterRemapReferenceToPointer.h parameterRemapThis.h
   parameterRemapToString.h
   parameterRemapHandleToInt.h
+  parameterRemapHandleToIntPointer.h
   parameterRemapUnchanged.h
   skipReport.h
   typeManager.h
@@ -50,6 +51,7 @@ set(INTERROGATE_SOURCES
   parameterRemapReferenceToPointer.cxx parameterRemapThis.cxx
   parameterRemapToString.cxx
   parameterRemapHandleToInt.cxx
+  parameterRemapHandleToIntPointer.cxx
   parameterRemapUnchanged.cxx
   skipReport.cxx
   typeManager.cxx

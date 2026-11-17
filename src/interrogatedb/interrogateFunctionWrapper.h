@@ -95,6 +95,9 @@ private:
     // inferred -- pass 2 only sees the pointer, and a raw `T *` buffer parameter
     // looks exactly the same.  Guessing from the type would mean `unsigned char *into`
     // (a buffer) and `PN_stdfloat &value` (an out-parameter) could not coexist.
+    // A pointer or non-const reference to a handle (TypeHandle, ButtonHandle) is
+    // one too: the wrapper takes a pointer to its index, and the parameter is
+    // recorded as the handle's own type.
     PF_is_out         = 0x0010,
   };
 

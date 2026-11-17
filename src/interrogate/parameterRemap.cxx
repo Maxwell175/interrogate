@@ -33,6 +33,32 @@ pass_parameter(std::ostream &out, const string &variable_name) {
 }
 
 /**
+ * Outputs whatever lines the remapper needs before the call, e.g.  to declare
+ * a temporary that pass_parameter() then names instead of the variable.
+ */
+void ParameterRemap::
+prepare_parameter(std::ostream &, int, const string &) {
+}
+
+/**
+ * Outputs whatever lines the remapper needs after the call, e.g.  to copy a
+ * temporary declared by prepare_parameter() back to the variable.
+ */
+void ParameterRemap::
+finish_parameter(std::ostream &, int, const string &) {
+}
+
+/**
+ * Returns the type the InterrogateDatabase records for this parameter in
+ * place of the new type, or nullptr to record the new type (or its atomic
+ * token, see get_new_atomic_token()).
+ */
+CPPType *ParameterRemap::
+get_recorded_type() {
+  return nullptr;
+}
+
+/**
  * This will be called immediately before get_return_expr().  It outputs
  * whatever lines the remapper needs to the function to set up its return
  * value, e.g.  to declare a temporary variable or something.  It should

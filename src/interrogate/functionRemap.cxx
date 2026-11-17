@@ -58,6 +58,19 @@ namespace {
       return builder.get_type(remap->get_new_type(), false);
     }
   }
+
+  /**
+   * Resolves a parameter's remap to the TypeIndex recorded for it: the type
+   * the remap names in place of its new_type (a handle C# passes as its index,
+   * see ParameterRemap::get_recorded_type), or else as resolve_atomic_type.
+   */
+  TypeIndex
+  resolve_parameter_type(ParameterRemap *remap) {
+    if (CPPType *recorded = remap->get_recorded_type()) {
+      return builder.get_type(recorded, false);
+    }
+    return resolve_atomic_type(remap);
+  }
 }
 
 /**
@@ -376,7 +389,7 @@ make_wrapper_entry(FunctionIndex function_index) {
        ++pi) {
     InterrogateFunctionWrapper::Parameter param;
     param._parameter_flags = 0;
-    param._type = resolve_atomic_type((*pi)._remap);
+    param._type = resolve_parameter_type((*pi)._remap);
     param._name = (*pi)._name;
     if ((*pi)._has_name) {
       param._parameter_flags |= InterrogateFunctionWrapper::PF_has_name;

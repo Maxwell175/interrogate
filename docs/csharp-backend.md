@@ -346,10 +346,40 @@ The C wrappers pass them as their integer index, so the managed wrapper of one
 holds that index where any other wrapper holds a pointer.  Such a wrapper is
 `Borrowed` from its constructors and has no destructor stub: deleting the
 index aborted the process with `free(): invalid pointer`, whether the wrapper
-was disposed or finalized.  For the same reason a `const` reference to a handle
-also crosses as the index (before, the index was handed over where the C++
-read an address), and a method taking a pointer or a non-`const` reference to
-one is not bound.  `tests/csharp/handles` covers all of it.
+was disposed or finalized.
+
+How a handle parameter crosses depends on how the C++ takes it:
+
+- **By value**: the C wrapper takes the index, and so does C#
+  (`ModifierButtons.HasButton(int)`).  Returns, by value or by `const`
+  reference, are the index too.
+- **By `const` reference**: the C wrapper takes the index as well (before, the
+  index was handed over where the C++ read an address), but C# keeps the
+  handle, `PGButton.AddClickButton(ButtonHandle)`, and the call passes
+  `(int)NativeObject.Unwrap(button)`, the wrapper's index.  Pass 1 records
+  such a parameter in the database as the handle's own type
+  (`ParameterRemap::get_recorded_type`), where any other object is recorded as
+  a pointer, so pass 2 knows it without guessing.
+- **By pointer or non-`const` reference**: the C wrapper takes a pointer to
+  the index, builds a local handle from it, calls with that, and writes the
+  local's index back (`ParameterRemapHandleToIntPointer`).  C# takes the
+  handle by `ref`: in, because the C++ may read it, and out, because it may
+  change it, as a non-`const` reference to a number is an `out` parameter.
+  Afterwards the caller's variable holds a wrapper of the index the call left,
+  or the same wrapper when the index did not change; the wrapper given is
+  never changed, since others may hold or hash it.  Index 0 comes back as
+  `null` (as `__CreateFromNative` gives it), so the parameter is always
+  nullable.  The C++ never receives a null pointer.  Only methods are written so; a constructor or an operator taking
+  one is left out.
+
+In both of the last two cases `null` is index 0, as the wrapper of index 0 has
+a zero handle.
+
+Two handles are equal when their indices are.  For a handle with a C++ `==`,
+`Equals` compares the indices in C# rather than calling it, `GetHashCode`
+returns the index, and `==`/`!=` go through `Equals` as for any class.  A
+handle with no `==` of its own gets `NativeObject`'s, which compares the same.
+`tests/csharp/handles` covers all of it.
 
 ## Why there is C# supplemental native code at all
 

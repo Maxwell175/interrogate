@@ -16,6 +16,7 @@
 #include "interrogate.h"
 #include "functionRemap.h"
 #include "parameterRemapHandleToInt.h"
+#include "parameterRemapHandleToIntPointer.h"
 #include "parameterRemapUnchanged.h"
 #include "typeManager.h"
 
@@ -89,6 +90,21 @@ write_functions(ostream &out) {
 }
 
 /**
+ * Returns true if the type is a pointer or a reference to a handle (see
+ * TypeManager::is_handle), const or not; a pointer to a pointer to one is not.
+ */
+static bool
+is_pointer_or_reference_to_handle(CPPType *type) {
+  if (TypeManager::is_pointer(type)) {
+    return TypeManager::is_handle(TypeManager::unwrap_pointer(type));
+  }
+  if (TypeManager::is_reference(type)) {
+    return TypeManager::is_handle(TypeManager::unwrap_reference(type));
+  }
+  return false;
+}
+
+/**
  * Allocates a new ParameterRemap object suitable to the indicated parameter
  * type.  If struct_type is non-NULL, it is the type of the enclosing class
  * for the function (method) in question.
@@ -112,13 +128,16 @@ remap_parameter(CPPType *struct_type, CPPType *param_type, bool is_return) {
     // the integer was read as an address.
     return new ParameterRemapHandleToInt(param_type);
 
-  } else if (build_csharp &&
-             (TypeManager::is_pointer(param_type) ||
-              TypeManager::is_reference(param_type)) &&
-             TypeManager::is_handle(TypeManager::unwrap(param_type))) {
+  } else if (build_csharp && is_pointer_or_reference_to_handle(param_type)) {
     // For the same reason C# can neither pass nor hold a pointer to a handle,
-    // nor write back through a non-const reference to one.
-    return nullptr;
+    // nor write back through a non-const reference to one.  As a parameter
+    // the wrapper passes a local handle instead, built from the index C#
+    // points it to, and writes the index back; nothing can hold a returned
+    // one.
+    if (is_return) {
+      return nullptr;
+    }
+    return new ParameterRemapHandleToIntPointer(param_type);
 
   } else {
     return InterfaceMaker::remap_parameter(struct_type, param_type, is_return);
@@ -238,9 +257,28 @@ write_function_instance(ostream &out, InterfaceMaker::Function *func,
 
   std::string container =
     (remap->_extension && remap->_csharp_extension && !remap->_has_this) ? "" : "param0";
+  for (size_t pn = 0; pn < remap->_parameters.size(); ++pn) {
+    remap->_parameters[pn]._remap->prepare_parameter(out, 2, remap->get_parameter_name(pn));
+  }
   std::string return_expr =
     remap->call_function(out, 2, true, container);
   return_expr = manage_return_value(out, 2, remap, return_expr);
+
+  // A parameter passed through a temporary is copied back after the call, so
+  // the return value is taken first.
+  std::ostringstream finish;
+  for (size_t pn = 0; pn < remap->_parameters.size(); ++pn) {
+    remap->_parameters[pn]._remap->finish_parameter(finish, 2, remap->get_parameter_name(pn));
+  }
+  if (!finish.str().empty()) {
+    if (!return_expr.empty()) {
+      out << "  ";
+      remap->_return_type->get_new_type()->output_instance(out, "return_value", &parser);
+      out << " = " << return_expr << ";\n";
+      return_expr = "return_value";
+    }
+    out << finish.str();
+  }
   if (!return_expr.empty()) {
     out << "  return " << return_expr << ";\n";
   }

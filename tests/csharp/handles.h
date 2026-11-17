@@ -11,12 +11,19 @@
 // Exported at module scope so the driver can tell the names apart.
 int handles_button_count();
 
+// How many times the C++ == or != of either handle has run, so the driver can
+// tell an index compared in C# from one compared here.
+int handles_equality_calls();
+
 class TypeHandle {
 public:
   constexpr TypeHandle() = default;
   static TypeHandle from_index(int index);
   int get_index() const;
   std::string get_name() const;
+
+  bool operator == (const TypeHandle &other) const;
+  bool operator != (const TypeHandle &other) const;
 
 private:
   int _index = 0;
@@ -34,14 +41,22 @@ public:
   int compare_to(const ButtonHandle &other) const;
   ButtonHandle get_alias() const;
 
+  bool operator == (const ButtonHandle &other) const;
+  bool operator != (const ButtonHandle &other) const;
+  bool operator < (const ButtonHandle &other) const;
+
 private:
   int _index = 0;
 };
 
-// Takes and gives handles by value, by const reference and by pointer.
+// Takes and gives handles by value, by const reference, by pointer and by
+// non-const reference.
 class ButtonList {
 public:
   ButtonList();
+  explicit ButtonList(const ButtonHandle &first);
+  // Only methods pass a handle through a temporary; this is not bound.
+  ButtonList(ButtonHandle &next, int count);
 
   void add_button(ButtonHandle button);
   bool add_button_ref(const ButtonHandle &button);
@@ -54,10 +69,15 @@ public:
   TypeHandle get_kind() const;
   bool is_kind(const TypeHandle &kind) const;
 
-  // C# can neither write back through a non-const reference to a handle nor
-  // hold a pointer to one; these two are not bound.
+  // C# passes these through a temporary: the wrapper builds a handle from
+  // the index it is given, and gives back the index the call left.
   void get_first_button(ButtonHandle &result) const;
+  bool next_button(ButtonHandle &button) const;
+  void clear_button(ButtonHandle *button) const;
   void add_button_ptr(const ButtonHandle *button);
+  void next_kind(TypeHandle &kind) const;
+  // A C# operator cannot pass one by ref, so this is a method only.
+  ButtonList operator + (ButtonHandle &button) const;
 
 private:
   std::vector<ButtonHandle> _buttons;
