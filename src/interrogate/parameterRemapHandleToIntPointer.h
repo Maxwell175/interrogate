@@ -23,7 +23,8 @@
  * handle (see ParameterRemapHandleToInt) through a temporary, for C#: the
  * caller holds only the handle's index, so it gives a pointer to that index;
  * the wrapper builds a local handle from it, passes the function that, and
- * writes the local's index back afterwards.
+ * writes the local's index back afterwards.  A null pointer is passed on as
+ * one, and nothing is written back to it.
  */
 class ParameterRemapHandleToIntPointer : public ParameterRemap {
 public:
@@ -37,6 +38,7 @@ public:
   virtual CPPType *get_recorded_type();
 
 private:
+  bool _is_pointer;
   CPPType *_handle_type;
 };
 

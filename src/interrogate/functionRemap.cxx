@@ -60,12 +60,13 @@ namespace {
   }
 
   /**
-   * Resolves a parameter's remap to the TypeIndex recorded for it: the type
-   * the remap names in place of its new_type (a handle C# passes as its index,
-   * see ParameterRemap::get_recorded_type), or else as resolve_atomic_type.
+   * Resolves a parameter's or a return value's remap to the TypeIndex recorded
+   * for it: the type the remap names in place of its new_type (a handle C#
+   * passes as its index, see ParameterRemap::get_recorded_type), or else as
+   * resolve_atomic_type.
    */
   TypeIndex
-  resolve_parameter_type(ParameterRemap *remap) {
+  resolve_recorded_type(ParameterRemap *remap) {
     if (CPPType *recorded = remap->get_recorded_type()) {
       return builder.get_type(recorded, false);
     }
@@ -389,7 +390,7 @@ make_wrapper_entry(FunctionIndex function_index) {
        ++pi) {
     InterrogateFunctionWrapper::Parameter param;
     param._parameter_flags = 0;
-    param._type = resolve_parameter_type((*pi)._remap);
+    param._type = resolve_recorded_type((*pi)._remap);
     param._name = (*pi)._name;
     if ((*pi)._has_name) {
       param._parameter_flags |= InterrogateFunctionWrapper::PF_has_name;
@@ -417,7 +418,7 @@ make_wrapper_entry(FunctionIndex function_index) {
     iwrapper._flags |= InterrogateFunctionWrapper::F_has_return;
   }
 
-  iwrapper._return_type = resolve_atomic_type(_return_type);
+  iwrapper._return_type = resolve_recorded_type(_return_type);
 
   if (_return_value_needs_management) {
     iwrapper._flags |= InterrogateFunctionWrapper::F_caller_manages;

@@ -87,6 +87,12 @@ ButtonList::ButtonList(ButtonHandle &next, int count) {
   }
 }
 
+ButtonList::ButtonList(const ButtonHandle *first, int count, int step) {
+  for (int i = 0; first != nullptr && i < count; ++i) {
+    _buttons.push_back(ButtonHandle(first->get_index() + i * step));
+  }
+}
+
 void ButtonList::add_button(ButtonHandle button) { _buttons.push_back(button); }
 
 bool ButtonList::add_button_ref(const ButtonHandle &button) {
@@ -112,6 +118,13 @@ ButtonHandle ButtonList::get_button(int n) const { return _buttons[n]; }
 
 const ButtonHandle &ButtonList::get_last_button() const { return _buttons.back(); }
 
+const ButtonHandle &ButtonList::get_no_button() const {
+  static const ButtonHandle none(0);
+  return none;
+}
+
+const ButtonHandle &ButtonList::get_button_ref(int n) const { return _buttons[n]; }
+
 void ButtonList::set_kind(TypeHandle kind) { _kind = kind; }
 
 TypeHandle ButtonList::get_kind() const { return _kind; }
@@ -119,6 +132,8 @@ TypeHandle ButtonList::get_kind() const { return _kind; }
 bool ButtonList::is_kind(const TypeHandle &kind) const {
   return _kind.get_index() == kind.get_index();
 }
+
+const TypeHandle &ButtonList::get_kind_ref() const { return _kind; }
 
 void ButtonList::get_first_button(ButtonHandle &result) const { result = _buttons.front(); }
 
@@ -142,8 +157,66 @@ void ButtonList::next_kind(TypeHandle &kind) const {
   kind = TypeHandle::from_index(kind.get_index() + 1);
 }
 
+bool ButtonList::is_null_button(const ButtonHandle *button) const { return button == nullptr; }
+
+// Each writes through the pointer only when it is not null, and says whether.
+bool ButtonList::fill_button(ButtonHandle *button) const {
+  if (button == nullptr) {
+    return false;
+  }
+  *button = _buttons.front();
+  return true;
+}
+
+bool ButtonList::fill_kind(TypeHandle *kind) const {
+  if (kind == nullptr) {
+    return false;
+  }
+  *kind = _kind;
+  return true;
+}
+
 ButtonList ButtonList::operator + (ButtonHandle &button) const {
   ButtonList result(*this);
   result._buttons.push_back(button);
   return result;
+}
+
+// Leaves out every copy of the button; a null pointer leaves out nothing.
+ButtonList ButtonList::operator - (const ButtonHandle *button) const {
+  ButtonList result;
+  for (const ButtonHandle &b : _buttons) {
+    if (button == nullptr || !b.matches(*button)) {
+      result._buttons.push_back(b);
+    }
+  }
+  return result;
+}
+
+ButtonRow::ButtonRow() {
+  for (int i = 0; i < 3; ++i) {
+    _buttons.push_back(ButtonHandle(i));
+  }
+}
+
+int ButtonRow::size() const { return (int)_buttons.size(); }
+
+const ButtonHandle &ButtonRow::operator [](int i) const { return _buttons[i]; }
+
+bool ButtonRow::has_named(const std::string &name) const {
+  for (const ButtonHandle &b : _buttons) {
+    if (b.get_name() == name) {
+      return true;
+    }
+  }
+  return false;
+}
+
+const ButtonHandle &ButtonRow::get_named(const std::string &name) const {
+  for (const ButtonHandle &b : _buttons) {
+    if (b.get_name() == name) {
+      return b;
+    }
+  }
+  return _buttons.front();
 }

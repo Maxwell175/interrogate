@@ -49,8 +49,9 @@ pass_parameter(std::ostream &out, const std::string &variable_name) {
 /**
  * A const reference to a handle (which only C# passes as the index, see
  * InterfaceMakerC::remap_parameter) is recorded as the handle's own type, so
- * that the C# signature keeps the handle and passes its index at the call.  A
- * handle passed by value stays an int.
+ * that the C# signature keeps the handle: a parameter passes its index at the
+ * call, and a return value wraps the index it is given.  A handle passed or
+ * returned by value stays an int.
  */
 CPPType *ParameterRemapHandleToInt::
 get_recorded_type() {

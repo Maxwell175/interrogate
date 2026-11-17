@@ -1,15 +1,18 @@
 // Handle-type tests.  TypeHandle and ButtonHandle cross the C ABI as their
 // index, so their wrappers hold an index, own nothing, and hand the index on
 // wherever the C++ takes a handle by value or by const reference.  A const
-// reference keeps the handle in the C# signature; a pointer or a non-const
-// reference goes by ref, through a temporary the C wrapper builds from the
-// index; and two handles are equal, and hash alike, when their indices are.
+// reference keeps the handle in the C# signature, as a parameter and as a
+// return value (null for index 0); a pointer or a non-const reference goes by
+// ref, through a temporary the C wrapper builds from the index, and a null
+// handle reaches a pointer as a null pointer; and two handles are equal, and
+// hash alike, when their indices are.
 //
 // Before this was so, a wrapper made from an index or a name deleted the index
 // when it was released -- "free(): invalid pointer", disposed or finalized --
 // and a const-reference parameter was given the index as an address.  The
 // driver is written to compile against those bindings too, and against each
-// later one (a const reference as an int; pointers unbound), so that they are
+// later one (a const reference as an int; pointers unbound; a const reference
+// returned as an int; a null handle given to a pointer as index 0), so that they are
 // seen to crash or fail rather than fail to build: what one of them lacks is
 // reached by reflection.
 
@@ -34,11 +37,13 @@ internal static class Driver {
         TestReleasedWrappersFreeNothing();
         TestFinalizedWrappersFreeNothing();
         TestAnOwnedWrapperFreesNothing();
-        TestAConstReferenceReturnIsTheIndex();
+        TestAConstReferenceReturnIsAHandle();
+        TestAConstReferenceElementIsAHandle();
         TestAConstReferenceParameterKeepsTheHandle();
         TestTypeHandleIsPassedTheSameWay();
         TestAConstReferenceConstructorParameterKeepsTheHandle();
         TestAPointerOrReferenceGoesByRef();
+        TestANullHandleIsANullPointer();
         TestOnlyMethodsTakeAHandleByRef();
         TestHandlesCompareByIndex();
 
@@ -70,9 +75,40 @@ internal static class Driver {
     private static int Pass(Func<int, int> call, int index) => call(index);
     private static bool PassType(Func<TypeHandle, bool> call, int index) => call(WrapType(index));
     private static bool PassType(Func<int, bool> call, int index) => call(index);
-    private static int IndexOf(ButtonHandle handle) => handle.GetIndex();
-    private static int IndexOf(int index) => index;
-    private static int IndexOf(object? handle) => (int)NativeObject.Unwrap(handle as INativeObject);
+    // The index a returned value stands for: the handle's, or (in the older
+    // binding) the int itself.
+    private static int IndexOf(object? handle) =>
+        handle is int index ? index : (int)NativeObject.Unwrap(handle as INativeObject);
+    private static bool IsNull(object? value) => value is null;
+
+    private static readonly NullabilityInfoContext Nullability = new();
+
+    // "ButtonHandle?" for a nullable handle, else the type's name.
+    private static string Describe(Type type, NullabilityInfo info) =>
+        type.Name + (!type.IsValueType && info.ReadState == NullabilityState.Nullable ? "?" : "");
+    private static string ReturnOf(Type type, string method) {
+        MethodInfo info = type.GetMethod(method)!;
+        return Describe(info.ReturnType, Nullability.Create(info.ReturnParameter));
+    }
+    private static string PropertyOf(Type type, string property) {
+        PropertyInfo? info = type.GetProperty(property);
+        return info == null ? "no such property" : Describe(info.PropertyType, Nullability.Create(info));
+    }
+    // The type argument n of a generic property's type, as Describe gives it.
+    private static string TypeArgumentOf(Type type, string property, int n) {
+        PropertyInfo? info = type.GetProperty(property);
+        if (info == null) return "no such property";
+        if (!info.PropertyType.IsGenericType) return info.PropertyType.Name;
+        return Describe(info.PropertyType.GetGenericArguments()[n],
+                        Nullability.Create(info).GenericTypeArguments[n]);
+    }
+
+    // The P/Invoke a binding calls for a C wrapper, by its name's prefix.
+    private static MethodInfo NativeMethod(string prefix) =>
+        typeof(ButtonList).Assembly.GetTypes()
+            .Where(t => t.Name.StartsWith("NativeMethods"))
+            .SelectMany(t => t.GetMethods(BindingFlags.Static | BindingFlags.NonPublic | BindingFlags.Public))
+            .First(m => m.Name.StartsWith(prefix + "_"));
 
     private static Type ParameterType(Type type, string method) =>
         type.GetMethod(method)!.GetParameters()[0].ParameterType;
@@ -161,18 +197,84 @@ internal static class Driver {
         Check(true, "disposed a handle marked owned");
     }
 
-    // A handle returned by const reference arrives as its index, as one
-    // returned by value does.  Before the fix it was a pointer into the list,
-    // which the wrapper's methods then passed on as an index.
-    private static void TestAConstReferenceReturnIsTheIndex() {
-        Console.WriteLine("TestAConstReferenceReturnIsTheIndex");
+    // A handle returned by const reference keeps its handle type, as a
+    // parameter does, and index 0 comes back as null; one returned by value is
+    // its index.  Before V2 it was a pointer into the list, which the
+    // wrapper's methods then passed on as an index; after V2 it was the index.
+    private static void TestAConstReferenceReturnIsAHandle() {
+        Console.WriteLine("TestAConstReferenceReturnIsAHandle");
+        foreach (var (type, method, handle) in new[] {
+                     (typeof(ButtonList), "GetLastButton", "ButtonHandle?"),
+                     (typeof(ButtonList), "GetNoButton", "ButtonHandle?"),
+                     (typeof(ButtonList), "GetButtonRef", "ButtonHandle?"),
+                     (typeof(ButtonList), "GetKindRef", "TypeHandle?"),
+                     (typeof(ButtonRow), "GetNamed", "ButtonHandle?") }) {
+            string returned = ReturnOf(type, method);
+            Check(returned == handle, $"{type.Name}.{method} returns a {handle} (got {returned})");
+        }
+        foreach (var (type, method) in new[] {
+                     (typeof(ButtonList), "GetButton"), (typeof(ButtonList), "GetKind"),
+                     (typeof(ButtonHandle), "GetAlias") }) {
+            string returned = ReturnOf(type, method);
+            Check(returned == "Int32", $"control: by value, {type.Name}.{method} returns the index (got {returned})");
+        }
+        foreach (string native in new[] { "ButtonList_get_last_button", "ButtonList_get_kind_ref" }) {
+            Type returned = NativeMethod(native).ReturnType;
+            Check(returned == typeof(int), $"the P/Invoke {native} returns the index (got {returned.Name})");
+        }
+
         using var list = new ButtonList();
         list.AddButton(1);
         list.AddButton(3);
-        Check(list.GetButton(0) == 1, "by value: button 0 is 1");
+        list.SetKind(7);
+        Check(list.GetButton(0) == 1, "control: by value, button 0 is 1");
+        Check(new ButtonHandle(2).GetAlias() == 1, "control: by value, enter's alias is mouse1");
         Check(IndexOf(list.GetLastButton()) == 3,
               $"by const reference: the last button is 3 (got {IndexOf(list.GetLastButton())})");
-        Check(new ButtonHandle(2).GetAlias() == 1, "by value: enter's alias is mouse1");
+        Check(IndexOf(list.GetButtonRef(0)) == 1,
+              $"by const reference: button 0 is 1 (got {IndexOf(list.GetButtonRef(0))})");
+        Check(IndexOf(list.GetKindRef()) == 7, $"by const reference: the kind is 7 (got {IndexOf(list.GetKindRef())})");
+        Check(IsNull(list.GetNoButton()), $"index 0 by const reference is null (got {list.GetNoButton()})");
+        var none = new ButtonList();
+        Check(IsNull(none.GetKindRef()), "a TypeHandle of index 0 by const reference is null");
+
+        string property = PropertyOf(typeof(ButtonList), "LastButton");
+        Check(property == "ButtonHandle?", $"the property LastButton is a ButtonHandle? (got {property})");
+        object? last = typeof(ButtonList).GetProperty("LastButton")?.GetValue(list);
+        Check(IndexOf(last) == 3, $"the property LastButton is shift (got {IndexOf(last)})");
+    }
+
+    // The same for every other way a binding returns one: the elements of a
+    // sequence property, of an indexer and of a map property.
+    private static void TestAConstReferenceElementIsAHandle() {
+        Console.WriteLine("TestAConstReferenceElementIsAHandle");
+        foreach (var (type, property, n) in new[] {
+                     (typeof(ButtonList), "Buttons", 0), (typeof(ButtonRow), "Named", 1) }) {
+            string element = TypeArgumentOf(type, property, n);
+            Check(element == "ButtonHandle?", $"{type.Name}.{property} holds ButtonHandle? (got {element})");
+        }
+        string indexer = PropertyOf(typeof(ButtonRow), "Item");
+        Check(indexer == "ButtonHandle?", $"ButtonRow's indexer gives a ButtonHandle? (got {indexer})");
+
+        using var list = new ButtonList();
+        list.AddButton(0);
+        list.AddButton(2);
+        var buttons = (System.Collections.IEnumerable?)typeof(ButtonList).GetProperty("Buttons")?.GetValue(list);
+        var held = buttons?.Cast<object?>().ToList() ?? new List<object?>();
+        Check(held.Count == 2 && IsNull(held[0]) && IndexOf(held[1]) == 2,
+              $"Buttons holds null and enter (got {string.Join(", ", held.Select(h => h?.ToString() ?? "null"))})");
+
+        using var row = new ButtonRow();
+        PropertyInfo? item = typeof(ButtonRow).GetProperty("Item");
+        var byPosition = Enumerable.Range(0, 3).Select(i => item?.GetValue(row, new object[] { i })).ToList();
+        Check(IsNull(byPosition[0]) && IndexOf(byPosition[1]) == 1 && IndexOf(byPosition[2]) == 2,
+              $"the indexer gives null, mouse1 and enter (got {string.Join(", ", byPosition.Select(h => h?.ToString() ?? "null"))})");
+        object? named = typeof(ButtonRow).GetProperty("Named")?.GetValue(row);
+        PropertyInfo? lookup = named?.GetType().GetProperty("Item");
+        object? enter = lookup?.GetValue(named, new object[] { "enter" });
+        object? nothing = lookup?.GetValue(named, new object[] { "none" });
+        Check(IndexOf(enter) == 2 && lookup != null, $"Named[\"enter\"] is enter (got {IndexOf(enter)})");
+        Check(IsNull(nothing) && lookup != null, "Named[\"none\"], index 0, is null");
     }
 
     // A const-reference parameter keeps the handle in C#, and the wrapper's
@@ -296,6 +398,56 @@ internal static class Driver {
         }
     }
 
+    // A pointer may be null: a null handle reaches the C++ as a null pointer,
+    // which it may test, and nothing is written back to it.  A wrapper of
+    // index 0 is a handle, not a null pointer.  (A reference cannot be null,
+    // and there null is index 0: see get_first_button above.)
+    private static void TestANullHandleIsANullPointer() {
+        Console.WriteLine("TestANullHandleIsANullPointer");
+        foreach (string native in new[] {
+                     "ButtonList_is_null_button", "ButtonList_fill_button", "ButtonList_fill_kind",
+                     "ButtonList_clear_button", "ButtonList_add_button_ptr" }) {
+            Type parameter = NativeMethod(native).GetParameters()[1].ParameterType;
+            Check(parameter == typeof(IntPtr), $"the P/Invoke {native} takes a pointer (got {parameter.Name})");
+        }
+        foreach (string native in new[] {
+                     "ButtonList_next_button", "ButtonList_get_first_button", "ButtonList_next_kind" }) {
+            Type parameter = NativeMethod(native).GetParameters()[1].ParameterType;
+            Check(parameter == typeof(int).MakeByRefType(),
+                  $"control: the P/Invoke {native}, a reference, takes the index by ref (got {parameter.Name})");
+        }
+
+        using var list = new ButtonList();
+        list.AddButton(1);
+        list.SetKind(7);
+        if (CallByRef(list, "IsNullButton", typeof(ButtonHandle), null) is var (isNull, stillNull)) {
+            Check(isNull is true, "a null handle reaches is_null_button as a null pointer");
+            Check(stillNull == null, "control: and it stays null");
+        }
+        // Wrap(0) is null, as __CreateFromNative gives; a constructor makes a wrapper.
+        if (CallByRef(list, "IsNullButton", typeof(ButtonHandle), new ButtonHandle(0)) is var (zeroIsNull, _)) {
+            Check(zeroIsNull is false, "a wrapper of index 0 reaches it as a pointer to index 0");
+        }
+        if (CallByRef(list, "IsNullButton", typeof(ButtonHandle), Wrap(2)) is var (enterIsNull, _)) {
+            Check(enterIsNull is false, "control: a wrapper of enter reaches it as a pointer");
+        }
+        if (CallByRef(list, "FillButton", typeof(ButtonHandle), null) is var (filled, notFilled)) {
+            Check(filled is false, "fill_button was given a null pointer and wrote nothing");
+            Check(notFilled == null, $"a null handle stays null (got {IndexOf(notFilled)})");
+        }
+        if (CallByRef(list, "FillButton", typeof(ButtonHandle), new ButtonHandle(0)) is var (filledZero, first)) {
+            Check(filledZero is true && IndexOf(first) == 1,
+                  $"control: fill_button wrote mouse1 over index 0 (got {IndexOf(first)})");
+        }
+        if (CallByRef(list, "FillKind", typeof(TypeHandle), null) is var (filledKind, noKind)) {
+            Check(filledKind is false && noKind == null, "a null TypeHandle reaches fill_kind as a null pointer");
+        }
+        if (CallByRef(list, "FillKind", typeof(TypeHandle), new TypeHandle()) is var (filledKindZero, kind)) {
+            Check(filledKindZero is true && IndexOf(kind) == 7,
+                  $"control: fill_kind wrote kind 7 over index 0 (got {IndexOf(kind)})");
+        }
+    }
+
     // A constructor or an operator would have to read the handle back too;
     // they are not written, and the method an operator names still is.
     private static void TestOnlyMethodsTakeAHandleByRef() {
@@ -303,11 +455,17 @@ internal static class Driver {
         bool byRefCtor = typeof(ButtonList).GetConstructors()
             .Any(c => c.GetParameters().Length == 2);
         Check(!byRefCtor, "ButtonList(ButtonHandle &, int) is not bound");
+        bool byPointerCtor = typeof(ButtonList).GetConstructors()
+            .Any(c => c.GetParameters().Length == 3);
+        Check(!byPointerCtor, "ButtonList(const ButtonHandle *, int, int) is not bound");
         Check(typeof(ButtonList).GetMethod("op_Addition") == null, "ButtonList has no C# operator +");
+        Check(typeof(ButtonList).GetMethod("op_Subtraction") == null, "ButtonList has no C# operator -");
 
-        MethodInfo? plus = typeof(ButtonList).GetMethods()
-            .FirstOrDefault(m => m.ReturnType == typeof(ButtonList) && m.GetParameters().Length == 1 &&
+        MethodInfo? OperatorMethod(string name) => typeof(ButtonList).GetMethods()
+            .FirstOrDefault(m => m.Name.Contains(name) && m.ReturnType == typeof(ButtonList) &&
+                                 m.GetParameters().Length == 1 &&
                                  m.GetParameters()[0].ParameterType == typeof(ButtonHandle).MakeByRefType());
+        MethodInfo? plus = OperatorMethod("add");
         Check(plus != null, $"operator + is bound as a method taking the handle by ref ({plus?.Name ?? "none"})");
         if (plus != null) {
             using var list = new ButtonList();
@@ -315,6 +473,21 @@ internal static class Driver {
             using var sum = (ButtonList)plus.Invoke(list, args)!;
             Check(sum.GetNumButtons() == 1 && sum.GetButton(0) == 1,
                   $"the sum holds mouse1 (got {sum.GetNumButtons()} buttons)");
+        }
+        MethodInfo? minus = OperatorMethod("sub");
+        Check(minus != null, $"operator - is bound as a method taking the handle by ref ({minus?.Name ?? "none"})");
+        if (minus != null) {
+            using var list = new ButtonList();
+            list.AddButton(1);
+            list.AddButton(2);
+            list.AddButton(0);
+            using var less = (ButtonList)minus.Invoke(list, new object?[] { Wrap(1) })!;
+            Check(less.GetNumButtons() == 2 && less.GetButton(0) == 2,
+                  $"control: the difference leaves out mouse1 (got {less.GetNumButtons()} buttons)");
+            // Given index 0 instead of a null pointer, it would leave out index 0.
+            using var same = (ButtonList)minus.Invoke(list, new object?[] { null })!;
+            Check(same.GetNumButtons() == 3,
+                  $"a null handle reaches operator - as a null pointer, which leaves out nothing (got {same.GetNumButtons()} buttons)");
         }
     }
 

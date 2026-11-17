@@ -348,18 +348,21 @@ holds that index where any other wrapper holds a pointer.  Such a wrapper is
 index aborted the process with `free(): invalid pointer`, whether the wrapper
 was disposed or finalized.
 
-How a handle parameter crosses depends on how the C++ takes it:
+How a handle crosses depends on how the C++ takes or gives it:
 
-- **By value**: the C wrapper takes the index, and so does C#
-  (`ModifierButtons.HasButton(int)`).  Returns, by value or by `const`
-  reference, are the index too.
-- **By `const` reference**: the C wrapper takes the index as well (before, the
-  index was handed over where the C++ read an address), but C# keeps the
-  handle, `PGButton.AddClickButton(ButtonHandle)`, and the call passes
-  `(int)NativeObject.Unwrap(button)`, the wrapper's index.  Pass 1 records
-  such a parameter in the database as the handle's own type
-  (`ParameterRemap::get_recorded_type`), where any other object is recorded as
-  a pointer, so pass 2 knows it without guessing.
+- **By value**: the C wrapper takes or returns the index, and so does C#
+  (`ModifierButtons.HasButton(int)`).
+- **By `const` reference**: the C wrapper takes or returns the index as well
+  (before, the index was handed over where the C++ read an address), but C#
+  keeps the handle.  A parameter, `PGButton.AddClickButton(ButtonHandle)`,
+  passes `(int)NativeObject.Unwrap(button)`, the wrapper's index.  A return
+  value is a wrapper of the index returned, or `null` for index 0 (as
+  `__CreateFromNative` gives it), so it is always nullable, `ButtonHandle?`:
+  from a method, a property, an indexer, and as the elements of a sequence or
+  map property.  Pass 1 records such a parameter or return value in the
+  database as the handle's own type (`ParameterRemap::get_recorded_type`),
+  where any other object is recorded as a pointer, so pass 2 knows it without
+  guessing.
 - **By pointer or non-`const` reference**: the C wrapper takes a pointer to
   the index, builds a local handle from it, calls with that, and writes the
   local's index back (`ParameterRemapHandleToIntPointer`).  C# takes the
@@ -368,12 +371,20 @@ How a handle parameter crosses depends on how the C++ takes it:
   Afterwards the caller's variable holds a wrapper of the index the call left,
   or the same wrapper when the index did not change; the wrapper given is
   never changed, since others may hold or hash it.  Index 0 comes back as
-  `null` (as `__CreateFromNative` gives it), so the parameter is always
-  nullable.  The C++ never receives a null pointer.  Only methods are written so; a constructor or an operator taking
-  one is left out.
+  `null`, so the parameter is always nullable.  Only methods are written so; a
+  constructor or an operator taking one is left out.  A returned pointer or
+  non-`const` reference to a handle is not bound: nothing could hold it.
 
-In both of the last two cases `null` is index 0, as the wrapper of index 0 has
-a zero handle.
+`null` given for a handle means index 0, except where the C++ takes a pointer.
+A pointer may be null, so there a `null` handle reaches the C++ as a null
+pointer and nothing is written back to it.  The database records that
+parameter as a pointer to the handle (a reference as the handle itself); the
+P/Invoke takes an `IntPtr`, which is `IntPtr.Zero` for `null` and otherwise the
+address of the method's local copy of the index (a local never moves, so it
+needs no other pinning); and the C wrapper builds its local handle, passes its
+address and writes it back only when the pointer is not null.  A wrapper of
+index 0, `new ButtonHandle(0)`, is a handle and reaches the C++ as a pointer to
+index 0.
 
 Two handles are equal when their indices are.  For a handle with a C++ `==`,
 `Equals` compares the indices in C# rather than calling it, `GetHashCode`

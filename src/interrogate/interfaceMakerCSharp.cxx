@@ -2127,12 +2127,13 @@ is_handle_type(const InterrogateType &itype) {
 }
 
 /**
- * Returns true if a parameter of this type is a handle that the C wrapper
- * takes as its index (or, flagged PF_is_out, as a pointer to its index) and
- * the C# signature keeps as the handle: one passed by const reference, by
- * pointer or by non-const reference.  The database records such a parameter
- * as the handle's own type (ParameterRemap::get_recorded_type), where any
- * other object is recorded as a pointer and a handle passed by value as int.
+ * Returns true if a parameter or return value of this type is a handle that
+ * the C wrapper passes as its index (or, for a parameter flagged PF_is_out, as
+ * a pointer to its index) and the C# signature keeps as the handle: one passed
+ * or returned by const reference, or passed by non-const reference.  The
+ * database records such a type as the handle's own type
+ * (ParameterRemap::get_recorded_type), where any other object is recorded as a
+ * pointer and a handle passed or returned by value as int.
  */
 static bool
 is_handle_parameter_type(TypeIndex type_index) {
@@ -2142,6 +2143,44 @@ is_handle_parameter_type(TypeIndex type_index) {
   }
   const InterrogateType &itype = InterrogateDatabase::get_ptr()->get_type(type_index);
   return !itype.is_pointer() && is_handle_type(itype);
+}
+
+/**
+ * Returns true if a parameter of this type is a pointer to a handle.  Only a
+ * handle passed by pointer is recorded so (ParameterRemapHandleToIntPointer,
+ * flagged PF_is_out): the C wrapper takes a pointer to the index, or a null
+ * pointer, which it passes on as one.
+ */
+static bool
+is_handle_pointer_type(TypeIndex type_index) {
+  type_index = unwrap_type_aliases(type_index);
+  if (type_index == 0) {
+    return false;
+  }
+  InterrogateDatabase *idb = InterrogateDatabase::get_ptr();
+  const InterrogateType &itype = idb->get_type(type_index);
+  if (!itype.is_pointer()) {
+    return false;
+  }
+  TypeIndex pointee = unwrap_type_aliases(itype.get_wrapped_type());
+  if (pointee != 0 && idb->get_type(pointee).is_const()) {
+    pointee = idb->get_type(pointee).get_wrapped_type();
+  }
+  return is_handle_parameter_type(pointee);
+}
+
+/**
+ * Returns true if the wrapper's parameter i is a handle that the C wrapper
+ * takes as a pointer to its index and writes back: one passed by pointer or by
+ * non-const reference, which C# passes by ref.
+ */
+static bool
+is_handle_by_ref_parameter(const InterrogateFunctionWrapper &wrapper, int i) {
+  if (wrapper.parameter_is_this(i) || !wrapper.parameter_is_out(i)) {
+    return false;
+  }
+  TypeIndex type_index = wrapper.parameter_get_type(i);
+  return is_handle_parameter_type(type_index) || is_handle_pointer_type(type_index);
 }
 
 const InterrogateFunctionWrapper *
@@ -4792,7 +4831,8 @@ find_sequence_indexer(Object *object,
     // A collection indexer reads through `this`; both accessors are instance methods.
     if (!lw->parameter_is_this(0) || !ew->parameter_is_this(0)) continue;
     TypeIndex eidx = ew->get_return_type();
-    string etype = get_csharp_signature_type(eidx, false);
+    // A handle returned by const reference is nullable (see write_method).
+    string etype = get_csharp_signature_type(eidx, is_handle_parameter_type(eidx));
     if (etype.empty()) continue;
     length_func = lf;
     element_func = ef;
@@ -4837,7 +4877,7 @@ find_sequence_indexer(Object *object,
   }
   if (op_func != nullptr && size_func != nullptr) {
     TypeIndex eidx = op_w->get_return_type();
-    string etype = get_csharp_signature_type(eidx, false);
+    string etype = get_csharp_signature_type(eidx, is_handle_parameter_type(eidx));
     if (!etype.empty()) {
       length_func = size_func;
       element_func = op_func;
@@ -5742,7 +5782,7 @@ write_constructor(ostream &out, Function *func, Object *object, int indent_level
         ? make_csharp_identifier(wrapper.parameter_get_name(i))
         : string("param") + std::to_string(i);
       bool is_handle = is_handle_parameter_type(param_type_index);
-      if (is_handle && wrapper.parameter_is_out(i)) {
+      if (is_handle_by_ref_parameter(wrapper, i)) {
         // Only write_method passes a handle by ref and reads it back; the
         // constructor is left unwritten, as for a type with no mapping.
         param_type.clear();
@@ -6010,7 +6050,7 @@ write_operator_aliases(ostream &out, Object *object, int indent_level,
       for (int i = 1; i < wrapper.number_of_parameters(); ++i) {
         TypeIndex param_type_index = wrapper.parameter_get_type(i);
         if (csharp_stream_token_for_type(param_type_index) != AT_not_atomic ||
-            (wrapper.parameter_is_out(i) && is_handle_parameter_type(param_type_index))) {
+            is_handle_by_ref_parameter(wrapper, i)) {
           // An operator cannot pass a handle by ref (see write_method).
           bad_param = true;
           break;
@@ -6655,6 +6695,14 @@ write_method(ostream &out, Function *func, Object *object, int indent_level,
 
     TypeIndex return_type_index = wrapper.get_return_type();
     bool return_nullable = wrapper.is_return_nullable();
+    // A handle returned by const reference keeps its handle type, as a
+    // parameter does.  The P/Invoke returns the index, which is wrapped as any
+    // returned object is (its handle is that index), and index 0 comes back as
+    // null, as __CreateFromNative gives it: so the return is always nullable,
+    // and is never refused as a null.
+    if (wrapper.has_return_value() && is_handle_parameter_type(return_type_index)) {
+      return_nullable = true;
+    }
     string return_type = wrapper.has_return_value()
       ? get_csharp_signature_type(return_type_index, return_nullable) : "void";
 
@@ -6689,8 +6737,9 @@ write_method(ostream &out, Function *func, Object *object, int indent_level,
     struct CoercionSite { string var; string facade; string param; bool nullable; };
     std::vector<CoercionSite> coercions;
 
-    // Handles passed by ref: (index variable, parameter, wrapper class).
-    struct HandleRefSite { string var; string param; string handle_class; };
+    // Handles passed by ref: (index variable, parameter, wrapper class, and
+    // the pointer variable when the C++ takes a pointer, which may be null).
+    struct HandleRefSite { string var; string param; string handle_class; string pointer; };
     std::vector<HandleRefSite> handle_refs;
 
     for (int i = first_param; i < wrapper.number_of_parameters(); ++i) {
@@ -6719,9 +6768,13 @@ write_method(ostream &out, Function *func, Object *object, int indent_level,
       // the index the call left (null for index 0, as __CreateFromNative gives;
       // hence always nullable), and the same wrapper if the index is unchanged.
       // The wrapper itself never changes: it is a value, which others may hold
-      // or hash.
-      bool handle_by_ref = stream_tok == AT_not_atomic && wrapper.parameter_is_out(i) &&
-                           is_handle_parameter_type(param_type_index) && !param_type.empty();
+      // or hash.  A pointer may be null, so a null handle is passed on as a
+      // null pointer, which the C++ receives as such and nothing is written
+      // back to; a reference cannot be, and null is index 0 there.
+      bool handle_by_ref = stream_tok == AT_not_atomic && is_handle_by_ref_parameter(wrapper, i) &&
+                           !param_type.empty();
+      bool handle_pointer = handle_by_ref && is_handle_pointer_type(param_type_index);
+
       string handle_class;
       if (handle_by_ref) {
         handle_class = get_csharp_native_object_class_name(param_type_index);
@@ -6760,8 +6813,9 @@ write_method(ostream &out, Function *func, Object *object, int indent_level,
         native_args.push_back("out " + param_name);
       } else if (handle_by_ref) {
         string var = "__p3handle" + std::to_string(handle_refs.size());
-        handle_refs.push_back({var, param_name, handle_class});
-        native_args.push_back("ref " + var);
+        string pointer = handle_pointer ? "__p3pointer" + std::to_string(handle_refs.size()) : string();
+        handle_refs.push_back({var, param_name, handle_class, pointer});
+        native_args.push_back(handle_pointer ? pointer : "ref " + var);
       } else if (stream_tok != AT_not_atomic) {
         string bridge_var = "__p3stream" + std::to_string(stream_bridges.size());
         stream_bridges.push_back({bridge_var, csharp_stream_bridge_factory(stream_tok),
@@ -6899,6 +6953,15 @@ write_method(ostream &out, Function *func, Object *object, int indent_level,
     for (const auto &h : handle_refs) {
       indent(out, indent_level + 2) << "int " << h.var << " = (int)NativeObject.Unwrap("
                                     << h.param << ");\n";
+      if (!h.pointer.empty()) {
+        // The index is a local, which never moves, so its address needs no
+        // other pinning for the call.
+        indent(out, indent_level + 2) << "IntPtr " << h.pointer << ";\n";
+        indent(out, indent_level + 2) << "unsafe {\n";
+        indent(out, indent_level + 4) << h.pointer << " = " << h.param
+                                      << " is null ? IntPtr.Zero : (IntPtr)(&" << h.var << ");\n";
+        indent(out, indent_level + 2) << "}\n";
+      }
     }
     auto write_handle_refs_back = [&]() {
       for (const auto &h : handle_refs) {
@@ -7633,7 +7696,10 @@ write_sequence_property_from_wrapper(ostream &out, const InterrogateElement &iel
   }
 
   TypeIndex element_index = getter_w->get_return_type();
-  string element_type = get_csharp_signature_type(element_index, false);
+  // A handle returned by const reference is the handle, null for index 0 (see
+  // write_method), so its elements are nullable.
+  bool element_handle = is_handle_parameter_type(element_index);
+  string element_type = get_csharp_signature_type(element_index, element_handle);
   if (element_type.empty()) {
     record_skipped("seq-property", ielement.get_scoped_name(),
                    "no C# mapping for element type '" +
@@ -7829,7 +7895,8 @@ write_map_property_from_wrapper(ostream &out, const InterrogateElement &ielement
   TypeIndex value_index = get_w->get_return_type();
 
   string key_type = get_csharp_signature_type(key_index, false, /*is_parameter=*/true);
-  string value_type = get_csharp_signature_type(value_index, false);
+  // A handle returned by const reference is nullable (see write_method).
+  string value_type = get_csharp_signature_type(value_index, is_handle_parameter_type(value_index));
   if (key_type.empty() || value_type.empty()) {
     record_skipped("map-property", ielement.get_scoped_name(),
                    "no C# mapping for key '" + report_type_name(key_index) +
@@ -8310,9 +8377,12 @@ write_dllimport(ostream &out, const InterrogateFunction &ifunc,
   }
 
   bool return_nullable = wrapper.is_return_nullable();
+  // A handle returned by const reference comes back as its index.
+  string return_pinvoke_type = is_handle_parameter_type(wrapper.get_return_type())
+    ? string("int") : get_pinvoke_type(wrapper.get_return_type(), true);
   out << "    internal static partial "
-      << get_pinvoke_type(wrapper.get_return_type(), true)
-      << ((get_pinvoke_type(wrapper.get_return_type(), true) == "string" && return_nullable) ? "?" : "")
+      << return_pinvoke_type
+      << ((return_pinvoke_type == "string" && return_nullable) ? "?" : "")
       << " " << friendly_name << "(";
 
   std::set<string> used_param_names;
@@ -8342,7 +8412,9 @@ write_dllimport(ostream &out, const InterrogateFunction &ifunc,
       pinvoke_type += "?";
     }
     if (!wrapper.parameter_is_this(i) && is_handle_parameter_type(type)) {
-      // The index, or a pointer to it that the wrapper writes back.
+      // The index, or a pointer to it that the wrapper writes back.  (A handle
+      // passed by pointer is recorded as a pointer, so it is an IntPtr, null or
+      // the address of the index, as any pointer is.)
       pinvoke_type = wrapper.parameter_is_out(i) ? "ref int" : "int";
     } else if (!wrapper.parameter_is_this(i) && wrapper.parameter_is_out(i)) {
       string out_type = csharp_out_parameter_type(type);
