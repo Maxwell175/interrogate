@@ -37,7 +37,7 @@ ParameterRemapHandleToInt(CPPType *orig_type) :
  */
 void ParameterRemapHandleToInt::
 pass_parameter(std::ostream &out, const std::string &variable_name) {
-  CPPType *unwrapped = TypeManager::unwrap_const(_orig_type);
+  CPPType *unwrapped = TypeManager::unwrap_const_reference(_orig_type);
 
   if (unwrapped->get_local_name(&parser) == "TypeHandle") {
     out << "TypeHandle::from_index(" << variable_name << ")";

@@ -106,6 +106,20 @@ remap_parameter(CPPType *struct_type, CPPType *param_type, bool is_return) {
    if (TypeManager::is_handle(param_type)) {
     return new ParameterRemapHandleToInt(param_type);
 
+  } else if (build_csharp && TypeManager::is_const_ref_to_handle(param_type)) {
+    // C# holds a handle as that integer, never as a pointer to one, so it has
+    // no pointer to give where a const reference is wanted.  Passed as one,
+    // the integer was read as an address.
+    return new ParameterRemapHandleToInt(param_type);
+
+  } else if (build_csharp &&
+             (TypeManager::is_pointer(param_type) ||
+              TypeManager::is_reference(param_type)) &&
+             TypeManager::is_handle(TypeManager::unwrap(param_type))) {
+    // For the same reason C# can neither pass nor hold a pointer to a handle,
+    // nor write back through a non-const reference to one.
+    return nullptr;
+
   } else {
     return InterfaceMaker::remap_parameter(struct_type, param_type, is_return);
   }

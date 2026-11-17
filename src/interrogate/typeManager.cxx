@@ -1899,8 +1899,7 @@ is_handle(CPPType *type) {
 
   case CPPDeclaration::ST_extension:
   case CPPDeclaration::ST_struct:
-    return (type->get_local_name(&parser) == "TypeHandle" ||
-            type->get_local_name(&parser) == "ButtonHandle");
+    return is_handle_name(type->get_local_name(&parser));
 
   case CPPDeclaration::ST_typedef:
     return is_handle(type->as_typedef_type()->_type);
@@ -1908,6 +1907,35 @@ is_handle(CPPType *type) {
   default:
     return false;
   }
+}
+
+/**
+ * Returns true if the indicated type is a const reference to TypeHandle or a
+ * class with identical semantics like ButtonHandle.
+ */
+bool TypeManager::
+is_const_ref_to_handle(CPPType *type) {
+  switch (type->get_subtype()) {
+  case CPPDeclaration::ST_reference:
+    return is_const(type->as_reference_type()->_pointing_at) &&
+           is_handle(type->as_reference_type()->_pointing_at);
+
+  case CPPDeclaration::ST_typedef:
+    return is_const_ref_to_handle(type->as_typedef_type()->_type);
+
+  default:
+    return false;
+  }
+}
+
+/**
+ * Returns true if the indicated name is that of a type is_handle() accepts.
+ * A pass that reads only the interrogate database has the name and not the
+ * C++ type, and asks this instead.
+ */
+bool TypeManager::
+is_handle_name(const std::string &name) {
+  return name == "TypeHandle" || name == "ButtonHandle";
 }
 
 /**

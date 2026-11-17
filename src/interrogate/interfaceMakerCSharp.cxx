@@ -2108,6 +2108,18 @@ get_native_ownership_name(const InterrogateFunctionWrapper &wrapper,
   return "NativeOwnership.Borrowed";
 }
 
+/**
+ * Returns true if the C wrappers pass this type by its index rather than by
+ * pointer (TypeManager::is_handle): TypeHandle and ButtonHandle.  The managed
+ * wrapper of one holds that index where any other holds a pointer, so there is
+ * nothing native for it to own or delete.  Deleting the index aborted the
+ * process with "free(): invalid pointer".
+ */
+static bool
+is_handle_type(const InterrogateType &itype) {
+  return itype.has_true_name() && TypeManager::is_handle_name(itype.get_true_name());
+}
+
 const InterrogateFunctionWrapper *
 get_wrapper_for_remap(FunctionRemap *remap) {
   if (remap == nullptr || remap->_wrapper_index == 0) {
@@ -2603,7 +2615,7 @@ write_functions(ostream &out) {
 
     ensure_make_seqs(*this, object);
 
-    if (object->_itype.has_destructor()) {
+    if (object->_itype.has_destructor() && !is_handle_type(object->_itype)) {
       InterrogateDatabase *idb = InterrogateDatabase::get_ptr();
       const InterrogateFunction &ifunc = idb->get_function(object->_itype.get_destructor());
       if (ifunc.number_of_c_wrappers() == 0) {
@@ -5752,7 +5764,9 @@ write_constructor(ostream &out, Function *func, Object *object, int indent_level
       emit_xml_doc_comment(out, func->_ifunc.get_comment(), indent_level);
     }
 
-    string ownership = get_native_ownership_name(wrapper, true);
+    string ownership = is_handle_type(object->_itype)
+      ? string("NativeOwnership.Borrowed")
+      : get_native_ownership_name(wrapper, true);
 
     if (stream_bridges.empty() && keepalive_params.empty()) {
       indent(out, indent_level) << "public " << class_name << "(";
@@ -10665,7 +10679,8 @@ type_has_destructor(Object *object) const {
  */
 string InterfaceMakerCSharp::
 get_destructor_wrapper_name(Object *object) const {
-  if (object == nullptr || !object->_itype.has_destructor()) {
+  if (object == nullptr || !object->_itype.has_destructor() ||
+      is_handle_type(object->_itype)) {
     return string();
   }
 
